@@ -16,10 +16,15 @@ from app.core.config import Settings
 
 
 def create_database_engine(settings: Settings) -> AsyncEngine:
-    """Build a new async engine without opening a connection eagerly."""
+    """Build a new async engine without opening a connection eagerly.
+
+    ``hide_parameters`` keeps bound values (phones, names, amounts) out of the
+    text of database errors, which reaches logs and tracebacks.
+    """
 
     return create_async_engine(
         settings.database_url,
+        hide_parameters=True,
         pool_pre_ping=True,
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -79,3 +80,26 @@ def test_rates_must_be_between_zero_and_one(value: str) -> None:
         Settings(_env_file=None, commission_rate=Decimal(value))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, damage_contribution_rate=Decimal(value))
+
+
+def test_business_timezone_is_a_real_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOUCH_BUSINESS_TIMEZONE", "Europe/London")
+    settings = Settings(_env_file=None)
+
+    assert settings.business_timezone == "Europe/London"
+    assert settings.business_zone == ZoneInfo("Europe/London")
+
+
+@pytest.mark.parametrize("value", ["Mars/Olympus_Mons", "not a zone", "../etc/passwd"])
+def test_business_timezone_rejects_unknown_zone(value: str) -> None:
+    with pytest.raises(ValidationError, match="business_timezone"):
+        Settings(_env_file=None, business_timezone=value)
+
+
+def test_rate_env_parsed_as_decimal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOUCH_COMMISSION_RATE", "0.12")
+
+    rate = Settings(_env_file=None).commission_rate
+
+    assert isinstance(rate, Decimal)
+    assert rate == Decimal("0.12")
