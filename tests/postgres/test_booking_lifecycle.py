@@ -19,7 +19,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import FrozenClock, start_of_business_day
@@ -1120,6 +1120,54 @@ async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, 
 
     assert result.status == BookingStatus.lost
     assert await _audits(db_session, booking.asset_id) == []
+
+
+async def test_mark_lost_reads_the_locked_asset_not_a_stale_copy(
+    db_session, clock, notifier
+) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    asset = await db_session.get(Asset, booking.asset_id)
+    assert asset.listing_status == ListingStatus.active  # the session's copy
+    # Paused behind the session's back (as another transaction would).
+    await db_session.execute(
+        text("UPDATE assets SET listing_status = 'paused' WHERE id = :id"), {"id": asset.id}
+    )
+    admin = await admin_actor(db_session)
+
+    await _transition(
+        db_session,
+        booking,
+        admin,
+        BookingEvent.mark_lost,
+        FrozenClock(_lost_from(booking)),
+        notifier,
+        {"reason": "Gone"},
+    )
+
+    assert await _audits(db_session, booking.asset_id) == []
+
+
+async def test_restrict_reads_the_locked_renter_not_a_stale_copy(
+    db_session, clock, notifier
+) -> None:
+    booking = await _booking(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
+    renter = await db_session.get(User, booking.renter_id)
+    assert renter.restricted_at is None  # the session's copy
+    earlier = DEFAULT_NOW - timedelta(days=30)
+    # Restricted behind the session's back (as another transaction would).
+    await db_session.execute(
+        text(
+            "UPDATE users SET restricted_at = :at, restricted_reason = 'lost_item' WHERE id = :id"
+        ),
+        {"at": earlier, "id": renter.id},
+    )
+
+    await _transition(
+        db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
+    )
+
+    assert (renter.restricted_at, renter.restricted_reason) == (earlier, "lost_item")
+    assert await _audits(db_session, booking.renter_id) == []
 
 
 # ---------------------------------------------------------------------------

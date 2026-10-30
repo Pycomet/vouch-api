@@ -894,7 +894,9 @@ async def _restrict_renter(ctx: _Context, reason: str, *, override: bool) -> Non
 
     Without ``override`` an existing restriction (and its reason) is kept.
     """
-    renter = await ctx.session.get(User, ctx.booking.renter_id, with_for_update=True)
+    renter = await ctx.session.get(
+        User, ctx.booking.renter_id, with_for_update=True, populate_existing=True
+    )
     if renter.restricted_at is not None and not override:
         return
     before = {"restricted_at": renter.restricted_at, "restricted_reason": renter.restricted_reason}
@@ -969,7 +971,9 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
     await _restrict_renter(ctx, "lost_item", override=True)
 
     # Lost gear must not stay bookable (R9).
-    asset = await ctx.session.get(Asset, booking.asset_id, with_for_update=True)
+    asset = await ctx.session.get(
+        Asset, booking.asset_id, with_for_update=True, populate_existing=True
+    )
     if asset.listing_status != ListingStatus.paused:
         previous = asset.listing_status
         asset.listing_status = ListingStatus.paused
