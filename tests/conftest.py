@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,3 +27,16 @@ def settings() -> Settings:
 def client(settings: Settings):
     with TestClient(create_app(settings)) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def vouch_caplog(caplog, monkeypatch):
+    """``caplog`` at INFO that also sees the project's ``vouch.*`` loggers.
+
+    Alembic's ``fileConfig`` (run by the migration fixtures) disables every logger
+    that exists at that moment, so re-enable the project loggers for this test.
+    """
+    for name in ("vouch", "vouch.timers", "vouch.notify"):
+        monkeypatch.setattr(logging.getLogger(name), "disabled", False)
+    caplog.set_level(logging.INFO)
+    return caplog
