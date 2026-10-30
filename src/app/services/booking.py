@@ -336,6 +336,9 @@ async def _accept(ctx: _Context) -> _Outcome:
     minimum = await ctx.session.scalar(
         select(Asset.minimum_trust_tier).where(Asset.id == booking.asset_id)
     )
+    # The renter may have been restricted, or lost a tier, since the request.
+    renter = await ctx.session.get(User, booking.renter_id, populate_existing=True)
+    await _check_renter_may_book(ctx.session, renter, minimum)
     if minimum == TrustTier.vendor_approved and booking.vendor_approved_at is None:
         raise BookingGuardFailed("vendor_approval_required")
 
@@ -990,6 +993,25 @@ def _tier_allows(effective: int, minimum: int) -> bool:
     return required_tier_met(effective, minimum, vendor_approved=False)
 
 
+async def _check_renter_may_book(session: AsyncSession, user: User | None, minimum: int) -> None:
+    """The renter guards of ``request`` (re-run by ``accept``).
+
+    ``renter_restricted`` for a missing, inactive, deleted or restricted user;
+    ``tier_insufficient`` when the effective tier is below the asset's minimum.
+    """
+    if (
+        user is None
+        or not user.is_active
+        or user.deleted_at is not None
+        or user.restricted_at is not None
+    ):
+        raise BookingGuardFailed("renter_restricted")
+
+    effective = await tier_effective(session, user.id)
+    if not _tier_allows(effective, minimum):
+        raise BookingGuardFailed("tier_insufficient", {"required": minimum, "effective": effective})
+
+
 async def request_booking(
     session: AsyncSession,
     *,
@@ -1022,20 +1044,7 @@ async def request_booking(
         )
 
     user = await session.get(User, renter.user_id)
-    if (
-        user is None
-        or not user.is_active
-        or user.deleted_at is not None
-        or user.restricted_at is not None
-    ):
-        raise BookingGuardFailed("renter_restricted")
-
-    effective = await tier_effective(session, user.id)
-    if not _tier_allows(effective, asset.minimum_trust_tier):
-        raise BookingGuardFailed(
-            "tier_insufficient",
-            {"required": asset.minimum_trust_tier, "effective": effective},
-        )
+    await _check_renter_may_book(session, user, asset.minimum_trust_tier)
 
     blocked = await session.scalar(
         select(

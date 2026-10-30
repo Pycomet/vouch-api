@@ -13,16 +13,16 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import FrozenClock
 from app.core.config import get_settings
-from app.db.models import AuditEvent, AvailabilityWindow, Booking
+from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
-from app.db.models.user import RenterRole, User
+from app.db.models.user import KYCStatus, RenterRole, TrustTier, User
 from app.schemas.errors import (
     BookingGuardFailed,
     InvalidRequestError,
@@ -398,6 +398,86 @@ async def test_accept_at_exact_hold_expiry_is_409(db_session, clock, notifier) -
     await db_session.refresh(booking)
     assert booking.status == BookingStatus.requested
     assert len(await _audits(db_session, booking.id)) == 1
+
+
+async def _accept_refused(session, booking, asset, clock, notifier) -> BookingGuardFailed:
+    """Accept must fail a guard and write nothing."""
+    audits = await session.scalar(select(func.count()).select_from(AuditEvent))
+    notifier.calls.clear()
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            session, booking, vendor_actor(asset.vendor_id), BookingEvent.accept, clock, notifier
+        )
+
+    assert await session.scalar(select(func.count()).select_from(AuditEvent)) == audits
+    await session.refresh(booking)
+    assert booking.status == BookingStatus.requested
+    assert booking.deposit_due_at is None
+    assert notifier.calls == []
+    return caught.value
+
+
+@pytest.mark.parametrize("change", ["restricted", "inactive", "deleted"])
+async def test_accept_refused_when_renter_restricted_after_request(
+    db_session, clock, notifier, change
+) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    if change == "restricted":
+        renter.restricted_at = DEFAULT_NOW
+        renter.restricted_reason = "at_risk"
+    elif change == "inactive":
+        renter.is_active = False
+    else:
+        renter.deleted_at = DEFAULT_NOW
+    await db_session.flush()
+
+    error = await _accept_refused(db_session, booking, asset, clock, notifier)
+
+    assert error.code == "renter_restricted"
+
+
+async def test_accept_refused_when_renter_tier_dropped(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session, minimum_trust_tier=1)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    profile = await db_session.scalar(select(KYCProfile).where(KYCProfile.user_id == renter.id))
+    profile.status = KYCStatus.failed
+    profile.tier = TrustTier.phone_verified
+    profile.verified_at = None
+    await db_session.flush()
+
+    error = await _accept_refused(db_session, booking, asset, clock, notifier)
+
+    assert error.code == "tier_insufficient"
+    assert error.error_details == {"required": 1, "effective": 0}
+
+
+async def test_band_c_accept_refused_when_tier_dropped_even_if_approved(
+    db_session, clock, notifier
+) -> None:
+    renter = await _tier2_renter(db_session)
+    asset = await create_asset(db_session, minimum_trust_tier=3, band="C")
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    await _transition(
+        db_session,
+        booking,
+        vendor_actor(asset.vendor_id),
+        BookingEvent.approve_vendor,
+        clock,
+        notifier,
+    )
+    profile = await db_session.scalar(select(KYCProfile).where(KYCProfile.user_id == renter.id))
+    profile.status = KYCStatus.failed
+    profile.tier = TrustTier.phone_verified
+    profile.verified_at = None
+    await db_session.flush()
+
+    error = await _accept_refused(db_session, booking, asset, clock, notifier)
+
+    assert error.code == "tier_insufficient"
 
 
 async def test_band_c_accept_without_vendor_approval_refused(db_session, clock, notifier) -> None:
