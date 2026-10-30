@@ -32,7 +32,7 @@ from app.services import timers as timers_module
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, transition
 from app.services.ledger import account_balance, post_txn
-from app.services.money import deposit_captured_postings
+from app.services.money import payment_captured_postings
 from app.services.notify import RecordingNotifier
 from app.services.timers import TimerReport, run_timers
 from tests.postgres.factories import (
@@ -49,6 +49,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEPOSIT = Decimal("150000.00")
+RENTAL = Decimal("150000.00")  # the money_snapshot default
+COMMISSION = Decimal("22500.00")
 ZERO = Decimal("0.00")
 # The factory sets hold_expires_at / deposit_due_at to DEFAULT_NOW + 24h and
 # claim_window_ends_at to DEFAULT_NOW + 48h.
@@ -71,7 +73,7 @@ async def _booking(
     claimed: bool = False,
     with_deposit: bool = False,
 ) -> Booking:
-    """A booking of its own asset, with a money snapshot (and the deposit posted)."""
+    """A booking of its own asset, with a money snapshot (and the upfront payment posted)."""
     renter = await create_user(session, kyc_verified=True)
     asset = await create_asset(session, deposit_amount=DEPOSIT)
     booking = await create_booking(
@@ -88,9 +90,9 @@ async def _booking(
     if with_deposit:
         await post_txn(
             session,
-            postings=deposit_captured_postings(DEPOSIT, ZERO),
+            postings=payment_captured_postings(DEPOSIT, ZERO, RENTAL, ZERO, COMMISSION),
             booking_id=booking.id,
-            memo="deposit_captured",
+            memo="payment_captured",
         )
     return booking
 

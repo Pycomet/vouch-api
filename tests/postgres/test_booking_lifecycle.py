@@ -1,14 +1,14 @@
 """Live PostgreSQL tests for the rest of the booking state machine (Task 3.4).
 
-Covers spec 3.1 rows ``confirmed + handover_completed / balance_captured``
-(-> in_progress), ``in_progress + return_completed``, ``returned + claim_raised``,
-``returned + complete``, ``disputed + resolve``, ``in_progress + flag_at_risk`` and
-``in_progress + mark_lost``.
+Covers spec 3.1 rows ``confirmed + handover_completed`` (-> in_progress; the
+renter paid everything upfront, A14), ``in_progress + return_completed``,
+``returned + claim_raised``, ``returned + complete``, ``disputed + resolve``,
+``in_progress + flag_at_risk`` and ``in_progress + mark_lost``.
 
-The last part proves spec 3.1 as a whole: one ``test_row_<from>_<event>`` per table
-row (all 15), ``test_forbidden_transitions`` over every (status, event) pair the
-table does not allow (one test per status, one SAVEPOINT per pair), and a
-service-level happy path that checks the ledger after every step.
+The last part proves spec 3.1 as amended (A13-A16) as a whole: one
+``test_row_<from>_<event>`` per table row, ``test_forbidden_transitions`` over every
+(status, event) pair the table does not allow (one test per status, one SAVEPOINT
+per pair), and a service-level happy path that checks the ledger after every step.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from app.db.models.asset import ListingStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection
-from app.db.models.payment import PaymentStatus, PaymentType
+from app.db.models.payment import PaymentType
 from app.db.models.user import RenterRole
 from app.schemas.errors import BookingGuardFailed, InvalidRequestError, InvalidTransition
 from app.services import booking as booking_service
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, request_booking, transition
 from app.services.ledger import account_balance, post_txn
-from app.services.money import balance_captured_postings, deposit_captured_postings
+from app.services.money import payment_captured_postings
 from app.services.notify import RecordingNotifier
 from tests.postgres.factories import (
     DEFAULT_NOW,
@@ -60,7 +60,8 @@ DELIVERY = D("7500.00")
 DEPOSIT = D("150000.00")
 CONTRIBUTION = D("7500.00")
 COMMISSION = D("22500.00")  # 15% of the rental (not of the delivery fee)
-BALANCE = RENTAL + DELIVERY
+TOTAL = DEPOSIT + CONTRIBUTION + RENTAL + DELIVERY  # the one upfront payment (A14)
+VENDOR_SHARE = RENTAL + DELIVERY - COMMISSION
 START = date(2027, 1, 4)
 # Ends 2026-10-29, so at risk from 2026-10-31 23:00 UTC: before DEFAULT_NOW.
 OVERDUE_START = date(2026, 10, 27)
@@ -127,23 +128,16 @@ async def _booking(
     )
 
 
-async def _with_deposit(session: AsyncSession, status: BookingStatus, **kwargs) -> Booking:
-    """A booking in ``status`` whose deposit and damage contribution are on the ledger."""
+async def _paid(session: AsyncSession, status: BookingStatus, **kwargs) -> Booking:
+    """A booking in ``status`` whose one upfront payment (D+C+R+F) is on the ledger."""
     booking = await _booking(session, status, **kwargs)
     await post_txn(
         session,
-        postings=deposit_captured_postings(DEPOSIT, CONTRIBUTION),
+        postings=payment_captured_postings(DEPOSIT, CONTRIBUTION, RENTAL, DELIVERY, COMMISSION),
         booking_id=booking.id,
-        memo="deposit_captured",
+        memo="payment_captured",
     )
     return booking
-
-
-async def _balance_payload(session: AsyncSession, booking: Booking, amount=BALANCE) -> dict:
-    payment = await create_payment(
-        session, booking, type=PaymentType.rental_balance, amount=BALANCE
-    )
-    return {"amount": amount, "payment_id": payment.id}
 
 
 async def _audits(session: AsyncSession, entity_id: uuid.UUID) -> list[AuditEvent]:
@@ -171,92 +165,52 @@ async def _counts(session: AsyncSession) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# confirmed + handover_completed / balance_captured -> in_progress
+# confirmed + handover_completed -> in_progress (everything was paid upfront, A14)
 # ---------------------------------------------------------------------------
 
 
-async def test_handover_then_balance_moves_to_in_progress(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+async def test_handover_alone_starts_rental(db_session, clock, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
+    ledger_before = len(await _ledger(db_session, booking.id))
 
-    signed = await _transition(
-        db_session, booking, renter_actor(booking), BookingEvent.handover_completed, clock, notifier
-    )
-
-    assert signed.status == BookingStatus.confirmed
-    audit = (await _audits(db_session, booking.id))[-1]
-    assert audit.action == "booking.handover_signed"
-    assert (audit.before["status"], audit.after["status"]) == ("confirmed", "confirmed")
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == ZERO
-
-    payload = await _balance_payload(db_session, booking)
     result = await _transition(
-        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
+        db_session, booking, renter_actor(booking), BookingEvent.handover_completed, clock, notifier
     )
 
     assert result.status == BookingStatus.in_progress
     audit = (await _audits(db_session, booking.id))[-1]
     assert audit.action == "booking.in_progress"
+    assert audit.actor_role == "renter"
     assert (audit.before["status"], audit.after["status"]) == ("confirmed", "in_progress")
-    assert audit.after["amount"] == str(BALANCE)
-    assert audit.after["payment_id"] == str(payload["payment_id"])
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == (
-        BALANCE - COMMISSION
-    )
+    assert audit.after["handover"] == "pickup"
+    # Nothing more to collect: the handover moves no money.
+    assert len(await _ledger(db_session, booking.id)) == ledger_before
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE
     assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
-    balance_rows = [
-        row for row in await _ledger(db_session, booking.id) if row.memo != "deposit_captured"
-    ]
-    assert len(balance_rows) == 3
-    assert {row.payment_id for row in balance_rows} == {payload["payment_id"]}
-    assert len({row.txn_group for row in balance_rows}) == 1
     assert {call.user_id for call in notifier.calls} == {booking.renter_id, booking.vendor_id}
     assert set(notifier.templates()) == {"booking.in_progress"}
 
 
-async def test_balance_then_handover_moves_to_in_progress(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
-    payload = await _balance_payload(db_session, booking)
-
-    captured = await _transition(
-        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
-    )
-
-    assert captured.status == BookingStatus.confirmed
-    audit = (await _audits(db_session, booking.id))[-1]
-    assert audit.action == "booking.balance_captured"
-    assert audit.after["status"] == "confirmed"
-    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
-
+@pytest.mark.parametrize("role", ["vendor", "system"])
+async def test_vendor_or_system_may_record_handover(db_session, clock, notifier, role) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
+    actor = vendor_actor(booking) if role == "vendor" else Actor.system()
+
     result = await _transition(
-        db_session, booking, vendor_actor(booking), BookingEvent.handover_completed, clock, notifier
+        db_session, booking, actor, BookingEvent.handover_completed, clock, notifier
     )
 
     assert result.status == BookingStatus.in_progress
-    audit = (await _audits(db_session, booking.id))[-1]
-    assert audit.action == "booking.in_progress"
-    assert audit.actor_role == "vendor"
-    # The balance is posted once, by balance_captured.
-    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
-
-
-async def test_system_may_record_handover(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.confirmed)
-    await create_handover(db_session, booking)
-
-    result = await _transition(
-        db_session, booking, Actor.system(), BookingEvent.handover_completed, clock, notifier
-    )
-
-    assert result.status == BookingStatus.confirmed
+    assert (await _audits(db_session, booking.id))[-1].actor_role == role
 
 
 @pytest.mark.parametrize("record", ["none", "draft", "return_only"])
 async def test_handover_without_completed_pickup_is_refused(
     db_session, clock, notifier, record
 ) -> None:
-    booking = await _booking(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
     if record == "draft":
         await create_handover(db_session, booking, completed=False)
     elif record == "return_only":
@@ -276,16 +230,20 @@ async def test_handover_without_completed_pickup_is_refused(
     assert caught.value.code == "handover_incomplete"
     assert caught.value.status_code == 409
     assert await _counts(db_session) == counts
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.confirmed
 
 
 async def test_second_handover_signal_is_invalid(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
     await _transition(
         db_session, booking, renter_actor(booking), BookingEvent.handover_completed, clock, notifier
     )
+    counts = await _counts(db_session)
 
-    with pytest.raises(InvalidTransition):
+    # The first signal started the rental; in_progress has no handover_completed row.
+    with pytest.raises(InvalidTransition) as caught:
         await _transition(
             db_session,
             booking,
@@ -294,10 +252,12 @@ async def test_second_handover_signal_is_invalid(db_session, clock, notifier) ->
             clock,
             notifier,
         )
+    assert caught.value.error_details == {"from": "in_progress", "event": "handover_completed"}
+    assert await _counts(db_session) == counts
 
 
 async def test_stranger_cannot_record_handover(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
     stranger = Actor(user_id=uuid.uuid4(), role=ActorRole.renter)
 
@@ -307,101 +267,8 @@ async def test_stranger_cannot_record_handover(db_session, clock, notifier) -> N
         )
 
 
-@pytest.mark.parametrize(
-    "amount",
-    [RENTAL, BALANCE + D("0.01"), None, "abc", 157500.0, "1e40", "1234567890123", "157500.001"],
-)
-async def test_balance_amount_mismatch(db_session, clock, notifier, amount) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
-    payload = await _balance_payload(db_session, booking, amount=amount)
-    if amount is None:
-        del payload["amount"]
-    counts = await _counts(db_session)
-
-    with pytest.raises(BookingGuardFailed) as caught:
-        await _transition(
-            db_session,
-            booking,
-            Actor.system(),
-            BookingEvent.balance_captured,
-            clock,
-            notifier,
-            payload,
-        )
-
-    assert caught.value.code == "amount_mismatch"
-    assert await _counts(db_session) == counts
-
-
-async def test_balance_needs_this_bookings_captured_balance_payment(
-    db_session, clock, notifier
-) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
-    other = await _booking(db_session, BookingStatus.confirmed, starts_on=date(2027, 3, 1))
-    other_payment = await create_payment(
-        db_session, other, type=PaymentType.rental_balance, amount=BALANCE
-    )
-    deposit = await create_payment(db_session, booking, amount=DEPOSIT)
-    pending = await create_payment(
-        db_session,
-        booking,
-        type=PaymentType.rental_balance,
-        amount=BALANCE,
-        status=PaymentStatus.pending,
-    )
-    counts = await _counts(db_session)
-
-    for payment_id in (other_payment.id, deposit.id, pending.id, uuid.uuid4(), "nope", None):
-        with pytest.raises(InvalidRequestError):
-            await _transition(
-                db_session,
-                booking,
-                Actor.system(),
-                BookingEvent.balance_captured,
-                clock,
-                notifier,
-                {"amount": BALANCE, "payment_id": payment_id},
-            )
-    assert await _counts(db_session) == counts
-
-
-async def test_second_balance_capture_is_invalid(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
-    payload = await _balance_payload(db_session, booking)
-    await _transition(
-        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
-    )
-    counts = await _counts(db_session)
-
-    with pytest.raises(InvalidTransition):
-        await _transition(
-            db_session,
-            booking,
-            Actor.system(),
-            BookingEvent.balance_captured,
-            clock,
-            notifier,
-            await _balance_payload(db_session, booking),
-        )
-    assert (await _counts(db_session))[0] == counts[0]
-    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
-
-
-async def test_commission_is_frozen_in_the_snapshot(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.confirmed)
-    booking.price_snapshot = {**booking.price_snapshot, "commission_rate": "0.125"}
-    await db_session.flush()
-    payload = await _balance_payload(db_session, booking)
-
-    await _transition(
-        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
-    )
-
-    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == D("18750.00")
-
-
 # ---------------------------------------------------------------------------
-# confirmed + cancel after the balance is captured (balance first, handover later)
+# confirmed + cancel: the whole upfront payment is reversed
 # ---------------------------------------------------------------------------
 
 
@@ -412,17 +279,11 @@ async def test_commission_is_frozen_in_the_snapshot(db_session, clock, notifier)
         (ActorRole.vendor, BookingStatus.cancelled_by_vendor),
     ],
 )
-async def test_cancel_after_balance_refunds_everything(
+async def test_cancel_confirmed_refunds_everything(
     db_session, clock, notifier, role, status
 ) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
-    payload = await _balance_payload(db_session, booking)
-    await _transition(
-        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
-    )
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == (
-        BALANCE - COMMISSION
-    )
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE
     actor = renter_actor(booking) if role == ActorRole.renter else vendor_actor(booking)
 
     result = await _transition(
@@ -440,7 +301,7 @@ async def test_cancel_after_balance_refunds_everything(
         assert await _balance(db_session, account, booking.id) == ZERO, account
     assert await _whole_ledger_balanced(db_session)
     refund_rows = [
-        row for row in await _ledger(db_session, booking.id) if row.memo == "cancel_balance_refund"
+        row for row in await _ledger(db_session, booking.id) if row.memo == "cancel_rental_refund"
     ]
     assert len(refund_rows) == 3
     assert len({row.txn_group for row in refund_rows}) == 1
@@ -455,23 +316,10 @@ async def test_cancel_after_balance_refunds_everything(
 
 
 @pytest.mark.parametrize("role", [ActorRole.renter, ActorRole.vendor])
-@pytest.mark.parametrize("balance_paid", [False, True])
-async def test_cancel_after_pickup_handover_is_refused(
-    db_session, clock, notifier, role, balance_paid
-) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+async def test_cancel_after_pickup_handover_is_refused(db_session, clock, notifier, role) -> None:
+    # Both signed the pickup, but handover_completed has not run yet: still confirmed.
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
-    if balance_paid:
-        payload = await _balance_payload(db_session, booking)
-        # Handover signed and balance paid would start the rental, so post the
-        # balance through the ledger only: the booking stays confirmed.
-        await post_txn(
-            db_session,
-            postings=balance_captured_postings(RENTAL, DELIVERY, COMMISSION),
-            booking_id=booking.id,
-            payment_id=payload["payment_id"],
-            memo="balance_captured",
-        )
     actor = renter_actor(booking) if role == ActorRole.renter else vendor_actor(booking)
     counts = await _counts(db_session)
     penalties = len(await _audits(db_session, booking.vendor_id))
@@ -492,7 +340,7 @@ async def test_cancel_after_pickup_handover_is_refused(
 
 
 async def test_cancel_with_only_a_draft_pickup_is_allowed(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking, completed=False)
 
     result = await _transition(
@@ -559,7 +407,7 @@ CLAIM = {
 
 
 async def test_claim_within_window_disputes(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(booking.claim_window_ends_at - DEFAULT_NOW - timedelta(seconds=1))
 
     result = await _transition(
@@ -589,7 +437,7 @@ async def test_claim_within_window_disputes(db_session, clock, notifier) -> None
 
 
 async def test_claim_after_window_409(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(booking.claim_window_ends_at - DEFAULT_NOW)  # exactly at the end
     counts = await _counts(db_session)
 
@@ -669,7 +517,7 @@ async def test_renter_cannot_raise_claim(db_session, clock, notifier) -> None:
 
 
 async def test_complete_after_window_releases_deposit(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(booking.claim_window_ends_at - DEFAULT_NOW + timedelta(seconds=1))
 
     result = await _transition(
@@ -686,7 +534,7 @@ async def test_complete_after_window_releases_deposit(db_session, clock, notifie
 
 
 async def test_complete_at_window_end_is_invalid(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(booking.claim_window_ends_at - DEFAULT_NOW)
     counts = await _counts(db_session)
 
@@ -698,7 +546,7 @@ async def test_complete_at_window_end_is_invalid(db_session, clock, notifier) ->
 
 
 async def test_complete_with_claim_is_invalid(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned, claimed=True)
+    booking = await _paid(db_session, BookingStatus.returned, claimed=True)
     clock.advance(timedelta(days=3))
 
     with pytest.raises(InvalidTransition):
@@ -708,7 +556,7 @@ async def test_complete_with_claim_is_invalid(db_session, clock, notifier) -> No
 
 
 async def test_vendor_cannot_complete(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(timedelta(days=3))
 
     with pytest.raises(InvalidTransition):
@@ -733,7 +581,7 @@ async def test_vendor_cannot_complete(db_session, clock, notifier) -> None:
 async def test_resolve_decisions(
     db_session, clock, notifier, decision, amount, action, vendor_gets, cash_out
 ) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
     admin = await admin_actor(db_session)
     cash_before = await _balance(db_session, LedgerAccount.platform_cash, booking.id)
     payload = {"decision": decision, "reason": "  Photos reviewed  "}
@@ -746,7 +594,10 @@ async def test_resolve_decisions(
 
     assert result.status == BookingStatus.completed
     assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == vendor_gets
+    assert (
+        await _balance(db_session, LedgerAccount.vendor_payable, booking.id)
+        == VENDOR_SHARE + vendor_gets
+    )
     cash_after = await _balance(db_session, LedgerAccount.platform_cash, booking.id)
     assert cash_after - cash_before == cash_out
     audits = await _audits(db_session, booking.id)
@@ -760,7 +611,7 @@ async def test_resolve_decisions(
 
 
 async def test_resolve_deduct_capped_at_deposit(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
     admin = await admin_actor(db_session)
 
     await _transition(
@@ -773,7 +624,10 @@ async def test_resolve_deduct_capped_at_deposit(db_session, clock, notifier) -> 
         {"decision": "deduct", "amount": "900000.00", "reason": "Total loss of the body"},
     )
 
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == DEPOSIT
+    assert (
+        await _balance(db_session, LedgerAccount.vendor_payable, booking.id)
+        == VENDOR_SHARE + DEPOSIT
+    )
     assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
     final = (await _audits(db_session, booking.id))[-1]
     assert final.after["amount"] == str(DEPOSIT)
@@ -782,7 +636,7 @@ async def test_resolve_deduct_capped_at_deposit(db_session, clock, notifier) -> 
 
 @pytest.mark.parametrize("reason", [None, "", "   ", 5])
 async def test_resolve_requires_reason(db_session, clock, notifier, reason) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
     admin = await admin_actor(db_session)
     payload = {"decision": "release"}
     if reason is not None:
@@ -816,7 +670,7 @@ async def test_resolve_requires_reason(db_session, clock, notifier, reason) -> N
     ],
 )
 async def test_resolve_payload_is_validated(db_session, clock, notifier, payload) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
     admin = await admin_actor(db_session)
     counts = await _counts(db_session)
 
@@ -835,7 +689,7 @@ async def test_resolve_payload_is_validated(db_session, clock, notifier, payload
 
 @pytest.mark.parametrize("role", ["renter", "vendor", "system"])
 async def test_only_admin_resolves(db_session, clock, notifier, role) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
     actor = {
         "renter": renter_actor(booking),
         "vendor": vendor_actor(booking),
@@ -860,7 +714,7 @@ async def test_only_admin_resolves(db_session, clock, notifier, role) -> None:
 
 
 async def test_flag_at_risk_freezes_renter(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
+    booking = await _paid(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
 
     result = await _transition(
         db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
@@ -881,7 +735,7 @@ async def test_flag_at_risk_freezes_renter(db_session, clock, notifier) -> None:
     assert user_audit.after["restricted_reason"] == "at_risk"
     assert notifier.templates() == ["ops.at_risk"]
     assert notifier.calls[0].user_id is None
-    assert len(await _ledger(db_session, booking.id)) == 3  # only the deposit group
+    assert len(await _ledger(db_session, booking.id)) == 5  # only the upfront payment group
 
 
 async def test_second_at_risk_flag_is_invalid(db_session, clock, notifier) -> None:
@@ -922,7 +776,7 @@ def _at_risk_from(booking: Booking) -> datetime:
 
 
 async def test_flag_at_risk_before_the_cutoff_is_invalid(db_session, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     early = FrozenClock(_at_risk_from(booking) - timedelta(seconds=1))
     counts = await _counts(db_session)
 
@@ -941,7 +795,7 @@ async def test_flag_at_risk_before_the_cutoff_is_invalid(db_session, notifier) -
 
 
 async def test_flag_at_risk_at_the_cutoff_flags(db_session, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     at = FrozenClock(_at_risk_from(booking))
 
     result = await _transition(
@@ -972,7 +826,7 @@ def _lost_from(booking: Booking):
 
 
 async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     admin = await admin_actor(db_session)
     clock = FrozenClock(_lost_from(booking))
 
@@ -988,7 +842,10 @@ async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> Non
 
     assert result.status == BookingStatus.lost
     assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == DEPOSIT
+    assert (
+        await _balance(db_session, LedgerAccount.vendor_payable, booking.id)
+        == VENDOR_SHARE + DEPOSIT
+    )
     renter = await db_session.get(User, booking.renter_id)
     await db_session.refresh(renter)
     assert renter.restricted_reason == "lost_item"
@@ -1015,7 +872,7 @@ async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> Non
 
 
 async def test_mark_lost_before_t_plus_7_409(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     admin = await admin_actor(db_session)
     clock = FrozenClock(_lost_from(booking) - timedelta(seconds=1))
     counts = await _counts(db_session)
@@ -1039,7 +896,7 @@ async def test_mark_lost_before_t_plus_7_409(db_session, clock, notifier) -> Non
 
 @pytest.mark.parametrize("payload", [None, {"reason": "  "}])
 async def test_mark_lost_requires_reason(db_session, clock, notifier, payload) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     admin = await admin_actor(db_session)
     clock = FrozenClock(_lost_from(booking))
     counts = await _counts(db_session)
@@ -1063,7 +920,7 @@ async def test_mark_lost_requires_reason(db_session, clock, notifier, payload) -
 async def test_mark_lost_boundary_absolute_instant(db_session, notifier, instant, allowed) -> None:
     """ends_on 2027-01-06 + 7 days = 13 Jan; Africa/Lagos midnight is 23:00Z on the 12th."""
     assert get_settings().business_timezone == "Africa/Lagos"
-    booking = await _with_deposit(db_session, BookingStatus.in_progress, ends_on=date(2027, 1, 6))
+    booking = await _paid(db_session, BookingStatus.in_progress, ends_on=date(2027, 1, 6))
     assert booking.ends_on == date(2027, 1, 6)
     admin = await admin_actor(db_session)
 
@@ -1102,7 +959,7 @@ async def test_vendor_cannot_mark_lost(db_session, clock, notifier) -> None:
 
 
 async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     asset = await db_session.get(Asset, booking.asset_id)
     asset.listing_status = ListingStatus.paused
     await db_session.flush()
@@ -1125,7 +982,7 @@ async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, 
 async def test_mark_lost_reads_the_locked_asset_not_a_stale_copy(
     db_session, clock, notifier
 ) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
     asset = await db_session.get(Asset, booking.asset_id)
     assert asset.listing_status == ListingStatus.active  # the session's copy
     # Paused behind the session's back (as another transaction would).
@@ -1243,23 +1100,25 @@ async def test_row_requested_expire_hold(db_session, clock, notifier) -> None:
     assert notifier.templates() == ["booking.expired"]
 
 
-async def test_row_accepted_deposit_captured(db_session, clock, notifier) -> None:
+async def test_row_accepted_payment_captured(db_session, clock, notifier) -> None:
     booking = await _booking(db_session, BookingStatus.accepted)
-    payment = await create_payment(db_session, booking, amount=DEPOSIT + CONTRIBUTION)
+    payment = await create_payment(db_session, booking, type=PaymentType.booking, amount=TOTAL)
 
     result = await _transition(
         db_session,
         booking,
         Actor.system(),
-        BookingEvent.deposit_captured,
+        BookingEvent.payment_captured,
         clock,
         notifier,
-        {"amount": DEPOSIT + CONTRIBUTION, "payment_id": payment.id},
+        {"amount": TOTAL, "payment_id": payment.id},
     )
 
     assert result.status == BookingStatus.confirmed
     liability = LedgerAccount.renter_deposit_liability
     assert await _balance(db_session, liability, booking.id) == DEPOSIT
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE
+    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
     assert [a.action for a in (await _audits(db_session, booking.id))[-2:]] == [
         "booking.deposit_paid",
         "booking.confirmed",
@@ -1280,7 +1139,7 @@ async def test_row_accepted_expire_deposit(db_session, clock, notifier) -> None:
 
 
 async def test_row_confirmed_cancel_renter(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
 
     result = await _transition(
         db_session, booking, renter_actor(booking), BookingEvent.cancel, clock, notifier
@@ -1293,7 +1152,7 @@ async def test_row_confirmed_cancel_renter(db_session, clock, notifier) -> None:
 
 
 async def test_row_confirmed_cancel_vendor(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    booking = await _paid(db_session, BookingStatus.confirmed)
     clock.advance(timedelta(days=90))  # any time, even after the start
 
     result = await _transition(
@@ -1313,33 +1172,18 @@ async def test_row_confirmed_cancel_vendor(db_session, clock, notifier) -> None:
     assert penalty.action == "vendor.reliability_penalty"
 
 
-async def test_row_confirmed_handover_completed_balance_captured(
-    db_session, clock, notifier
-) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+async def test_row_confirmed_handover_completed(db_session, clock, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking)
-    await _transition(
-        db_session, booking, renter_actor(booking), BookingEvent.handover_completed, clock, notifier
-    )
-    assert booking.status == BookingStatus.confirmed
 
     result = await _transition(
-        db_session,
-        booking,
-        Actor.system(),
-        BookingEvent.balance_captured,
-        clock,
-        notifier,
-        await _balance_payload(db_session, booking),
+        db_session, booking, renter_actor(booking), BookingEvent.handover_completed, clock, notifier
     )
 
     assert result.status == BookingStatus.in_progress
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == (
-        BALANCE - COMMISSION
-    )
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE
     assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
-    assert [a.action for a in (await _audits(db_session, booking.id))[-2:]] == [
-        "booking.handover_signed",
+    assert [a.action for a in (await _audits(db_session, booking.id))[-1:]] == [
         "booking.in_progress",
     ]
 
@@ -1358,7 +1202,7 @@ async def test_row_in_progress_return_completed(db_session, clock, notifier) -> 
 
 
 async def test_row_returned_claim_raised(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
 
     result = await _transition(
         db_session,
@@ -1379,7 +1223,7 @@ async def test_row_returned_claim_raised(db_session, clock, notifier) -> None:
 
 
 async def test_row_returned_complete(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.returned)
+    booking = await _paid(db_session, BookingStatus.returned)
     clock.advance(booking.claim_window_ends_at - DEFAULT_NOW + timedelta(seconds=1))
 
     result = await _transition(
@@ -1393,7 +1237,7 @@ async def test_row_returned_complete(db_session, clock, notifier) -> None:
 
 
 async def test_row_disputed_resolve(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    booking = await _paid(db_session, BookingStatus.disputed, claimed=True)
 
     result = await _transition(
         db_session,
@@ -1406,7 +1250,9 @@ async def test_row_disputed_resolve(db_session, clock, notifier) -> None:
     )
 
     assert result.status == BookingStatus.completed
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == D("20000.00")
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE + D(
+        "20000.00"
+    )
     final = (await _audits(db_session, booking.id))[-1]
     assert (final.action, final.reason) == ("booking.completed", "Scratch confirmed")
 
@@ -1426,7 +1272,7 @@ async def test_row_in_progress_flag_at_risk(db_session, clock, notifier) -> None
 
 
 async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _paid(db_session, BookingStatus.in_progress)
 
     result = await _transition(
         db_session,
@@ -1439,7 +1285,10 @@ async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
     )
 
     assert result.status == BookingStatus.lost
-    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == DEPOSIT
+    assert (
+        await _balance(db_session, LedgerAccount.vendor_payable, booking.id)
+        == VENDOR_SHARE + DEPOSIT
+    )
     renter = await db_session.get(User, booking.renter_id)
     assert renter.restricted_reason == "lost_item"
     asset = await db_session.get(Asset, booking.asset_id)
@@ -1452,19 +1301,18 @@ async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
 
 S, E = BookingStatus, BookingEvent
 
-# Written out by hand from spec 3.1 (plus the A3 vendor-approval step), so a
-# registry bug cannot silently shrink the forbidden list below.
+# Written out by hand from spec 3.1 as amended (A3 vendor approval; A14 one upfront
+# payment, so no balance step), so a registry bug cannot silently shrink the forbidden list below.
 EXPECTED_ALLOWED = frozenset(
     {
         (S.requested, E.accept),
         (S.requested, E.decline),
         (S.requested, E.approve_vendor),
         (S.requested, E.expire_hold),
-        (S.accepted, E.deposit_captured),
+        (S.accepted, E.payment_captured),
         (S.accepted, E.expire_deposit),
         (S.confirmed, E.cancel),
         (S.confirmed, E.handover_completed),
-        (S.confirmed, E.balance_captured),
         (S.in_progress, E.return_completed),
         (S.in_progress, E.flag_at_risk),
         (S.in_progress, E.mark_lost),
@@ -1487,11 +1335,10 @@ EVENT_ROLE = {
     E.decline: ActorRole.vendor,
     E.approve_vendor: ActorRole.vendor,
     E.expire_hold: ActorRole.system,
-    E.deposit_captured: ActorRole.system,
+    E.payment_captured: ActorRole.system,
     E.expire_deposit: ActorRole.system,
     E.cancel: ActorRole.renter,
     E.handover_completed: ActorRole.renter,
-    E.balance_captured: ActorRole.system,
     E.return_completed: ActorRole.renter,
     E.claim_raised: ActorRole.vendor,
     E.complete: ActorRole.system,
@@ -1504,7 +1351,7 @@ EVENT_ROLE = {
 def test_registry_is_exactly_the_spec_table() -> None:
     assert set(booking_service._TRANSITIONS) == EXPECTED_ALLOWED
     assert len(FORBIDDEN) == len(BookingStatus) * len(BookingEvent) - len(EXPECTED_ALLOWED)
-    assert len(FORBIDDEN) == 180
+    assert len(FORBIDDEN) == 168
     for (_status, event), rule in booking_service._TRANSITIONS.items():
         assert EVENT_ROLE[event] in rule.roles
 
@@ -1515,19 +1362,18 @@ async def test_forbidden_transitions(db_session, notifier, status) -> None:
 
     One booking per status (one ``db_session`` setup), each forbidden event tried
     inside its own SAVEPOINT. The booking is given every fact a guard could ask for
-    (completed pickup and return records, a captured balance, a long-past clock),
+    (completed pickup and return records, a captured upfront payment, a long-past
+    clock),
     so only the missing table row can refuse the event.
     """
     events = [event for (s, event) in FORBIDDEN if s == status]
     allowed_here = [pair for pair in EXPECTED_ALLOWED if pair[0] == status]
     assert len(events) == len(BookingEvent) - len(allowed_here)
 
-    booking = await _with_deposit(db_session, status, claimed=status == BookingStatus.disputed)
+    booking = await _paid(db_session, status, claimed=status == BookingStatus.disputed)
     await create_handover(db_session, booking)
     await create_handover(db_session, booking, direction=HandoverDirection.return_)
-    balance = await create_payment(
-        db_session, booking, type=PaymentType.rental_balance, amount=BALANCE
-    )
+    payment = await create_payment(db_session, booking, type=PaymentType.booking, amount=TOTAL)
     admin = await create_user(db_session, role=RenterRole.admin)
     actors = {
         ActorRole.renter: renter_actor(booking),
@@ -1537,8 +1383,8 @@ async def test_forbidden_transitions(db_session, notifier, status) -> None:
     }
     payload = {
         **CLAIM,
-        "amount": BALANCE,
-        "payment_id": balance.id,
+        "amount": TOTAL,
+        "payment_id": payment.id,
         "decision": "release",
         "reason": "Forbidden-pair check",
     }
@@ -1628,36 +1474,24 @@ async def test_happy_path_ledger_at_every_step(db_session, clock, notifier) -> N
     await _transition(db_session, booking, vendor_actor(booking), E.accept, clock, notifier)
     await check(BookingStatus.accepted, ZERO, ZERO, ZERO)
 
-    deposit_payment = await create_payment(db_session, booking, amount=deposit + contribution)
+    total = deposit + contribution + rental + delivery
+    payment = await create_payment(db_session, booking, type=PaymentType.booking, amount=total)
     await _transition(
         db_session,
         booking,
         Actor.system(),
-        E.deposit_captured,
+        E.payment_captured,
         clock,
         notifier,
-        {"amount": deposit + contribution, "payment_id": deposit_payment.id},
+        {"amount": total, "payment_id": payment.id},
     )
-    await check(BookingStatus.confirmed, deposit, ZERO, ZERO)
+    await check(BookingStatus.confirmed, deposit, vendor_share, commission)
     assert await _balance(db_session, LedgerAccount.protection_pool, booking.id) == contribution
+    assert -(await _balance(db_session, LedgerAccount.platform_cash, booking.id)) == total
 
     await create_handover(db_session, booking)
     await _transition(
         db_session, booking, renter_actor(booking), E.handover_completed, clock, notifier
-    )
-    await check(BookingStatus.confirmed, deposit, ZERO, ZERO)
-
-    balance_payment = await create_payment(
-        db_session, booking, type=PaymentType.rental_balance, amount=rental + delivery
-    )
-    await _transition(
-        db_session,
-        booking,
-        Actor.system(),
-        E.balance_captured,
-        clock,
-        notifier,
-        {"amount": rental + delivery, "payment_id": balance_payment.id},
     )
     await check(BookingStatus.in_progress, deposit, vendor_share, commission)
 
@@ -1686,7 +1520,6 @@ async def test_happy_path_ledger_at_every_step(db_session, clock, notifier) -> N
         ("requested", "accepted"),
         ("accepted", "deposit_paid"),
         ("deposit_paid", "confirmed"),
-        ("confirmed", "confirmed"),
         ("confirmed", "in_progress"),
         ("in_progress", "returned"),
         ("returned", "completed"),

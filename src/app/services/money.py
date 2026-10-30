@@ -108,40 +108,15 @@ def cancellation_fee_postings(vendor_part: Decimal, platform_part: Decimal) -> l
     )
 
 
-def deposit_captured_postings(deposit: Decimal, contribution: Decimal) -> list[Posting]:
-    """dr platform_cash D+C / cr renter_deposit_liability D / cr protection_pool C."""
-    d = _amount(deposit, "deposit")
-    c = _amount(contribution, "contribution")
-    return _group(
-        (LedgerAccount.platform_cash, Direction.dr, d + c),
-        (LedgerAccount.renter_deposit_liability, Direction.cr, d),
-        (LedgerAccount.protection_pool, Direction.cr, c),
-    )
-
-
-def balance_captured_postings(
-    rental: Decimal, delivery_fee: Decimal, commission: Decimal
-) -> list[Posting]:
-    """dr platform_cash R+F / cr vendor_payable R+F-K / cr platform_revenue K."""
-    r = _amount(rental, "rental")
-    f = _amount(delivery_fee, "delivery_fee")
-    k = _amount(commission, "commission")
-    if k > r + f:
-        raise ValueError("commission must not exceed rental plus delivery fee")
-    return _group(
-        (LedgerAccount.platform_cash, Direction.dr, r + f),
-        (LedgerAccount.vendor_payable, Direction.cr, r + f - k),
-        (LedgerAccount.platform_revenue, Direction.cr, k),
-    )
-
-
-def balance_refund_postings(
+def rental_refund_postings(
     rental: Decimal, delivery_fee: Decimal, commission: Decimal
 ) -> list[Posting]:
     """dr vendor_payable R+F-K / dr platform_revenue K / cr platform_cash R+F.
 
-    The exact reverse of :func:`balance_captured_postings`: the rental balance
-    goes back to the renter (a cancel after the balance was captured).
+    The exact reverse of the rental lines of :func:`payment_captured_postings`:
+    the rental and delivery fee go back to the renter when a paid booking is
+    cancelled (:func:`deposit_release_postings` and
+    :func:`refund_contribution_postings` reverse the rest).
     """
     r = _amount(rental, "rental")
     f = _amount(delivery_fee, "delivery_fee")

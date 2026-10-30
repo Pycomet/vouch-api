@@ -1,8 +1,8 @@
 """Live PostgreSQL tests for the money transitions (Task 3.3).
 
-Covers spec 3.1 rows ``accepted + deposit_captured`` (deposit_paid -> confirmed),
-``accepted + expire_deposit`` and ``confirmed + cancel`` (renter and vendor), with
-their ledger postings (spec 2.5) and the A8 full-refund policy.
+Covers spec 3.1 rows ``accepted + payment_captured`` (deposit_paid -> confirmed; the
+one upfront payment of A14), ``accepted + expire_deposit`` and ``confirmed + cancel``
+(renter and vendor), with their ledger postings (spec 2.5).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
-from app.db.models.payment import PaymentType
+from app.db.models.payment import PaymentStatus, PaymentType
 from app.db.models.user import User
 from app.schemas.errors import BookingGuardFailed, InvalidRequestError, InvalidTransition
 from app.services.audit import Actor
@@ -45,6 +45,9 @@ pytestmark = pytest.mark.skipif(
 D = Decimal
 DEPOSIT = D("150000.00")
 CONTRIBUTION = D("7500.00")
+RENTAL = D("150000.00")  # the money_snapshot default; no delivery fee
+COMMISSION = D("22500.00")  # 15% of the rental
+TOTAL = DEPOSIT + CONTRIBUTION + RENTAL
 START = date(2027, 1, 4)
 
 
@@ -86,7 +89,7 @@ async def _accepted(
     contribution: Decimal = CONTRIBUTION,
     starts_on: date = START,
 ) -> tuple[Booking, uuid.UUID]:
-    """An accepted booking with a money snapshot and its captured deposit payment."""
+    """An accepted booking with a money snapshot and its captured upfront payment."""
     renter = await create_user(session, kyc_verified=True)
     asset = await create_asset(session, deposit_amount=deposit)
     booking = await create_booking(
@@ -98,7 +101,9 @@ async def _accepted(
         deposit_amount=deposit,
         price_snapshot=money_snapshot(deposit=str(deposit), damage_contribution=str(contribution)),
     )
-    payment = await create_payment(session, booking, amount=deposit + contribution)
+    payment = await create_payment(
+        session, booking, type=PaymentType.booking, amount=deposit + contribution + RENTAL
+    )
     return booking, payment.id
 
 
@@ -110,10 +115,10 @@ async def _confirmed(session, clock, notifier, **kwargs) -> Booking:
         session,
         booking,
         Actor.system(),
-        BookingEvent.deposit_captured,
+        BookingEvent.payment_captured,
         clock,
         notifier,
-        {"amount": deposit + contribution, "payment_id": payment_id},
+        {"amount": deposit + contribution + RENTAL, "payment_id": payment_id},
     )
     notifier.calls.clear()
     return booking
@@ -142,41 +147,45 @@ async def _phone(session: AsyncSession, user_id: uuid.UUID) -> str:
 
 
 # ---------------------------------------------------------------------------
-# deposit_captured
+# payment_captured (A14: D + C + R + F in one payment)
 # ---------------------------------------------------------------------------
 
 
-async def test_deposit_captured_confirms_and_posts(db_session, clock, notifier) -> None:
+async def test_payment_captured_posts_one_group(db_session, clock, notifier) -> None:
     booking, payment_id = await _accepted(db_session)
 
     result = await _transition(
         db_session,
         booking,
         Actor.system(),
-        BookingEvent.deposit_captured,
+        BookingEvent.payment_captured,
         clock,
         notifier,
-        {"amount": DEPOSIT + CONTRIBUTION, "payment_id": payment_id},
+        {"amount": TOTAL, "payment_id": payment_id},
     )
 
     assert result.status == BookingStatus.confirmed
     liability = LedgerAccount.renter_deposit_liability
     assert await _balance(db_session, liability, booking.id) == DEPOSIT
     assert await _balance(db_session, LedgerAccount.protection_pool, booking.id) == CONTRIBUTION
-    assert await _balance(db_session, LedgerAccount.platform_cash, booking.id) == -(
-        DEPOSIT + CONTRIBUTION
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == (
+        RENTAL - COMMISSION
     )
+    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == COMMISSION
+    assert await _balance(db_session, LedgerAccount.platform_cash, booking.id) == -TOTAL
     rows = await _ledger(db_session, booking.id)
-    assert len(rows) == 3
+    assert len(rows) == 5
     assert {row.payment_id for row in rows} == {payment_id}
     assert len({row.txn_group for row in rows}) == 1
+    assert {row.memo for row in rows} == {"payment_captured"}
 
     audits = await _audits(db_session, booking.id)
     assert [a.action for a in audits[-2:]] == ["booking.deposit_paid", "booking.confirmed"]
     paid, confirmed = audits[-2:]
     assert (paid.before["status"], paid.after["status"]) == ("accepted", "deposit_paid")
-    assert paid.after["amount"] == str(DEPOSIT + CONTRIBUTION)
+    assert paid.after["amount"] == str(TOTAL)
     assert paid.after["payment_id"] == str(payment_id)
+    assert paid.after["commission"] == str(COMMISSION)
     assert (confirmed.before["status"], confirmed.after["status"]) == ("deposit_paid", "confirmed")
     assert paid.actor_role == confirmed.actor_role == "system"
 
@@ -188,30 +197,47 @@ async def test_deposit_captured_confirms_and_posts(db_session, clock, notifier) 
     assert vendor_call.data["counterpart_phone"] == await _phone(db_session, booking.renter_id)
 
 
-async def test_deposit_captured_without_damage_contribution(db_session, clock, notifier) -> None:
+async def test_payment_captured_without_damage_contribution(db_session, clock, notifier) -> None:
     booking, payment_id = await _accepted(db_session, contribution=D("0.00"))
 
     await _transition(
         db_session,
         booking,
         Actor.system(),
-        BookingEvent.deposit_captured,
+        BookingEvent.payment_captured,
         clock,
         notifier,
-        {"amount": DEPOSIT, "payment_id": payment_id},
+        {"amount": DEPOSIT + RENTAL, "payment_id": payment_id},
     )
 
     rows = await _ledger(db_session, booking.id)
-    assert len(rows) == 2
-    assert {row.account for row in rows} == {"platform_cash", "renter_deposit_liability"}
+    assert len(rows) == 4
+    assert {row.account for row in rows} == {
+        "platform_cash",
+        "renter_deposit_liability",
+        "vendor_payable",
+        "platform_revenue",
+    }
     assert await _balance(db_session, LedgerAccount.protection_pool, booking.id) == D("0.00")
 
 
 @pytest.mark.parametrize(
     "amount",
-    [DEPOSIT, DEPOSIT + CONTRIBUTION + D("0.01"), None, "abc", "1e40", "1234567890123"],
+    [
+        DEPOSIT + CONTRIBUTION,  # the old deposit-only payment is no longer enough
+        DEPOSIT,
+        RENTAL,
+        TOTAL - D("0.01"),
+        TOTAL + D("0.01"),
+        None,
+        "abc",
+        307500.0,
+        "1e40",
+        "1234567890123",
+        "307500.001",
+    ],
 )
-async def test_deposit_amount_mismatch_no_transition(db_session, clock, notifier, amount) -> None:
+async def test_payment_captured_requires_full_amount(db_session, clock, notifier, amount) -> None:
     booking, payment_id = await _accepted(db_session)
     audits_before = len(await _audits(db_session, booking.id))
     payload = {"payment_id": payment_id}
@@ -223,13 +249,14 @@ async def test_deposit_amount_mismatch_no_transition(db_session, clock, notifier
             db_session,
             booking,
             Actor.system(),
-            BookingEvent.deposit_captured,
+            BookingEvent.payment_captured,
             clock,
             notifier,
             payload,
         )
 
     assert caught.value.code == "amount_mismatch"
+    assert caught.value.error_details["expected"] == str(TOTAL)
     await db_session.refresh(booking)
     assert booking.status == BookingStatus.accepted
     assert await _ledger(db_session, booking.id) == []
@@ -237,41 +264,53 @@ async def test_deposit_amount_mismatch_no_transition(db_session, clock, notifier
     assert notifier.calls == []
 
 
-async def test_deposit_amount_compares_as_decimal(db_session, clock, notifier) -> None:
+async def test_payment_amount_compares_as_decimal(db_session, clock, notifier) -> None:
     booking, payment_id = await _accepted(db_session)
 
     result = await _transition(
         db_session,
         booking,
         Actor.system(),
-        BookingEvent.deposit_captured,
+        BookingEvent.payment_captured,
         clock,
         notifier,
-        {"amount": "157500.0", "payment_id": str(payment_id)},
+        {"amount": "307500.0", "payment_id": str(payment_id)},
     )
 
     assert result.status == BookingStatus.confirmed
 
 
-async def test_deposit_captured_needs_this_bookings_deposit_payment(
+async def test_payment_captured_needs_this_bookings_captured_payment(
     db_session, clock, notifier
 ) -> None:
     booking, _ = await _accepted(db_session)
     other, other_payment = await _accepted(db_session, starts_on=date(2027, 2, 1))
+    deposit = await create_payment(db_session, booking, amount=TOTAL)
     balance = await create_payment(
-        db_session, booking, type=PaymentType.rental_balance, amount=D("1.00")
+        db_session, booking, type=PaymentType.rental_balance, amount=TOTAL
+    )
+    pending = await create_payment(
+        db_session, booking, type=PaymentType.booking, amount=TOTAL, status=PaymentStatus.pending
     )
 
-    for payment_id in (other_payment, balance.id, uuid.uuid4(), "not-a-uuid", None):
+    for payment_id in (
+        other_payment,
+        deposit.id,
+        balance.id,
+        pending.id,
+        uuid.uuid4(),
+        "not-a-uuid",
+        None,
+    ):
         with pytest.raises(InvalidRequestError):
             await _transition(
                 db_session,
                 booking,
                 Actor.system(),
-                BookingEvent.deposit_captured,
+                BookingEvent.payment_captured,
                 clock,
                 notifier,
-                {"amount": DEPOSIT + CONTRIBUTION, "payment_id": payment_id},
+                {"amount": TOTAL, "payment_id": payment_id},
             )
 
     await db_session.refresh(booking)
@@ -280,7 +319,7 @@ async def test_deposit_captured_needs_this_bookings_deposit_payment(
 
 
 @pytest.mark.parametrize("role", ["renter", "vendor"])
-async def test_only_system_captures_deposit(db_session, clock, notifier, role) -> None:
+async def test_only_system_captures_payment(db_session, clock, notifier, role) -> None:
     booking, payment_id = await _accepted(db_session)
     actor = renter_actor(booking.renter_id) if role == "renter" else vendor_actor(booking.vendor_id)
 
@@ -289,28 +328,47 @@ async def test_only_system_captures_deposit(db_session, clock, notifier, role) -
             db_session,
             booking,
             actor,
-            BookingEvent.deposit_captured,
+            BookingEvent.payment_captured,
             clock,
             notifier,
-            {"amount": DEPOSIT + CONTRIBUTION, "payment_id": payment_id},
+            {"amount": TOTAL, "payment_id": payment_id},
         )
 
 
-async def test_second_deposit_capture_is_invalid(db_session, clock, notifier) -> None:
+async def test_second_payment_capture_is_invalid(db_session, clock, notifier) -> None:
     booking = await _confirmed(db_session, clock, notifier)
-    payment = await create_payment(db_session, booking, amount=DEPOSIT + CONTRIBUTION)
+    payment = await create_payment(db_session, booking, type=PaymentType.booking, amount=TOTAL)
 
     with pytest.raises(InvalidTransition):
         await _transition(
             db_session,
             booking,
             Actor.system(),
-            BookingEvent.deposit_captured,
+            BookingEvent.payment_captured,
             clock,
             notifier,
-            {"amount": DEPOSIT + CONTRIBUTION, "payment_id": payment.id},
+            {"amount": TOTAL, "payment_id": payment.id},
         )
     assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == DEPOSIT
+    assert len(await _ledger(db_session, booking.id)) == 5
+
+
+async def test_commission_is_frozen_in_the_snapshot(db_session, clock, notifier) -> None:
+    booking, payment_id = await _accepted(db_session)
+    booking.price_snapshot = {**booking.price_snapshot, "commission_rate": "0.125"}
+    await db_session.flush()
+
+    await _transition(
+        db_session,
+        booking,
+        Actor.system(),
+        BookingEvent.payment_captured,
+        clock,
+        notifier,
+        {"amount": TOTAL, "payment_id": payment_id},
+    )
+
+    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == D("18750.00")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +427,8 @@ async def _assert_refunded(session, booking_id: uuid.UUID) -> None:
     for account in (
         LedgerAccount.renter_deposit_liability,
         LedgerAccount.protection_pool,
+        LedgerAccount.vendor_payable,
+        LedgerAccount.platform_revenue,
         LedgerAccount.platform_cash,
     ):
         assert await _balance(session, account, booking_id) == D("0.00"), account
@@ -391,7 +451,7 @@ async def test_renter_cancel_refunds(db_session, clock, notifier) -> None:
     assert result.cancelled_at == DEFAULT_NOW
     assert result.cancellation_reason == "Plans changed"
     await _assert_refunded(db_session, booking.id)
-    assert len(await _ledger(db_session, booking.id)) == 3 + 4
+    assert len(await _ledger(db_session, booking.id)) == 5 + 2 + 2 + 3
     audit = (await _audits(db_session, booking.id))[-1]
     assert audit.action == "booking.cancelled_by_renter"
     assert audit.actor_role == "renter"
@@ -399,6 +459,9 @@ async def test_renter_cancel_refunds(db_session, clock, notifier) -> None:
     assert audit.after["refund"] == {
         "deposit": str(DEPOSIT),
         "damage_contribution": str(CONTRIBUTION),
+        "rental": str(RENTAL),
+        "delivery_fee": "0.00",
+        "commission": str(COMMISSION),
     }
     assert {call.user_id for call in notifier.calls} == {booking.renter_id, booking.vendor_id}
     assert set(notifier.templates()) == {"booking.cancelled"}
@@ -414,7 +477,7 @@ async def test_renter_cancel_without_reason_or_contribution(db_session, clock, n
     assert result.status == BookingStatus.cancelled_by_renter
     assert result.cancellation_reason is None
     await _assert_refunded(db_session, booking.id)
-    assert len(await _ledger(db_session, booking.id)) == 2 + 2
+    assert len(await _ledger(db_session, booking.id)) == 4 + 2 + 3
 
 
 async def test_cancel_at_2330_utc_day_before_start_is_refused(db_session, clock, notifier) -> None:
@@ -524,7 +587,7 @@ async def test_vendor_cancel_requires_reason(db_session, clock, notifier, payloa
     assert booking.status == BookingStatus.confirmed
     assert booking.cancelled_at is None
     assert await db_session.scalar(select(func.count()).select_from(AuditEvent)) == audits_before
-    assert len(await _ledger(db_session, booking.id)) == 3
+    assert len(await _ledger(db_session, booking.id)) == 5
 
 
 async def test_renter_cannot_cancel_other_booking(db_session, clock, notifier) -> None:

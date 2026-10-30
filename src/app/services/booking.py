@@ -13,7 +13,7 @@ Two entry points:
   (``SELECT ... FOR UPDATE``), looks up ``(status, event)`` in ``_TRANSITIONS``,
   checks the actor, runs the handler, writes one audit row and flushes.
 
-A handler may also record an intermediate step itself: ``deposit_captured``
+A handler may also record an intermediate step itself: ``payment_captured``
 writes the ``booking.deposit_paid`` audit row inside its handler and returns
 ``_Outcome.before`` so the engine's ``booking.confirmed`` row starts from
 ``deposit_paid``. Money transitions post their ledger groups with the recipes in
@@ -47,13 +47,9 @@ from app.core.clock import Clock, business_date, start_of_business_day
 from app.core.config import Settings
 from app.db.models import (
     Asset,
-    AuditEvent,
     AvailabilityWindow,
     Booking,
-    Direction,
     HandoverRecord,
-    LedgerAccount,
-    LedgerEntry,
     Payment,
     User,
 )
@@ -73,14 +69,13 @@ from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
 from app.services.ledger import CENT, MAX_AMOUNT, Posting, post_txn
 from app.services.money import (
-    balance_captured_postings,
-    balance_refund_postings,
     commission_amount,
-    deposit_captured_postings,
     deposit_deduct_postings,
     deposit_forfeit_postings,
     deposit_release_postings,
+    payment_captured_postings,
     refund_contribution_postings,
+    rental_refund_postings,
 )
 from app.services.notify import Notifier
 from app.services.pricing import money, price_snapshot
@@ -111,11 +106,10 @@ class BookingEvent(StrEnum):
     decline = "decline"
     approve_vendor = "approve_vendor"
     expire_hold = "expire_hold"
-    deposit_captured = "deposit_captured"
+    payment_captured = "payment_captured"
     expire_deposit = "expire_deposit"
     cancel = "cancel"
     handover_completed = "handover_completed"
-    balance_captured = "balance_captured"
     return_completed = "return_completed"
     claim_raised = "claim_raised"
     complete = "complete"
@@ -420,8 +414,8 @@ def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
     return amount if amount == amount.quantize(CENT) else None
 
 
-async def _deposit_payment_id(ctx: _Context) -> uuid.UUID:
-    """The payload's ``payment_id``, which must be this booking's deposit payment."""
+async def _booking_payment_id(ctx: _Context) -> uuid.UUID:
+    """The payload's ``payment_id``: this booking's captured upfront payment (A14)."""
     raw = ctx.payload.get("payment_id")
     try:
         payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
@@ -432,13 +426,14 @@ async def _deposit_payment_id(ctx: _Context) -> uuid.UUID:
             exists().where(
                 Payment.id == payment_id,
                 Payment.booking_id == ctx.booking.id,
-                Payment.type == PaymentType.deposit,
+                Payment.type == PaymentType.booking,
+                Payment.status == PaymentStatus.captured,
             )
         )
     )
     if not found:
         raise InvalidRequestError(
-            "The payment is not this booking's deposit.", {"payment_id": _plain(raw)}
+            "The payment is not this booking's captured payment.", {"payment_id": _plain(raw)}
         )
     return payment_id
 
@@ -472,20 +467,51 @@ def _both(booking: Booking, template: str, **extra: Any) -> tuple[Notice, ...]:
     )
 
 
-@_register(BookingStatus.accepted, BookingEvent.deposit_captured, ActorRole.system)
-async def _deposit_captured(ctx: _Context) -> _Outcome:
-    """accepted -> deposit_paid -> confirmed in one call, with two audit rows."""
+@dataclass(frozen=True)
+class _Money:
+    """The booking's frozen amounts: D, C, R, F and the commission K on R."""
+
+    deposit: Decimal
+    contribution: Decimal
+    rental: Decimal
+    delivery_fee: Decimal
+    commission: Decimal
+
+    @property
+    def total(self) -> Decimal:
+        """Everything the renter pays upfront (A14): D + C + R + F."""
+        return self.deposit + self.contribution + self.rental + self.delivery_fee
+
+
+def _money(booking: Booking) -> _Money:
+    rental = _snapshot_amount(booking, "rental_total")
+    return _Money(
+        deposit=_snapshot_amount(booking, "deposit"),
+        contribution=_snapshot_amount(booking, "damage_contribution"),
+        rental=rental,
+        delivery_fee=_snapshot_amount(booking, "delivery_fee"),
+        commission=_snapshot_commission(booking, rental),
+    )
+
+
+@_register(BookingStatus.accepted, BookingEvent.payment_captured, ActorRole.system)
+async def _payment_captured(ctx: _Context) -> _Outcome:
+    """The one upfront payment (A14): accepted -> deposit_paid -> confirmed.
+
+    The amount must be D + C + R + F exactly; one ledger group splits it between
+    the deposit hold, the protection pool, the vendor's share and the commission.
+    Two audit rows: ``booking.deposit_paid`` here and ``booking.confirmed``.
+    """
     booking = ctx.booking
-    deposit = _snapshot_amount(booking, "deposit")
-    contribution = _snapshot_amount(booking, "damage_contribution")
-    expected = deposit + contribution
+    amounts = _money(booking)
+    expected = amounts.total
     amount = _payload_amount(ctx.payload)
     if amount is None or amount != expected:
         raise BookingGuardFailed(
             "amount_mismatch",
             {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
         )
-    payment_id = await _deposit_payment_id(ctx)
+    payment_id = await _booking_payment_id(ctx)
 
     booking.status = BookingStatus.deposit_paid
     await record_audit(
@@ -499,10 +525,20 @@ async def _deposit_captured(ctx: _Context) -> _Outcome:
             "status": BookingStatus.deposit_paid,
             "amount": money(amount),
             "payment_id": payment_id,
+            "commission": amounts.commission,
         },
     )
     await _post(
-        ctx, deposit_captured_postings(deposit, contribution), "deposit_captured", payment_id
+        ctx,
+        payment_captured_postings(
+            amounts.deposit,
+            amounts.contribution,
+            amounts.rental,
+            amounts.delivery_fee,
+            amounts.commission,
+        ),
+        "payment_captured",
+        payment_id,
     )
 
     booking.status = BookingStatus.confirmed
@@ -557,25 +593,25 @@ async def _cancel(ctx: _Context) -> _Outcome:
             raise BookingGuardFailed("reason_required")
         status = BookingStatus.cancelled_by_vendor
 
-    # By `confirmed` the renter has paid the deposit and the damage contribution,
-    # and may already have paid the rental balance (balance first, handover later).
-    # Everything paid goes back, each part in its own txn_group.
-    deposit = _snapshot_amount(booking, "deposit")
-    contribution = _snapshot_amount(booking, "damage_contribution")
-    refund: dict[str, Any] = {"deposit": deposit, "damage_contribution": contribution}
-    balance_paid = await _balance_posted(ctx)
-    await _post(ctx, deposit_release_postings(deposit), "cancel_deposit_refund")
-    await _post(ctx, refund_contribution_postings(contribution), "cancel_contribution_refund")
-    if balance_paid:
-        rental = _snapshot_amount(booking, "rental_total")
-        delivery_fee = _snapshot_amount(booking, "delivery_fee")
-        commission = _snapshot_commission(booking, rental)
-        await _post(
-            ctx,
-            balance_refund_postings(rental, delivery_fee, commission),
-            "cancel_balance_refund",
-        )
-        refund.update(rental=rental, delivery_fee=delivery_fee, commission=commission)
+    # By `confirmed` the renter has paid everything upfront (A14). All of it goes
+    # back, each part in its own txn_group, so every booking account returns to 0.
+    amounts = _money(booking)
+    refund: dict[str, Any] = {
+        "deposit": amounts.deposit,
+        "damage_contribution": amounts.contribution,
+        "rental": amounts.rental,
+        "delivery_fee": amounts.delivery_fee,
+        "commission": amounts.commission,
+    }
+    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund")
+    await _post(
+        ctx, refund_contribution_postings(amounts.contribution), "cancel_contribution_refund"
+    )
+    await _post(
+        ctx,
+        rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
+        "cancel_rental_refund",
+    )
 
     booking.status = status
     booking.cancelled_at = ctx.now
@@ -599,7 +635,7 @@ async def _cancel(ctx: _Context) -> _Outcome:
 
 
 # ---------------------------------------------------------------------------
-# Handlers: handover, balance and return (confirmed, in_progress)
+# Handlers: handover and return (confirmed, in_progress)
 # ---------------------------------------------------------------------------
 
 
@@ -618,73 +654,6 @@ async def _handover_done(ctx: _Context, direction: HandoverDirection) -> bool:
     )
 
 
-async def _balance_posted(ctx: _Context) -> bool:
-    """Whether ``balance_captured`` has already run for this booking.
-
-    Its ledger group is the only one that credits ``vendor_payable`` or
-    ``platform_revenue`` before the booking leaves ``confirmed``.
-    """
-    return bool(
-        await ctx.session.scalar(
-            select(
-                exists().where(
-                    LedgerEntry.booking_id == ctx.booking.id,
-                    LedgerEntry.direction == Direction.cr.value,
-                    LedgerEntry.account.in_(
-                        (LedgerAccount.vendor_payable.value, LedgerAccount.platform_revenue.value)
-                    ),
-                )
-            )
-        )
-    )
-
-
-async def _handover_signal_recorded(ctx: _Context) -> bool:
-    """Whether an earlier ``handover_completed`` left a ``booking.handover_signed`` row."""
-    return bool(
-        await ctx.session.scalar(
-            select(
-                exists().where(
-                    AuditEvent.entity == AUDIT_ENTITY,
-                    AuditEvent.entity_id == ctx.booking.id,
-                    AuditEvent.action == "booking.handover_signed",
-                )
-            )
-        )
-    )
-
-
-async def _balance_payment_id(ctx: _Context) -> uuid.UUID:
-    """The payload's ``payment_id``: this booking's captured rental-balance payment."""
-    raw = ctx.payload.get("payment_id")
-    try:
-        payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
-    except ValueError:
-        payment_id = None
-    found = payment_id is not None and await ctx.session.scalar(
-        select(
-            exists().where(
-                Payment.id == payment_id,
-                Payment.booking_id == ctx.booking.id,
-                Payment.type == PaymentType.rental_balance,
-                Payment.status == PaymentStatus.captured,
-            )
-        )
-    )
-    if not found:
-        raise InvalidRequestError(
-            "The payment is not this booking's captured rental balance.",
-            {"payment_id": _plain(raw)},
-        )
-    return payment_id
-
-
-def _start_rental(booking: Booking, outcome_after: Mapping[str, Any]) -> _Outcome:
-    """Both in_progress facts hold: confirmed -> in_progress."""
-    booking.status = BookingStatus.in_progress
-    return _Outcome(after=outcome_after, notices=_both(booking, "booking.in_progress"))
-
-
 @_register(
     BookingStatus.confirmed,
     BookingEvent.handover_completed,
@@ -693,47 +662,15 @@ def _start_rental(booking: Booking, outcome_after: Mapping[str, Any]) -> _Outcom
     ActorRole.system,
 )
 async def _handover_completed(ctx: _Context) -> _Outcome:
-    """Record the signed pickup; start the rental if the balance is already captured."""
-    if await _handover_signal_recorded(ctx):
-        raise InvalidTransition(ctx.booking.status.value, ctx.event.value)
+    """Both pickup signatures: the rental starts (everything was paid upfront, A14)."""
     if not await _handover_done(ctx, HandoverDirection.pickup):
         raise BookingGuardFailed("handover_incomplete", {"direction": "pickup"})
-
-    after = {"handover": HandoverDirection.pickup.value}
-    if await _balance_posted(ctx):
-        return _start_rental(ctx.booking, after)
-    return _Outcome(action="booking.handover_signed", after=after)
-
-
-@_register(BookingStatus.confirmed, BookingEvent.balance_captured, ActorRole.system)
-async def _balance_captured(ctx: _Context) -> _Outcome:
-    """Post R + F (vendor share and commission K); start the rental if handed over."""
     booking = ctx.booking
-    if await _balance_posted(ctx):
-        raise InvalidTransition(booking.status.value, ctx.event.value)
-    rental = _snapshot_amount(booking, "rental_total")
-    delivery_fee = _snapshot_amount(booking, "delivery_fee")
-    expected = rental + delivery_fee
-    amount = _payload_amount(ctx.payload)
-    if amount is None or amount != expected:
-        raise BookingGuardFailed(
-            "amount_mismatch",
-            {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
-        )
-    payment_id = await _balance_payment_id(ctx)
-
-    commission = _snapshot_commission(booking, rental)
-    await _post(
-        ctx,
-        balance_captured_postings(rental, delivery_fee, commission),
-        "balance_captured",
-        payment_id,
+    booking.status = BookingStatus.in_progress
+    return _Outcome(
+        after={"handover": HandoverDirection.pickup.value},
+        notices=_both(booking, "booking.in_progress"),
     )
-
-    after = {"amount": money(amount), "payment_id": payment_id, "commission": commission}
-    if await _handover_done(ctx, HandoverDirection.pickup):
-        return _start_rental(booking, after)
-    return _Outcome(action="booking.balance_captured", after=after)
 
 
 @_register(
