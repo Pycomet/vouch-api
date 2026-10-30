@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -697,6 +697,7 @@ async def test_resolve_requires_reason(db_session, clock, notifier, reason) -> N
         {},
         {"decision": "deduct"},
         {"decision": "deduct", "amount": "0"},
+        {"decision": "deduct", "amount": "0.004"},  # rounds to 0.00
         {"decision": "deduct", "amount": 10.0},
         {"decision": "deduct", "amount": "abc"},
     ],
@@ -900,6 +901,38 @@ async def test_mark_lost_requires_reason(db_session, clock, notifier, payload) -
 
     assert caught.value.code == "reason_required"
     assert await _counts(db_session) == counts
+
+
+@pytest.mark.parametrize(
+    ("instant", "allowed"),
+    [
+        (datetime(2027, 1, 12, 22, 59, 59, tzinfo=UTC), False),  # 23:59:59 WAT on the 12th
+        (datetime(2027, 1, 12, 23, 0, 0, tzinfo=UTC), True),  # 00:00 WAT on the 13th
+    ],
+)
+async def test_mark_lost_boundary_absolute_instant(db_session, notifier, instant, allowed) -> None:
+    """ends_on 2027-01-06 + 7 days = 13 Jan; Africa/Lagos midnight is 23:00Z on the 12th."""
+    assert get_settings().business_timezone == "Africa/Lagos"
+    booking = await _with_deposit(db_session, BookingStatus.in_progress, ends_on=date(2027, 1, 6))
+    assert booking.ends_on == date(2027, 1, 6)
+    admin = await admin_actor(db_session)
+
+    async def mark() -> Booking:
+        return await _transition(
+            db_session,
+            booking,
+            admin,
+            BookingEvent.mark_lost,
+            FrozenClock(instant),
+            notifier,
+            {"reason": "Unreachable"},
+        )
+
+    if allowed:
+        assert (await mark()).status == BookingStatus.lost
+    else:
+        with pytest.raises(InvalidTransition):
+            await mark()
 
 
 async def test_vendor_cannot_mark_lost(db_session, clock, notifier) -> None:
@@ -1316,15 +1349,20 @@ async def test_forbidden_transitions(db_session, notifier, status) -> None:
     tried = []
     for event in events:
         counts = await _counts(db_session)
+        savepoint = await db_session.begin_nested()
+        # Everything is checked INSIDE the savepoint, before it is rolled back, so a
+        # row written before the raise would still be visible here.
         with pytest.raises(InvalidTransition) as caught:
-            async with db_session.begin_nested():
-                await _transition(
-                    db_session, booking, actors[EVENT_ROLE[event]], event, late, notifier, payload
-                )
+            await _transition(
+                db_session, booking, actors[EVENT_ROLE[event]], event, late, notifier, payload
+            )
         assert caught.value.error_details == {"from": status.value, "event": event.value}
+        assert booking.status == status, (status, event)  # in memory, before any refresh
+        await db_session.flush()
         assert await _counts(db_session) == counts, (status, event)
         await db_session.refresh(booking)
-        assert booking.status == status
+        assert booking.status == status, (status, event)
+        await savepoint.rollback()
         tried.append((status, event))
 
     assert tried == [pair for pair in FORBIDDEN if pair[0] == status]

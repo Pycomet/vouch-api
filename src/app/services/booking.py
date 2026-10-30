@@ -822,11 +822,13 @@ async def _resolve(ctx: _Context) -> _Outcome:
     deposit = _snapshot_amount(booking, "deposit")
     after: dict[str, Any] = {"decision": decision}
     if decision == "deduct":
-        requested = _payload_amount(ctx.payload)
+        raw = _payload_amount(ctx.payload)
+        # Judge the amount after rounding to the cent: "0.004" is 0.00, not a deduction.
+        requested = None if raw is None else money(raw)
         if requested is None or requested <= 0:
             raise InvalidRequestError("A deduction needs a positive amount.")
-        deduction = min(money(requested), deposit)
-        after.update(amount=deduction, requested_amount=money(requested))
+        deduction = min(requested, deposit)
+        after.update(amount=deduction, requested_amount=requested)
         postings = deposit_deduct_postings(deposit, deduction)
         action = "deposit.deducted"
     elif decision == "forfeit":
