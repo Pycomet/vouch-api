@@ -307,7 +307,10 @@ async def test_stranger_cannot_record_handover(db_session, clock, notifier) -> N
         )
 
 
-@pytest.mark.parametrize("amount", [RENTAL, BALANCE + D("0.01"), None, "abc", 157500.0])
+@pytest.mark.parametrize(
+    "amount",
+    [RENTAL, BALANCE + D("0.01"), None, "abc", 157500.0, "1e40", "1234567890123", "157500.001"],
+)
 async def test_balance_amount_mismatch(db_session, clock, notifier, amount) -> None:
     booking = await _with_deposit(db_session, BookingStatus.confirmed)
     payload = await _balance_payload(db_session, booking, amount=amount)
@@ -616,6 +619,9 @@ async def test_claim_after_window_409(db_session, clock, notifier) -> None:
         {"amount": "-5.00"},
         {"amount": 100.5},
         {"amount": None},
+        {"amount": "1e40"},
+        {"amount": "1234567890123"},  # 13 digits: beyond Numeric(12, 2)
+        {"amount": "100.005"},  # more than 2 decimal places
         {"description": "   "},
         {"description": None},
         {"evidence": []},
@@ -801,7 +807,10 @@ async def test_resolve_requires_reason(db_session, clock, notifier, reason) -> N
         {},
         {"decision": "deduct"},
         {"decision": "deduct", "amount": "0"},
-        {"decision": "deduct", "amount": "0.004"},  # rounds to 0.00
+        {"decision": "deduct", "amount": "0.004"},  # more than 2 decimal places
+        {"decision": "deduct", "amount": "100.005"},
+        {"decision": "deduct", "amount": "1e40"},
+        {"decision": "deduct", "amount": "1234567890123"},  # beyond Numeric(12, 2)
         {"decision": "deduct", "amount": 10.0},
         {"decision": "deduct", "amount": "abc"},
     ],

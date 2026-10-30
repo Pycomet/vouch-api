@@ -71,7 +71,7 @@ from app.schemas.errors import (
 )
 from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
-from app.services.ledger import Posting, post_txn
+from app.services.ledger import CENT, MAX_AMOUNT, Posting, post_txn
 from app.services.money import (
     balance_captured_postings,
     balance_refund_postings,
@@ -402,7 +402,12 @@ def _snapshot_commission(booking: Booking, rental: Decimal) -> Decimal:
 
 
 def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
-    """The payload's ``amount`` as a Decimal, or None if absent or not money."""
+    """The payload's ``amount`` as a Decimal, or None if absent or not money.
+
+    Not money: floats, non-finite values, more than 2 decimal places, or a size
+    beyond ``Numeric(12, 2)`` (``ledger.MAX_AMOUNT``). None takes each caller's
+    invalid-amount path (400 or ``amount_mismatch``), never a 500.
+    """
     raw = payload.get("amount")
     if isinstance(raw, bool) or not isinstance(raw, Decimal | int | str):
         return None  # floats are never money
@@ -410,7 +415,9 @@ def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
         amount = Decimal(raw)
     except InvalidOperation:
         return None
-    return amount if amount.is_finite() else None
+    if not amount.is_finite() or abs(amount) > MAX_AMOUNT:
+        return None
+    return amount if amount == amount.quantize(CENT) else None
 
 
 async def _deposit_payment_id(ctx: _Context) -> uuid.UUID:
@@ -851,7 +858,6 @@ async def _resolve(ctx: _Context) -> _Outcome:
     after: dict[str, Any] = {"decision": decision}
     if decision == "deduct":
         raw = _payload_amount(ctx.payload)
-        # Judge the amount after rounding to the cent: "0.004" is 0.00, not a deduction.
         requested = None if raw is None else money(raw)
         if requested is None or requested <= 0:
             raise InvalidRequestError("A deduction needs a positive amount.")

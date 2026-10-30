@@ -207,7 +207,10 @@ async def test_deposit_captured_without_damage_contribution(db_session, clock, n
     assert await _balance(db_session, LedgerAccount.protection_pool, booking.id) == D("0.00")
 
 
-@pytest.mark.parametrize("amount", [DEPOSIT, DEPOSIT + CONTRIBUTION + D("0.01"), None, "abc"])
+@pytest.mark.parametrize(
+    "amount",
+    [DEPOSIT, DEPOSIT + CONTRIBUTION + D("0.01"), None, "abc", "1e40", "1234567890123"],
+)
 async def test_deposit_amount_mismatch_no_transition(db_session, clock, notifier, amount) -> None:
     booking, payment_id = await _accepted(db_session)
     audits_before = len(await _audits(db_session, booking.id))
