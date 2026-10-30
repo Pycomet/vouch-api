@@ -14,11 +14,11 @@ Vouch describes customer funds only as a **deposit hold** unless Nigerian counse
 
 Vouch is a trusted rental marketplace for high-value creative gear in Nigeria. It connects verified renters with vendors and adds identity verification, platform-controlled payments, condition evidence, and co-signed handovers to reduce fraud and disputes.
 
-The launch sequence is:
+The launch sequence is **Abuja Phase 0 → Abuja v1 → Lagos**. The PRD in Notion is canonical; this file mirrors it for engineering.
 
-1. **Phase 0 concierge in Lagos**: manually operated, tightly gated transactions that validate demand and controls before automation.
-2. **v1 in Lagos**: automate only the workflows proven safe in Phase 0.
-3. **Abuja expansion**: enabled only after Lagos meets the expansion gates in this document.
+1. **Phase 0 concierge in Abuja**: manually operated, tightly gated transactions that validate demand and controls before automation.
+2. **v1 in Abuja**: automate only the workflows proven safe in Phase 0.
+3. **Lagos expansion**: enabled only after Abuja meets the expansion gates in this document.
 
 ## 3. Problem and proposition
 
@@ -39,7 +39,7 @@ The current `users.role` model allows one role value (`renter`, `vendor`, or `ad
 ### 5.1 In scope
 
 - Creative gear only: cameras, lenses, lighting, audio, drones, gimbals, and manually reviewed `other` creative gear.
-- Lagos launch, followed by Abuja only after expansion gates pass.
+- Abuja launch, followed by Lagos only after expansion gates pass.
 - Web application as the first customer channel.
 - Phone-based accounts and authenticated renter/vendor/admin access.
 - Verified renter tiers based on national-ID, liveness, and enhanced address verification.
@@ -131,7 +131,7 @@ Payout is never made from the pickup record. It depends on the completed return 
 
 ### 8.3 Booking and deposit
 
-1. Verified renter searches Lagos inventory and selects dates.
+1. Verified renter searches Abuja inventory and selects dates.
 2. Server checks listing availability and required trust tier, calculates immutable fee/deposit snapshots, and creates a `pending` booking.
 3. Vendor and/or operations approves under the current concierge policy.
 4. Vouch initializes the deposit transaction with Paystack; renter pays via provider-hosted flow.
@@ -300,7 +300,7 @@ Phase 0 baselines are collected manually; v1 targets should be ratified after th
 
 | Metric | Phase 0 / launch acceptance |
 |---|---|
-| Scope compliance | 100% live listings are approved creative gear in Lagos |
+| Scope compliance | 100% live listings are approved creative gear in Abuja |
 | Verification gate | 100% confirmed bookings have the policy-required verified renter tier |
 | Deposit control | 100% confirmed bookings have provider-verified upfront deposit collection |
 | Pickup control | 100% active bookings have verified balance plus completed co-signed pickup evidence |
@@ -311,14 +311,14 @@ Phase 0 baselines are collected manually; v1 targets should be ratified after th
 | Evidence completeness | At least 95% of initiated handovers complete without evidence/signature remediation; 100% completed records meet required fields |
 | Restore readiness | Successful pre-launch PITR restore drill and quarterly drills thereafter |
 | Privacy/security | Zero known unauthorized KYC/evidence access; 100% privileged access events logged |
-| Concierge viability | At least 20 completed Lagos rentals across at least 5 active vendors before broad automation review |
+| Concierge viability | At least 20 completed Abuja rentals across at least 5 active vendors before broad automation review |
 | Marketplace quality | At least 90% of confirmed rentals complete without a substantiated damage/loss/payment dispute during the gate cohort |
 
 Metrics are safeguards and learning criteria, not promises of loss prevention.
 
 ## 15. Expansion and automation gates
 
-### 15.1 Phase 0 to automated Lagos v1
+### 15.1 Phase 0 to automated Abuja v1
 
 All must hold:
 
@@ -332,16 +332,16 @@ All must hold:
 - support runbooks and payout/deposit kill switches tested; and
 - each automation rule shadowed against concierge decisions with an approved error rate.
 
-### 15.2 Lagos to Abuja
+### 15.2 Abuja to Lagos
 
 All must hold:
 
-- Lagos v1 operates for at least three consecutive months with acceptance controls sustained;
-- sufficient verified Abuja supply and demand to launch a curated cohort (target to be approved; suggested minimum 10 vetted vendors and 50 approved listings);
-- Abuja-specific operations, handover, support, dispute, and recovery coverage is staffed;
-- provider/KYC service coverage and contractual terms apply in Abuja;
+- Abuja v1 operates for at least three consecutive months with acceptance controls sustained;
+- sufficient verified Lagos supply and demand to launch a curated cohort (target to be approved; suggested minimum 10 vetted vendors and 50 approved listings);
+- Lagos-specific operations, handover, support, dispute, and recovery coverage is staffed;
+- provider/KYC service coverage and contractual terms apply in Lagos;
 - unit economics remain viable after vendor-side commission, support, payment, fraud, refund, and dispute costs; and
-- executive risk review approves city activation. City support in the current enum does not itself authorize Abuja launch.
+- executive risk review approves city activation. A row in the `cities` table does not itself authorize Lagos launch; a city goes live only when it is added to `VOUCH_LAUNCHED_CITIES`.
 
 ## 16. Dependencies and unresolved decisions
 
