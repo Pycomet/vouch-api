@@ -86,6 +86,26 @@ Part B downgrade (lossy)
 * ``kyc_profiles``: verified tier 1 becomes tier 2. Rows the upgrade moved from old
   tier 1 to ``submitted`` / tier 0 are not restored (their ``verified_at`` is gone).
 * ``vendor_references`` and the user restriction columns are dropped.
+
+Part C: ledger, audit, webhooks
+-------------------------------
+* ``ledger_entries`` (append-only double entry). CHECKs: ``account`` is one of the
+  six spec accounts, ``direction`` is ``dr`` or ``cr``, ``amount > 0``.
+* ``audit_events`` (append-only). CHECKs: ``actor_role`` is renter, vendor, admin
+  or system, and only ``system`` may omit ``actor_id``.
+* ``reject_mutation()`` is one shared function. It raises
+  ``'<table> is append-only'`` from ``TG_TABLE_NAME`` and is attached to both
+  tables by ``trg_ledger_no_update`` and ``trg_audit_no_update`` (BEFORE UPDATE OR
+  DELETE). Corrections are reversing entries.
+* ``assert_txn_group_balanced()`` backs the constraint trigger
+  ``trg_ledger_balanced`` (AFTER INSERT, DEFERRABLE INITIALLY DEFERRED, FOR EACH
+  ROW). It runs at COMMIT, not at INSERT, so a transaction may insert a group
+  row by row. Each ``txn_group`` must satisfy ``sum(dr) = sum(cr)`` on its own;
+  two groups that only balance against each other fail.
+* ``webhook_events`` with ``UNIQUE (provider, provider_event_id)`` for idempotency.
+
+Part C downgrade drops the triggers, both functions and the three tables (the
+ledger and audit history is lost).
 """
 
 from __future__ import annotations
@@ -110,9 +130,11 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     _upgrade_reference_and_catalogue()
     _upgrade_users_trust_bookings()
+    _upgrade_ledger_audit_webhooks()
 
 
 def downgrade() -> None:
+    _downgrade_ledger_audit_webhooks()
     _downgrade_users_trust_bookings()
     _downgrade_reference_and_catalogue()
 
@@ -702,3 +724,142 @@ def _downgrade_users_trust_bookings() -> None:
     op.drop_constraint("ck_users_restriction_has_reason", "users", type_="check")
     op.drop_column("users", "restricted_reason")
     op.drop_column("users", "restricted_at")
+
+
+# ===========================================================================
+# Part C: ledger, audit, webhooks
+# ===========================================================================
+
+LEDGER_ACCOUNTS = (
+    "renter_deposit_liability",
+    "platform_cash",
+    "vendor_payable",
+    "platform_revenue",
+    "protection_pool",
+    "processing_fees",
+)
+ACTOR_ROLES = ("renter", "vendor", "admin", "system")
+
+
+def _in_list(values: Sequence[str]) -> str:
+    return ", ".join(_sql_literal(value) for value in values)
+
+
+def _upgrade_ledger_audit_webhooks() -> None:
+    op.execute(
+        f"""
+        CREATE TABLE ledger_entries (
+            id          BIGSERIAL PRIMARY KEY,
+            booking_id  UUID REFERENCES bookings(id),
+            payment_id  UUID REFERENCES payments(id),
+            account     TEXT NOT NULL,
+            direction   CHAR(2) NOT NULL,
+            amount      NUMERIC(12,2) NOT NULL,
+            currency    CHAR(3) NOT NULL DEFAULT 'NGN',
+            txn_group   UUID NOT NULL,
+            memo        TEXT,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT ck_ledger_entries_account_valid
+                CHECK (account IN ({_in_list(LEDGER_ACCOUNTS)})),
+            CONSTRAINT ck_ledger_entries_direction_valid
+                CHECK (direction IN ('dr', 'cr')),
+            CONSTRAINT ck_ledger_entries_amount_positive CHECK (amount > 0)
+        )
+        """
+    )
+    op.execute("CREATE INDEX ix_ledger_booking ON ledger_entries (booking_id)")
+    op.execute("CREATE INDEX ix_ledger_group ON ledger_entries (txn_group)")
+
+    op.execute(
+        f"""
+        CREATE TABLE audit_events (
+            id          BIGSERIAL PRIMARY KEY,
+            actor_id    UUID REFERENCES users(id),
+            actor_role  TEXT NOT NULL,
+            entity      TEXT NOT NULL,
+            entity_id   UUID NOT NULL,
+            action      TEXT NOT NULL,
+            before      JSONB,
+            after       JSONB,
+            reason      TEXT,
+            request_id  TEXT,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT ck_audit_events_actor_role_valid
+                CHECK (actor_role IN ({_in_list(ACTOR_ROLES)})),
+            CONSTRAINT ck_audit_events_actor_required
+                CHECK (actor_role = 'system' OR actor_id IS NOT NULL)
+        )
+        """
+    )
+    op.execute("CREATE INDEX ix_audit_events_entity ON audit_events (entity, entity_id)")
+
+    op.execute(
+        """
+        CREATE TABLE webhook_events (
+            id                BIGSERIAL PRIMARY KEY,
+            provider          TEXT NOT NULL,
+            provider_event_id TEXT NOT NULL,
+            payload           JSONB NOT NULL,
+            signature_ok      BOOLEAN NOT NULL,
+            received_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            processed_at      TIMESTAMPTZ,
+            processing_error  TEXT,
+            CONSTRAINT uq_webhook_events_provider_event UNIQUE (provider, provider_event_id)
+        )
+        """
+    )
+
+    op.execute(
+        """
+        CREATE FUNCTION reject_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
+        END
+        $$
+        """
+    )
+    op.execute(
+        "CREATE TRIGGER trg_ledger_no_update BEFORE UPDATE OR DELETE ON ledger_entries "
+        "FOR EACH ROW EXECUTE FUNCTION reject_mutation()"
+    )
+    op.execute(
+        "CREATE TRIGGER trg_audit_no_update BEFORE UPDATE OR DELETE ON audit_events "
+        "FOR EACH ROW EXECUTE FUNCTION reject_mutation()"
+    )
+
+    op.execute(
+        """
+        CREATE FUNCTION assert_txn_group_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            debits  NUMERIC(14,2);
+            credits NUMERIC(14,2);
+        BEGIN
+            SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'dr'), 0),
+                   COALESCE(SUM(amount) FILTER (WHERE direction = 'cr'), 0)
+              INTO debits, credits
+              FROM ledger_entries
+             WHERE txn_group = NEW.txn_group;
+            IF debits <> credits THEN
+                RAISE EXCEPTION 'txn_group % is not balanced: dr % <> cr %',
+                    NEW.txn_group, debits, credits;
+            END IF;
+            RETURN NULL;
+        END
+        $$
+        """
+    )
+    op.execute(
+        "CREATE CONSTRAINT TRIGGER trg_ledger_balanced AFTER INSERT ON ledger_entries "
+        "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION assert_txn_group_balanced()"
+    )
+
+
+def _downgrade_ledger_audit_webhooks() -> None:
+    op.execute("DROP TRIGGER trg_ledger_balanced ON ledger_entries")
+    op.execute("DROP TRIGGER trg_audit_no_update ON audit_events")
+    op.execute("DROP TRIGGER trg_ledger_no_update ON ledger_entries")
+    op.execute("DROP FUNCTION assert_txn_group_balanced()")
+    op.execute("DROP FUNCTION reject_mutation()")
+    op.execute("DROP TABLE webhook_events")
+    op.execute("DROP TABLE audit_events")
+    op.execute("DROP TABLE ledger_entries")
