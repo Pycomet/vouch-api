@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,8 +18,8 @@ class WebhookEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    provider: Mapped[str] = mapped_column(String, nullable=False)
-    provider_event_id: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     signature_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
     received_at: Mapped[datetime] = mapped_column(

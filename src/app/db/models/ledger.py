@@ -14,13 +14,13 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
     Numeric,
-    String,
     Text,
     func,
     text,
@@ -55,7 +55,9 @@ class LedgerEntry(Base):
         CheckConstraint(
             f"account IN ({_in_list(LedgerAccount)})", name="ck_ledger_entries_account_valid"
         ),
-        CheckConstraint("direction IN ('dr', 'cr')", name="ck_ledger_entries_direction_valid"),
+        CheckConstraint(
+            f"direction IN ({_in_list(Direction)})", name="ck_ledger_entries_direction_valid"
+        ),
         CheckConstraint("amount > 0", name="ck_ledger_entries_amount_positive"),
         Index("ix_ledger_booking", "booking_id"),
         Index("ix_ledger_group", "txn_group"),
@@ -64,10 +66,10 @@ class LedgerEntry(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     booking_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bookings.id"), nullable=True)
     payment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payments.id"), nullable=True)
-    account: Mapped[LedgerAccount] = mapped_column(String, nullable=False)
-    direction: Mapped[Direction] = mapped_column(String(2), nullable=False)
+    account: Mapped[str] = mapped_column(Text, nullable=False)
+    direction: Mapped[str] = mapped_column(CHAR(2), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), nullable=False, server_default=text("'NGN'"))
+    currency: Mapped[str] = mapped_column(CHAR(3), nullable=False, server_default=text("'NGN'"))
     txn_group: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     memo: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

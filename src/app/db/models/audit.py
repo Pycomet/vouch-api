@@ -12,7 +12,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
-    String,
     Text,
     func,
 )
@@ -29,11 +28,15 @@ class ActorRole(enum.StrEnum):
     system = "system"
 
 
+def _in_list(values: type[enum.StrEnum]) -> str:
+    return ", ".join(f"'{member.value}'" for member in values)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
         CheckConstraint(
-            "actor_role IN ('renter', 'vendor', 'admin', 'system')",
+            f"actor_role IN ({_in_list(ActorRole)})",
             name="ck_audit_events_actor_role_valid",
         ),
         CheckConstraint(
@@ -45,14 +48,14 @@ class AuditEvent(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    actor_role: Mapped[ActorRole] = mapped_column(String, nullable=False)
-    entity: Mapped[str] = mapped_column(String, nullable=False)
+    actor_role: Mapped[str] = mapped_column(Text, nullable=False)
+    entity: Mapped[str] = mapped_column(Text, nullable=False)
     entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
-    action: Mapped[str] = mapped_column(String, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
     before: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     after: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
