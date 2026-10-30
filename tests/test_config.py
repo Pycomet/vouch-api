@@ -94,3 +94,12 @@ def test_business_timezone_is_a_real_zone(monkeypatch: pytest.MonkeyPatch) -> No
 def test_business_timezone_rejects_unknown_zone(value: str) -> None:
     with pytest.raises(ValidationError, match="business_timezone"):
         Settings(_env_file=None, business_timezone=value)
+
+
+def test_rate_env_parsed_as_decimal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOUCH_COMMISSION_RATE", "0.12")
+
+    rate = Settings(_env_file=None).commission_rate
+
+    assert isinstance(rate, Decimal)
+    assert rate == Decimal("0.12")
