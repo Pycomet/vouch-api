@@ -75,6 +75,44 @@ async def test_audit_update_delete_raise(db: asyncpg.Connection) -> None:
         await db.execute("DELETE FROM audit_events")
 
 
+async def _seed_one_of_each(conn: asyncpg.Connection) -> None:
+    async with conn.transaction():
+        await _post(conn, uuid.uuid4(), 100, 100)
+    await conn.execute(
+        "INSERT INTO audit_events (actor_role, entity, entity_id, action) "
+        "VALUES ('system', 'booking', $1, 'booking.expired')",
+        uuid.uuid4(),
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["TRUNCATE ledger_entries", "TRUNCATE audit_events", "TRUNCATE bookings CASCADE"],
+)
+async def test_truncate_is_rejected(db: asyncpg.Connection, statement: str) -> None:
+    await _seed_one_of_each(db)
+    # Rolled back, so nothing is lost if the guard were ever missing.
+    transaction = db.transaction()
+    await transaction.start()
+    try:
+        with pytest.raises(asyncpg.RaiseError, match="append-only"):
+            await db.execute(statement)
+    finally:
+        await transaction.rollback()
+    assert await db.fetchval("SELECT count(*) FROM ledger_entries") == 2
+    assert await db.fetchval("SELECT count(*) FROM audit_events") == 1
+
+
+async def test_guard_functions_pin_search_path(db: asyncpg.Connection) -> None:
+    rows = await db.fetch(
+        "SELECT proname, proconfig FROM pg_proc WHERE pronamespace = 'public'::regnamespace "
+        "AND proname IN ('reject_mutation', 'assert_txn_group_balanced')"
+    )
+    assert {row["proname"] for row in rows} == {"reject_mutation", "assert_txn_group_balanced"}
+    for row in rows:
+        assert "search_path=pg_catalog, public" in row["proconfig"]
+
+
 # ---------------------------------------------------------------------------
 # Deferred balance trigger
 # ---------------------------------------------------------------------------
