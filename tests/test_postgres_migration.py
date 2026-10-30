@@ -61,11 +61,20 @@ async def _exercise_constraints() -> None:
                 renter_id,
             )
 
+        category_id = await connection.fetchval("SELECT id FROM categories WHERE slug = 'camera'")
+        item_id = await connection.fetchval(
+            "INSERT INTO catalogue_items (category_id, make, model, replacement_value_band) "
+            "VALUES ($1, 'Sony', 'FX3', 'B') RETURNING id",
+            category_id,
+        )
         asset_id = await connection.fetchval(
             "INSERT INTO assets "
-            "(vendor_id, name, category, daily_rate, deposit_amount, city) "
-            "VALUES ($1, 'Sony FX3', 'camera', 75000, 200000, 'lagos') RETURNING id",
+            "(vendor_id, catalogue_item_id, category_id, city_id, daily_rate, deposit_amount) "
+            "VALUES ($1, $2, $3, (SELECT id FROM cities WHERE slug = 'abuja'), "
+            "75000, 200000) RETURNING id",
             vendor_id,
+            item_id,
+            category_id,
         )
         await connection.execute(
             "INSERT INTO bookings "
