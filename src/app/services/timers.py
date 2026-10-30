@@ -9,7 +9,8 @@ One run of :func:`run_timers` performs four sweeps, in this order:
 * flag at risk: ``in_progress`` bookings not yet flagged whose return day ended at
   least 48 hours ago. The spec says "T+48h no contact"; M2 has no contact signal,
   so "no contact" is read as "not returned": a booking is at risk from
-  ``start_of_business_day(ends_on + 1 day) + 48h``.
+  ``start_of_business_day(ends_on + 1 day) + 48h`` (``booking.at_risk_last_end_date``,
+  which the transition itself also enforces).
 
 Every action is an ordinary :func:`app.services.booking.transition` sent as
 ``Actor.system()``. The run reads the clock once; that instant judges every
@@ -48,24 +49,22 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from enum import Enum
 
 from sqlalchemy import ColumnElement, select
 from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.clock import Clock, FrozenClock, business_date
+from app.core.clock import Clock, FrozenClock
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.db.models import Booking
 from app.db.models.booking import BookingStatus
 from app.schemas.errors import BookingGuardFailed, InvalidTransition
 from app.services.audit import Actor
-from app.services.booking import BookingEvent, transition
+from app.services.booking import BookingEvent, at_risk_last_end_date, transition
 from app.services.notify import Notifier
-
-AT_RISK_AFTER = timedelta(hours=48)
 
 logger = get_logger("timers")
 
@@ -89,18 +88,6 @@ class _Result(Enum):
 
 # The database is unreachable: carrying on with the next booking is pointless.
 _UNREACHABLE = (OperationalError, InterfaceError, DisconnectionError)
-
-
-def at_risk_last_end_date(now: datetime, settings: Settings) -> date:
-    """The latest ``ends_on`` that is at risk at ``now``.
-
-    At risk iff ``now >= start_of_business_day(ends_on + 1 day) + 48h``, that is
-    ``start_of_business_day(ends_on + 1 day) <= now - 48h``. Local midnight of a
-    date is at or before an instant exactly when the date is at or before that
-    instant's business date, so the condition is
-    ``ends_on + 1 day <= business_date(now - 48h)``.
-    """
-    return business_date(now - AT_RISK_AFTER, settings.business_zone) - timedelta(days=1)
 
 
 Predicate = Callable[[datetime, Settings], Sequence[ColumnElement[bool]]]

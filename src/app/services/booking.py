@@ -90,6 +90,7 @@ HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
 CLAIM_WINDOW = timedelta(hours=24)
 LOST_AFTER = timedelta(days=7)
+AT_RISK_AFTER = timedelta(hours=48)
 ZERO = Decimal("0.00")
 
 AUDIT_ENTITY = "booking"
@@ -916,11 +917,29 @@ def _ops(booking: Booking, event: str, **extra: Any) -> Notice:
     return Notice(None, f"ops.{event}", data)
 
 
+def at_risk_last_end_date(now: datetime, settings: Settings) -> date:
+    """The latest ``ends_on`` that is at risk at ``now``.
+
+    At risk iff ``now >= start_of_business_day(ends_on + 1 day) + 48h``, that is
+    ``start_of_business_day(ends_on + 1 day) <= now - 48h``. Local midnight of a
+    date is at or before an instant exactly when the date is at or before that
+    instant's business date, so the condition is
+    ``ends_on + 1 day <= business_date(now - 48h)``. The timer's at-risk sweep and
+    :func:`_flag_at_risk` both use it.
+    """
+    return business_date(now - AT_RISK_AFTER, settings.business_zone) - timedelta(days=1)
+
+
 @_register(BookingStatus.in_progress, BookingEvent.flag_at_risk, ActorRole.system)
 async def _flag_at_risk(ctx: _Context) -> _Outcome:
-    """No contact past the return: flag the booking (not a state), freeze the renter."""
+    """No contact past the return: flag the booking (not a state), freeze the renter.
+
+    Only from 48 hours after the end of the return day (:func:`at_risk_last_end_date`).
+    """
     booking = ctx.booking
-    if booking.at_risk_at is not None:
+    if booking.at_risk_at is not None or booking.ends_on > at_risk_last_end_date(
+        ctx.now, ctx.settings
+    ):
         raise InvalidTransition(booking.status.value, ctx.event.value)
     booking.at_risk_at = ctx.now
     await _restrict_renter(ctx, "at_risk", override=False)

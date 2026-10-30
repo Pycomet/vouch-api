@@ -62,6 +62,8 @@ CONTRIBUTION = D("7500.00")
 COMMISSION = D("22500.00")  # 15% of the rental (not of the delivery fee)
 BALANCE = RENTAL + DELIVERY
 START = date(2027, 1, 4)
+# Ends 2026-10-29, so at risk from 2026-10-31 23:00 UTC: before DEFAULT_NOW.
+OVERDUE_START = date(2026, 10, 27)
 
 
 @pytest.fixture
@@ -849,7 +851,7 @@ async def test_only_admin_resolves(db_session, clock, notifier, role) -> None:
 
 
 async def test_flag_at_risk_freezes_renter(db_session, clock, notifier) -> None:
-    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    booking = await _with_deposit(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
 
     result = await _transition(
         db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
@@ -874,7 +876,7 @@ async def test_flag_at_risk_freezes_renter(db_session, clock, notifier) -> None:
 
 
 async def test_second_at_risk_flag_is_invalid(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.in_progress)
+    booking = await _booking(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
     await _transition(
         db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
     )
@@ -888,7 +890,7 @@ async def test_second_at_risk_flag_is_invalid(db_session, clock, notifier) -> No
 
 
 async def test_at_risk_keeps_an_existing_restriction(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.in_progress)
+    booking = await _booking(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
     renter = await db_session.get(User, booking.renter_id)
     earlier = DEFAULT_NOW - timedelta(days=30)
     renter.restricted_at = earlier
@@ -902,6 +904,43 @@ async def test_at_risk_keeps_an_existing_restriction(db_session, clock, notifier
     await db_session.refresh(renter)
     assert (renter.restricted_at, renter.restricted_reason) == (earlier, "lost_item")
     assert [a.action for a in await _audits(db_session, booking.renter_id)] == []
+
+
+def _at_risk_from(booking: Booking) -> datetime:
+    """start_of_business_day(ends_on + 1 day) + 48h: the first at-risk instant."""
+    zone = get_settings().business_zone
+    return start_of_business_day(booking.ends_on + timedelta(days=1), zone) + timedelta(hours=48)
+
+
+async def test_flag_at_risk_before_the_cutoff_is_invalid(db_session, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    early = FrozenClock(_at_risk_from(booking) - timedelta(seconds=1))
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, Actor.system(), BookingEvent.flag_at_risk, early, notifier
+        )
+
+    assert await _counts(db_session) == counts
+    await db_session.refresh(booking)
+    assert booking.at_risk_at is None
+    renter = await db_session.get(User, booking.renter_id)
+    await db_session.refresh(renter)
+    assert renter.restricted_at is None
+    assert notifier.calls == []
+
+
+async def test_flag_at_risk_at_the_cutoff_flags(db_session, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    at = FrozenClock(_at_risk_from(booking))
+
+    result = await _transition(
+        db_session, booking, Actor.system(), BookingEvent.flag_at_risk, at, notifier
+    )
+
+    assert result.at_risk_at == at.now()
+    assert notifier.templates() == ["ops.at_risk"]
 
 
 async def test_vendor_cannot_flag_at_risk(db_session, clock, notifier) -> None:
@@ -1316,7 +1355,7 @@ async def test_row_disputed_resolve(db_session, clock, notifier) -> None:
 
 
 async def test_row_in_progress_flag_at_risk(db_session, clock, notifier) -> None:
-    booking = await _booking(db_session, BookingStatus.in_progress)
+    booking = await _booking(db_session, BookingStatus.in_progress, starts_on=OVERDUE_START)
 
     result = await _transition(
         db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
