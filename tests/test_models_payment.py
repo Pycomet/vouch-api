@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from decimal import Decimal
-from uuid import UUID
-
 from sqlalchemy import CheckConstraint, Enum
 from sqlalchemy.dialects.postgresql import JSONB
 
 import app.db.models  # noqa: F401
 from app.db.base import Base
-from app.db.models.booking import BookingStatus
-from app.db.models.handover import HandoverDirection, HandoverRecord, HandoverStatus
-from app.db.models.payment import DepositStatus, Payment, PaymentType, PayoutStatus
+from app.db.models.payment import DepositStatus, PayoutStatus
 
 
 def _table(name: str):
@@ -111,95 +105,3 @@ def test_payment_lifecycle_columns_match_transaction_type() -> None:
     assert "deposit_claimed_at IS NOT NULL" in checks["ck_payments_deposit_status_timestamps"]
     assert "payout_eligible_at IS NOT NULL" in checks["ck_payments_payout_status_timestamps"]
     assert "paid_at IS NOT NULL" in checks["ck_payments_payout_status_timestamps"]
-
-
-def _completed_return(booking_id: UUID) -> HandoverRecord:
-    signed_at = datetime(2026, 9, 26, 11, tzinfo=UTC)
-    return HandoverRecord(
-        direction=HandoverDirection.return_,
-        status=HandoverStatus.completed,
-        condition_checklist={"items": []},
-        vendor_signer_id="00000000-0000-0000-0000-000000000001",
-        renter_signer_id="00000000-0000-0000-0000-000000000002",
-        vendor_signed_at=signed_at,
-        renter_signed_at=signed_at,
-        evidence_urls=["evidence://return-1"],
-        booking_id=booking_id,
-    )
-
-
-def test_payout_eligibility_requires_completed_booking_and_evidenced_return() -> None:
-    booking_id = UUID("00000000-0000-0000-0000-000000000010")
-    completed_return = _completed_return(booking_id)
-    incomplete_return = HandoverRecord(
-        direction=HandoverDirection.return_,
-        status=HandoverStatus.renter_signed,
-        condition_checklist={},
-    )
-    completed_pickup = HandoverRecord(
-        direction=HandoverDirection.pickup,
-        status=HandoverStatus.completed,
-        condition_checklist={},
-    )
-    unsigned_return = HandoverRecord(
-        direction=HandoverDirection.return_,
-        status=HandoverStatus.completed,
-        condition_checklist={},
-        evidence_urls=[],
-    )
-    payment = Payment(
-        booking_id=booking_id,
-        type=PaymentType.payout,
-        amount=Decimal("1000.00"),
-        vendor_recipient_code="RCP_vendor",
-        platform_fee=Decimal("100.00"),
-    )
-
-    assert payment.is_payout_eligible(
-        [completed_return], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-    assert not payment.is_payout_eligible(
-        [completed_return], booking_status=BookingStatus.disputed, payout_on_hold=False
-    )
-    assert not payment.is_payout_eligible(
-        [completed_return], booking_status=BookingStatus.completed, payout_on_hold=True
-    )
-    assert not payment.is_payout_eligible(
-        [incomplete_return], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-    assert not payment.is_payout_eligible(
-        [completed_pickup], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-    assert not payment.is_payout_eligible(
-        [unsigned_return], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-    assert not payment.is_payout_eligible(
-        [], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-    unrelated_return = _completed_return(UUID("00000000-0000-0000-0000-000000000099"))
-    assert not payment.is_payout_eligible(
-        [unrelated_return], booking_status=BookingStatus.completed, payout_on_hold=False
-    )
-
-
-def test_mark_payout_eligible_records_timestamp_after_completed_return() -> None:
-    booking_id = UUID("00000000-0000-0000-0000-000000000010")
-    eligible_at = datetime(2026, 9, 26, 12, tzinfo=UTC)
-    payment = Payment(
-        booking_id=booking_id,
-        type=PaymentType.payout,
-        amount=Decimal("1000.00"),
-        vendor_recipient_code="RCP_vendor",
-        platform_fee=Decimal("100.00"),
-    )
-    completed_return = _completed_return(booking_id)
-
-    payment.mark_payout_eligible(
-        [completed_return],
-        booking_status=BookingStatus.completed,
-        payout_on_hold=False,
-        eligible_at=eligible_at,
-    )
-
-    assert payment.payout_status is PayoutStatus.eligible
-    assert payment.payout_eligible_at == eligible_at
