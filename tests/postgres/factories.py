@@ -164,10 +164,11 @@ async def create_booking(
 
     ``claimed`` sets the claim columns (amount, description, ``claimed_at``).
     """
-    if starts_on is None or ends_on is None:
-        default_start, default_end = _next_dates()
-        starts_on = starts_on or default_start
+    if starts_on is None:
+        starts_on, default_end = _next_dates()
         ends_on = ends_on or default_end
+    elif ends_on is None:
+        ends_on = starts_on + timedelta(days=2)
     deposit = asset.deposit_amount if deposit_amount is None else deposit_amount
     booking = Booking(
         asset_id=asset.id,
