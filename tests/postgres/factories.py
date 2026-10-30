@@ -30,11 +30,13 @@ from app.db.models import (
     Category,
     City,
     KYCProfile,
+    Payment,
     User,
     VendorReference,
 )
 from app.db.models.asset import ListingStatus
 from app.db.models.booking import BookingStatus
+from app.db.models.payment import DepositStatus, PaymentStatus, PaymentType
 from app.db.models.user import KYCStatus, RenterRole, TrustTier
 
 DEFAULT_NOW = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
@@ -223,3 +225,54 @@ async def create_vendor_reference(session: AsyncSession, booking: Booking) -> Ve
     session.add(reference)
     await session.flush()
     return reference
+
+
+def money_snapshot(
+    *,
+    rental: str = "150000.00",
+    deposit: str = "150000.00",
+    damage_contribution: str = "0.00",
+    delivery_fee: str = "0.00",
+    commission_rate: str = "0.15",
+) -> dict[str, str]:
+    """A ``price_snapshot`` with the money keys the booking service reads."""
+    return {
+        "rate_basis": "daily",
+        "rental_total": rental,
+        "delivery_fee": delivery_fee,
+        "deposit": deposit,
+        "commission_rate": commission_rate,
+        "damage_contribution": damage_contribution,
+        "currency": "NGN",
+    }
+
+
+async def create_payment(
+    session: AsyncSession,
+    booking: Booking,
+    *,
+    type: PaymentType = PaymentType.deposit,
+    amount: Decimal | None = None,
+    status: PaymentStatus = PaymentStatus.captured,
+    now: datetime = DEFAULT_NOW,
+) -> Payment:
+    """A payment row for ``booking`` that satisfies the payments CHECKs.
+
+    A ``deposit`` payment is ``held`` from ``now``; its amount defaults to the
+    booking's ``deposit_amount``. Payout payments are not supported here.
+    """
+    if type == PaymentType.payout:
+        raise ValueError("create_payment does not build payout rows")
+    payment = Payment(
+        booking_id=booking.id,
+        type=type,
+        status=status,
+        amount=booking.deposit_amount if amount is None else amount,
+        captured_at=now if status == PaymentStatus.captured else None,
+    )
+    if type == PaymentType.deposit:
+        payment.deposit_status = DepositStatus.held
+        payment.deposit_held_at = now
+    session.add(payment)
+    await session.flush()
+    return payment

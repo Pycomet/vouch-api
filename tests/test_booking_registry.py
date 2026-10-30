@@ -25,6 +25,18 @@ def test_requested_rows_registered_with_their_roles() -> None:
         assert rule.party_only is True
 
 
+def test_money_rows_registered_with_their_roles() -> None:
+    table = booking_service._TRANSITIONS
+    expected = {
+        (BookingStatus.accepted, BookingEvent.deposit_captured): {ActorRole.system},
+        (BookingStatus.accepted, BookingEvent.expire_deposit): {ActorRole.system},
+        (BookingStatus.confirmed, BookingEvent.cancel): {ActorRole.renter, ActorRole.vendor},
+    }
+    for key, roles in expected.items():
+        assert table[key].roles == roles
+        assert table[key].party_only is True
+
+
 def test_duplicate_registration_rejected() -> None:
     register = booking_service._register(
         BookingStatus.requested, BookingEvent.accept, ActorRole.vendor

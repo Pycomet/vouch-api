@@ -13,6 +13,12 @@ Two entry points:
   (``SELECT ... FOR UPDATE``), looks up ``(status, event)`` in ``_TRANSITIONS``,
   checks the actor, runs the handler, writes one audit row and flushes.
 
+A handler may also record an intermediate step itself: ``deposit_captured``
+writes the ``booking.deposit_paid`` audit row inside its handler and returns
+``_Outcome.before`` so the engine's ``booking.confirmed`` row starts from
+``deposit_paid``. Money transitions post their ledger groups with the recipes in
+:mod:`app.services.money`, using amounts from the booking's ``price_snapshot``.
+
 ``_TRANSITIONS`` is a plain dict from ``(BookingStatus, BookingEvent)`` to a
 :class:`_Rule`. Later steps add their rows to it with :func:`_register`. A missing
 row, a role the rule does not allow, or a renter or vendor who is not this
@@ -29,7 +35,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -37,11 +43,12 @@ from sqlalchemy import exists, inspect, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.clock import Clock, business_date
+from app.core.clock import Clock, business_date, start_of_business_day
 from app.core.config import Settings
-from app.db.models import Asset, AvailabilityWindow, Booking, User
+from app.db.models import Asset, AvailabilityWindow, Booking, Payment, User
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
+from app.db.models.payment import PaymentType
 from app.db.models.user import TrustTier
 from app.schemas.errors import (
     BookingGuardFailed,
@@ -51,8 +58,14 @@ from app.schemas.errors import (
 )
 from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
+from app.services.ledger import Posting, post_txn
+from app.services.money import (
+    deposit_captured_postings,
+    deposit_release_postings,
+    refund_contribution_postings,
+)
 from app.services.notify import Notifier
-from app.services.pricing import price_snapshot
+from app.services.pricing import money, price_snapshot
 from app.services.trust import required_tier_met, tier_effective
 
 HOLD_PERIOD = timedelta(hours=4)
@@ -122,11 +135,14 @@ class _Context:
 class _Outcome:
     """What a handler returns once it has changed the booking.
 
-    ``action`` defaults to ``booking.<new status>``. ``after`` is merged into the
-    audit row's after-data, on top of the changed columns.
+    ``action`` defaults to ``booking.<new status>``. ``before`` and ``after`` are
+    merged into the audit row's before- and after-data, on top of the changed
+    columns (``before`` lets a handler that recorded an intermediate step start
+    the final row from that step's status).
     """
 
     action: str | None = None
+    before: Mapping[str, Any] = field(default_factory=dict)
     after: Mapping[str, Any] = field(default_factory=dict)
     reason: str | None = None
     notices: tuple[Notice, ...] = ()
@@ -238,7 +254,11 @@ async def transition(
 
     after_columns = _audited_columns(booking)
     changed = [key for key, value in after_columns.items() if before_columns[key] != value]
-    before = {"status": from_status, **{key: before_columns[key] for key in changed}}
+    before = {
+        "status": from_status,
+        **{key: before_columns[key] for key in changed},
+        **outcome.before,
+    }
     after = {
         "status": booking.status,
         **{key: after_columns[key] for key in changed},
@@ -339,6 +359,187 @@ async def _expire_hold(ctx: _Context) -> _Outcome:
         raise InvalidTransition(booking.status.value, ctx.event.value)
     booking.status = BookingStatus.expired
     return _Outcome(notices=(_notice(booking, booking.renter_id, "booking.expired"),))
+
+
+# ---------------------------------------------------------------------------
+# Handlers: money (accepted, confirmed)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_amount(booking: Booking, key: str) -> Decimal:
+    """A money value frozen in ``price_snapshot`` (a missing optional key is 0)."""
+    return money(booking.price_snapshot.get(key, "0"))
+
+
+def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
+    """The payload's ``amount`` as a Decimal, or None if absent or not money."""
+    raw = payload.get("amount")
+    if isinstance(raw, bool) or not isinstance(raw, Decimal | int | str):
+        return None  # floats are never money
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return amount if amount.is_finite() else None
+
+
+async def _deposit_payment_id(ctx: _Context) -> uuid.UUID:
+    """The payload's ``payment_id``, which must be this booking's deposit payment."""
+    raw = ctx.payload.get("payment_id")
+    try:
+        payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+    except ValueError:
+        payment_id = None
+    found = payment_id is not None and await ctx.session.scalar(
+        select(
+            exists().where(
+                Payment.id == payment_id,
+                Payment.booking_id == ctx.booking.id,
+                Payment.type == PaymentType.deposit,
+            )
+        )
+    )
+    if not found:
+        raise InvalidRequestError(
+            "The payment is not this booking's deposit.", {"payment_id": _plain(raw)}
+        )
+    return payment_id
+
+
+async def _post(
+    ctx: _Context, postings: list[Posting], memo: str, payment_id: uuid.UUID | None = None
+) -> None:
+    """Write one ledger group for this booking; an empty recipe writes nothing."""
+    if postings:
+        await post_txn(
+            ctx.session,
+            postings=postings,
+            booking_id=ctx.booking.id,
+            payment_id=payment_id,
+            memo=memo,
+        )
+
+
+async def _phones(ctx: _Context) -> dict[uuid.UUID, str]:
+    booking = ctx.booking
+    rows = await ctx.session.execute(
+        select(User.id, User.phone).where(User.id.in_((booking.renter_id, booking.vendor_id)))
+    )
+    return {user_id: phone for user_id, phone in rows.all()}
+
+
+def _both(booking: Booking, template: str, **extra: Any) -> tuple[Notice, ...]:
+    return tuple(
+        _notice(booking, user_id, template, **extra)
+        for user_id in (booking.renter_id, booking.vendor_id)
+    )
+
+
+@_register(BookingStatus.accepted, BookingEvent.deposit_captured, ActorRole.system)
+async def _deposit_captured(ctx: _Context) -> _Outcome:
+    """accepted -> deposit_paid -> confirmed in one call, with two audit rows."""
+    booking = ctx.booking
+    deposit = _snapshot_amount(booking, "deposit")
+    contribution = _snapshot_amount(booking, "damage_contribution")
+    expected = deposit + contribution
+    amount = _payload_amount(ctx.payload)
+    if amount is None or amount != expected:
+        raise BookingGuardFailed(
+            "amount_mismatch",
+            {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
+        )
+    payment_id = await _deposit_payment_id(ctx)
+
+    booking.status = BookingStatus.deposit_paid
+    await record_audit(
+        ctx.session,
+        actor=ctx.actor,
+        entity=AUDIT_ENTITY,
+        entity_id=booking.id,
+        action=f"booking.{BookingStatus.deposit_paid.value}",
+        before={"status": BookingStatus.accepted},
+        after={
+            "status": BookingStatus.deposit_paid,
+            "amount": money(amount),
+            "payment_id": payment_id,
+        },
+    )
+    await _post(
+        ctx, deposit_captured_postings(deposit, contribution), "deposit_captured", payment_id
+    )
+
+    booking.status = BookingStatus.confirmed
+    # "Release contact details": each party gets the counterpart's phone (R8).
+    phones = await _phones(ctx)
+    return _Outcome(
+        before={"status": BookingStatus.deposit_paid},
+        notices=(
+            _notice(
+                booking,
+                booking.renter_id,
+                "booking.confirmed",
+                counterpart_phone=phones.get(booking.vendor_id),
+            ),
+            _notice(
+                booking,
+                booking.vendor_id,
+                "booking.confirmed",
+                counterpart_phone=phones.get(booking.renter_id),
+            ),
+        ),
+    )
+
+
+@_register(BookingStatus.accepted, BookingEvent.expire_deposit, ActorRole.system)
+async def _expire_deposit(ctx: _Context) -> _Outcome:
+    booking = ctx.booking
+    if not ctx.now > booking.deposit_due_at:
+        raise InvalidTransition(booking.status.value, ctx.event.value)
+    booking.status = BookingStatus.expired
+    return _Outcome(notices=_both(booking, "booking.expired"))
+
+
+@_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
+async def _cancel(ctx: _Context) -> _Outcome:
+    """Renter before the start day, or vendor any time; both refund in full (A8)."""
+    booking = ctx.booking
+    reason = _reason(ctx.payload)
+    if ctx.actor.role == ActorRole.renter:
+        cutoff = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
+        if not ctx.now < cutoff:
+            raise BookingGuardFailed("cancel_window_closed", {"cancel_before": _plain(cutoff)})
+        status = BookingStatus.cancelled_by_renter
+    else:
+        if reason is None:
+            raise BookingGuardFailed("reason_required")
+        status = BookingStatus.cancelled_by_vendor
+
+    # By `confirmed` the renter has paid the deposit and the damage contribution
+    # (the rental balance is due at handover); each goes back in its own txn_group.
+    deposit = _snapshot_amount(booking, "deposit")
+    contribution = _snapshot_amount(booking, "damage_contribution")
+    await _post(ctx, deposit_release_postings(deposit), "cancel_deposit_refund")
+    await _post(ctx, refund_contribution_postings(contribution), "cancel_contribution_refund")
+
+    booking.status = status
+    booking.cancelled_at = ctx.now
+    booking.cancellation_reason = reason
+    if status == BookingStatus.cancelled_by_vendor:
+        await record_audit(
+            ctx.session,
+            actor=ctx.actor,
+            entity="user",
+            entity_id=booking.vendor_id,
+            action="vendor.reliability_penalty",
+            before=None,
+            after={"booking_id": booking.id, "status": status},
+            reason=reason,
+        )
+    return _Outcome(
+        after={"refund": {"deposit": deposit, "damage_contribution": contribution}},
+        reason=reason,
+        notices=_both(booking, "booking.cancelled"),
+    )
 
 
 # ---------------------------------------------------------------------------
