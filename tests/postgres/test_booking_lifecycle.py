@@ -17,9 +17,10 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.clock import FrozenClock
+from app.core.clock import FrozenClock, start_of_business_day
 from app.core.config import get_settings
-from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry
+from app.db.models import Asset, AuditEvent, Booking, LedgerAccount, LedgerEntry, User
+from app.db.models.asset import ListingStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection
@@ -731,3 +732,202 @@ async def test_only_admin_resolves(db_session, clock, notifier, role) -> None:
             notifier,
             {"decision": "release", "reason": "x"},
         )
+
+
+# ---------------------------------------------------------------------------
+# in_progress + flag_at_risk (timer): a flag, not a state
+# ---------------------------------------------------------------------------
+
+
+async def test_flag_at_risk_freezes_renter(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+
+    result = await _transition(
+        db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
+    )
+
+    assert result.status == BookingStatus.in_progress
+    assert result.at_risk_at == DEFAULT_NOW
+    renter = await db_session.get(User, booking.renter_id)
+    await db_session.refresh(renter)
+    assert renter.restricted_at == DEFAULT_NOW
+    assert renter.restricted_reason == "at_risk"
+    audit = (await _audits(db_session, booking.id))[-1]
+    assert audit.action == "booking.at_risk"
+    assert (audit.before["status"], audit.after["status"]) == ("in_progress", "in_progress")
+    assert audit.after["at_risk_at"] == DEFAULT_NOW.isoformat()
+    user_audit = (await _audits(db_session, booking.renter_id))[-1]
+    assert user_audit.action == "user.restricted"
+    assert user_audit.after["restricted_reason"] == "at_risk"
+    assert notifier.templates() == ["ops.at_risk"]
+    assert notifier.calls[0].user_id is None
+    assert len(await _ledger(db_session, booking.id)) == 3  # only the deposit group
+
+
+async def test_second_at_risk_flag_is_invalid(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.in_progress)
+    await _transition(
+        db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
+    )
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
+        )
+    assert await _counts(db_session) == counts
+
+
+async def test_at_risk_keeps_an_existing_restriction(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.in_progress)
+    renter = await db_session.get(User, booking.renter_id)
+    earlier = DEFAULT_NOW - timedelta(days=30)
+    renter.restricted_at = earlier
+    renter.restricted_reason = "lost_item"
+    await db_session.flush()
+
+    await _transition(
+        db_session, booking, Actor.system(), BookingEvent.flag_at_risk, clock, notifier
+    )
+
+    await db_session.refresh(renter)
+    assert (renter.restricted_at, renter.restricted_reason) == (earlier, "lost_item")
+    assert [a.action for a in await _audits(db_session, booking.renter_id)] == []
+
+
+async def test_vendor_cannot_flag_at_risk(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.in_progress)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, vendor_actor(booking), BookingEvent.flag_at_risk, clock, notifier
+        )
+
+
+# ---------------------------------------------------------------------------
+# in_progress + mark_lost (admin) -> lost
+# ---------------------------------------------------------------------------
+
+
+def _lost_from(booking: Booking):
+    """start_of_business_day(ends_on + 7 days) in the business zone, as UTC."""
+    return start_of_business_day(booking.ends_on + timedelta(days=7), get_settings().business_zone)
+
+
+async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    admin = await admin_actor(db_session)
+    clock = FrozenClock(_lost_from(booking))
+
+    result = await _transition(
+        db_session,
+        booking,
+        admin,
+        BookingEvent.mark_lost,
+        clock,
+        notifier,
+        {"reason": "No contact for 7 days"},
+    )
+
+    assert result.status == BookingStatus.lost
+    assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == DEPOSIT
+    renter = await db_session.get(User, booking.renter_id)
+    await db_session.refresh(renter)
+    assert renter.restricted_reason == "lost_item"
+    assert renter.restricted_at == clock.now()
+    asset = await db_session.get(Asset, booking.asset_id)
+    await db_session.refresh(asset)
+    assert asset.listing_status == ListingStatus.paused
+
+    audits = await _audits(db_session, booking.id)
+    assert [a.action for a in audits[-2:]] == ["deposit.forfeited", "booking.lost"]
+    assert audits[-1].reason == "No contact for 7 days"
+    assert audits[-1].actor_role == "admin"
+    paused = (await _audits(db_session, booking.asset_id))[-1]
+    assert paused.action == "asset.paused"
+    assert (paused.before["listing_status"], paused.after["listing_status"]) == (
+        "active",
+        "paused",
+    )
+    restricted = (await _audits(db_session, booking.renter_id))[-1]
+    assert restricted.action == "user.restricted"
+    assert restricted.after["restricted_reason"] == "lost_item"
+    assert {call.user_id for call in notifier.calls} >= {booking.renter_id, booking.vendor_id}
+    assert "ops.lost" in notifier.templates()
+
+
+async def test_mark_lost_before_t_plus_7_409(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    admin = await admin_actor(db_session)
+    clock = FrozenClock(_lost_from(booking) - timedelta(seconds=1))
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidTransition) as caught:
+        await _transition(
+            db_session,
+            booking,
+            admin,
+            BookingEvent.mark_lost,
+            clock,
+            notifier,
+            {"reason": "No contact"},
+        )
+
+    assert caught.value.status_code == 409
+    assert await _counts(db_session) == counts
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.in_progress
+
+
+@pytest.mark.parametrize("payload", [None, {"reason": "  "}])
+async def test_mark_lost_requires_reason(db_session, clock, notifier, payload) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    admin = await admin_actor(db_session)
+    clock = FrozenClock(_lost_from(booking))
+    counts = await _counts(db_session)
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session, booking, admin, BookingEvent.mark_lost, clock, notifier, payload
+        )
+
+    assert caught.value.code == "reason_required"
+    assert await _counts(db_session) == counts
+
+
+async def test_vendor_cannot_mark_lost(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.in_progress)
+    clock = FrozenClock(_lost_from(booking))
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(booking),
+            BookingEvent.mark_lost,
+            clock,
+            notifier,
+            {"reason": "Gone"},
+        )
+
+
+async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.in_progress)
+    asset = await db_session.get(Asset, booking.asset_id)
+    asset.listing_status = ListingStatus.paused
+    await db_session.flush()
+    admin = await admin_actor(db_session)
+
+    result = await _transition(
+        db_session,
+        booking,
+        admin,
+        BookingEvent.mark_lost,
+        FrozenClock(_lost_from(booking)),
+        notifier,
+        {"reason": "Gone"},
+    )
+
+    assert result.status == BookingStatus.lost
+    assert await _audits(db_session, booking.asset_id) == []

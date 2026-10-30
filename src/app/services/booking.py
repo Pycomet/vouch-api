@@ -57,6 +57,7 @@ from app.db.models import (
     Payment,
     User,
 )
+from app.db.models.asset import ListingStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
@@ -87,6 +88,7 @@ from app.services.trust import required_tier_met, tier_effective
 HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
 CLAIM_WINDOW = timedelta(hours=24)
+LOST_AFTER = timedelta(days=7)
 ZERO = Decimal("0.00")
 
 AUDIT_ENTITY = "booking"
@@ -843,6 +845,96 @@ async def _resolve(ctx: _Context) -> _Outcome:
         after=after,
         reason=reason,
         notices=_both(booking, "booking.completed", decision=decision),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers: at-risk flag and lost gear (in_progress)
+# ---------------------------------------------------------------------------
+
+
+async def _restrict_renter(ctx: _Context, reason: str, *, override: bool) -> None:
+    """Freeze the renter's account, with a ``user.restricted`` audit row.
+
+    Without ``override`` an existing restriction (and its reason) is kept.
+    """
+    renter = await ctx.session.get(User, ctx.booking.renter_id, with_for_update=True)
+    if renter.restricted_at is not None and not override:
+        return
+    before = {"restricted_at": renter.restricted_at, "restricted_reason": renter.restricted_reason}
+    renter.restricted_at = ctx.now
+    renter.restricted_reason = reason
+    await record_audit(
+        ctx.session,
+        actor=ctx.actor,
+        entity="user",
+        entity_id=renter.id,
+        action="user.restricted",
+        before=before,
+        after={
+            "restricted_at": renter.restricted_at,
+            "restricted_reason": reason,
+            "booking_id": ctx.booking.id,
+        },
+        reason=_reason(ctx.payload),
+    )
+
+
+def _ops(booking: Booking, event: str, **extra: Any) -> Notice:
+    """An operations alert (R8): ``notifier.send(None, "ops.<event>", data)``."""
+    data = {"booking_id": str(booking.id), "renter_id": str(booking.renter_id)}
+    data.update({key: _plain(value) for key, value in extra.items()})
+    return Notice(None, f"ops.{event}", data)
+
+
+@_register(BookingStatus.in_progress, BookingEvent.flag_at_risk, ActorRole.system)
+async def _flag_at_risk(ctx: _Context) -> _Outcome:
+    """No contact past the return: flag the booking (not a state), freeze the renter."""
+    booking = ctx.booking
+    if booking.at_risk_at is not None:
+        raise InvalidTransition(booking.status.value, ctx.event.value)
+    booking.at_risk_at = ctx.now
+    await _restrict_renter(ctx, "at_risk", override=False)
+    return _Outcome(action="booking.at_risk", notices=(_ops(booking, "at_risk"),))
+
+
+@_register(BookingStatus.in_progress, BookingEvent.mark_lost, ActorRole.admin)
+async def _mark_lost(ctx: _Context) -> _Outcome:
+    """From the start of the 7th business day after ``ends_on``: forfeit and pause."""
+    booking = ctx.booking
+    lost_from = start_of_business_day(booking.ends_on + LOST_AFTER, ctx.settings.business_zone)
+    if not ctx.now >= lost_from:
+        raise InvalidTransition(booking.status.value, ctx.event.value)
+    reason = _reason(ctx.payload)
+    if reason is None:
+        raise BookingGuardFailed("reason_required")
+
+    deposit = _snapshot_amount(booking, "deposit")
+    await _post(ctx, deposit_forfeit_postings(deposit), "lost_deposit_forfeited")
+    await _deposit_audit(ctx, "deposit.forfeited", deposit=deposit, amount=deposit)
+    await _restrict_renter(ctx, "lost_item", override=True)
+
+    # Lost gear must not stay bookable (R9).
+    asset = await ctx.session.get(Asset, booking.asset_id, with_for_update=True)
+    if asset.listing_status != ListingStatus.paused:
+        previous = asset.listing_status
+        asset.listing_status = ListingStatus.paused
+        await record_audit(
+            ctx.session,
+            actor=ctx.actor,
+            entity="asset",
+            entity_id=asset.id,
+            action="asset.paused",
+            before={"listing_status": previous},
+            after={"listing_status": ListingStatus.paused, "booking_id": booking.id},
+            reason=reason,
+        )
+
+    booking.status = BookingStatus.lost
+    return _Outcome(
+        after={"deposit_forfeited": deposit},
+        reason=reason,
+        notices=(*_both(booking, "booking.lost"), _ops(booking, "lost")),
     )
 
 
