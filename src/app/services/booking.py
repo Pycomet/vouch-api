@@ -527,8 +527,14 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
 
 @_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
 async def _cancel(ctx: _Context) -> _Outcome:
-    """Renter before the start day, or vendor any time; both refund in full (A8)."""
+    """Renter before the start day, or vendor before the pickup; both refund in full (A8).
+
+    Nobody cancels once both parties have signed the pickup handover: the item has
+    changed hands, so the rental is under way whatever the booking status says.
+    """
     booking = ctx.booking
+    if await _handover_done(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("handover_signed")
     reason = _reason(ctx.payload)
     if ctx.actor.role == ActorRole.renter:
         cutoff = start_of_business_day(booking.starts_on, ctx.settings.business_zone)

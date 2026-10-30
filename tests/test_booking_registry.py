@@ -61,6 +61,12 @@ def test_handover_incomplete_is_a_guard_code() -> None:
     assert (error.status_code, error.code) == (409, "handover_incomplete")
 
 
+def test_handover_signed_is_a_guard_code() -> None:
+    error = BookingGuardFailed("handover_signed")
+
+    assert (error.status_code, error.code) == (409, "handover_signed")
+
+
 def test_duplicate_registration_rejected() -> None:
     register = booking_service._register(
         BookingStatus.requested, BookingEvent.accept, ActorRole.vendor

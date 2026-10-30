@@ -36,7 +36,7 @@ from app.services import booking as booking_service
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, request_booking, transition
 from app.services.ledger import account_balance, post_txn
-from app.services.money import deposit_captured_postings
+from app.services.money import balance_captured_postings, deposit_captured_postings
 from app.services.notify import RecordingNotifier
 from tests.postgres.factories import (
     DEFAULT_NOW,
@@ -447,6 +447,54 @@ async def test_cancel_after_balance_refunds_everything(
         "delivery_fee": str(DELIVERY),
         "commission": str(COMMISSION),
     }
+
+
+@pytest.mark.parametrize("role", [ActorRole.renter, ActorRole.vendor])
+@pytest.mark.parametrize("balance_paid", [False, True])
+async def test_cancel_after_pickup_handover_is_refused(
+    db_session, clock, notifier, role, balance_paid
+) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    await create_handover(db_session, booking)
+    if balance_paid:
+        payload = await _balance_payload(db_session, booking)
+        # Handover signed and balance paid would start the rental, so post the
+        # balance through the ledger only: the booking stays confirmed.
+        await post_txn(
+            db_session,
+            postings=balance_captured_postings(RENTAL, DELIVERY, COMMISSION),
+            booking_id=booking.id,
+            payment_id=payload["payment_id"],
+            memo="balance_captured",
+        )
+    actor = renter_actor(booking) if role == ActorRole.renter else vendor_actor(booking)
+    counts = await _counts(db_session)
+    penalties = len(await _audits(db_session, booking.vendor_id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session, booking, actor, BookingEvent.cancel, clock, notifier, {"reason": "No go"}
+        )
+
+    assert caught.value.code == "handover_signed"
+    assert await _counts(db_session) == counts
+    assert len(await _audits(db_session, booking.vendor_id)) == penalties
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.confirmed
+    assert booking.cancelled_at is None
+    assert booking.cancellation_reason is None
+    assert notifier.calls == []
+
+
+async def test_cancel_with_only_a_draft_pickup_is_allowed(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    await create_handover(db_session, booking, completed=False)
+
+    result = await _transition(
+        db_session, booking, renter_actor(booking), BookingEvent.cancel, clock, notifier
+    )
+
+    assert result.status == BookingStatus.cancelled_by_renter
 
 
 # ---------------------------------------------------------------------------

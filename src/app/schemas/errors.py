@@ -138,6 +138,7 @@ _GUARD_MESSAGES = {
     "claim_window_closed": "The claim window has closed.",
     "reason_required": "A reason is required.",
     "handover_incomplete": "Both parties have not signed the handover yet.",
+    "handover_signed": "The item has been handed over; the booking can no longer be cancelled.",
 }
 
 
