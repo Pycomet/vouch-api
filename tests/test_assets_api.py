@@ -15,9 +15,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_launched_cities
+from app.core.config import Settings
 from app.db.models.asset import ListingStatus
 from app.schemas.assets import PublicAsset
 from app.schemas.errors import ResourceNotFoundError
@@ -238,10 +240,31 @@ def test_ensure_city_launched_accepts_launched_and_none() -> None:
     ensure_city_launched("abuja", ["abuja", "lagos"])
 
 
-def test_default_launched_cities_come_from_settings() -> None:
-    from app.core.config import get_settings
+def test_launched_cities_come_from_the_apps_own_settings(settings: Settings) -> None:
+    from app.main import create_app
 
-    assert get_launched_cities() == get_settings().launched_cities
+    own = settings.model_copy(update={"launched_cities": ["kano", "enugu"]})
+    application = create_app(own)
+    request = Request({"type": "http", "app": application, "headers": []})
+    assert get_launched_cities(request) == ["kano", "enugu"]
+
+
+def test_city_filter_is_stripped_and_lowercased(client: TestClient, monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def mock_search(*args, **kwargs):
+        from app.services.inventory import AssetPage
+
+        seen.update(kwargs)
+        return AssetPage(items=[], next_cursor=None)
+
+    monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
+    client.app.dependency_overrides[get_launched_cities] = lambda: ["abuja"]
+    try:
+        assert client.get("/api/v1/assets", params={"city": " Abuja "}).status_code == 200
+    finally:
+        client.app.dependency_overrides.clear()
+    assert seen["city"] == "abuja"
 
 
 def test_display_name_prefers_name_then_make_model() -> None:

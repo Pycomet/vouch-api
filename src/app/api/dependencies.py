@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from app.core.config import get_settings
+from fastapi import Request
 
 
-def get_launched_cities() -> list[str]:
+def get_launched_cities(request: Request) -> list[str]:
     """City slugs open to the public (``VOUCH_LAUNCHED_CITIES``).
 
-    A dependency rather than a direct settings read, so tests can override it
-    through ``app.dependency_overrides``.
+    Read from the settings the running app was built with (``app.state.settings``),
+    not from the process-wide cache. A dependency so tests can override it through
+    ``app.dependency_overrides``.
     """
-    return list(get_settings().launched_cities)
+    return list(request.app.state.settings.launched_cities)

@@ -93,6 +93,7 @@ async def list_assets(
         decode_cursor(cursor)  # raises CursorDecodeError (→ 400) on failure
 
     # The service raises CityNotLaunchedError (→ 400) before querying.
+    city = city.strip().lower() if city else None
     page = await search_public_assets(
         session,
         launched_cities=launched_cities,

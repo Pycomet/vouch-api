@@ -133,6 +133,7 @@ def app():
         _env_file=None,
         environment=Environment.TEST,
         database_url=DATABASE_URL,
+        launched_cities=["abuja"],
     )
     return create_app(settings)
 
