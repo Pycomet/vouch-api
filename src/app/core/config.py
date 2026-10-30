@@ -7,6 +7,7 @@ from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from typing import Annotated
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -72,6 +73,15 @@ class Settings(BaseSettings):
             raise ValueError("rate must satisfy 0 <= rate < 1")
         return value
 
+    @field_validator("business_timezone")
+    @classmethod
+    def validate_business_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown business_timezone: {value!r}") from exc
+        return value
+
     @model_validator(mode="after")
     def enforce_production_safety(self) -> Settings:
         if self.environment == Environment.PRODUCTION and self.debug:
@@ -81,6 +91,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == Environment.PRODUCTION
+
+    @property
+    def business_zone(self) -> ZoneInfo:
+        return ZoneInfo(self.business_timezone)
 
     @property
     def cors_origin_values(self) -> list[str]:
