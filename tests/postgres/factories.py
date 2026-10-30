@@ -8,12 +8,13 @@ so factories can be called any number of times in one test.
 ``create_booking`` fills the columns the bookings CHECK constraints require for the
 chosen status (``hold_expires_at`` for requested, ``deposit_due_at`` for accepted,
 ``claim_window_ends_at`` for returned and disputed) and, by default, gives each
-booking its own dates so live bookings of one asset never overlap.
+booking of the session its own dates (FIRST_START, then a week apart), so live
+bookings of one asset never overlap and every test sees the same defaults. Given
+only one of ``starts_on``/``ends_on``, the other is two days away.
 """
 
 from __future__ import annotations
 
-import itertools
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -39,7 +40,7 @@ from app.db.models.user import KYCStatus, RenterRole, TrustTier
 DEFAULT_NOW = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
 FIRST_START = date(2027, 1, 4)
 
-_booking_slot = itertools.count()
+_SLOT_KEY = "factories.booking_slot"
 
 
 def _phone() -> str:
@@ -139,8 +140,15 @@ async def create_asset(
     return asset
 
 
-def _next_dates() -> tuple[date, date]:
-    start = FIRST_START + timedelta(days=7 * next(_booking_slot))
+def _next_dates(session: AsyncSession) -> tuple[date, date]:
+    """The next default slot for this session: FIRST_START, then a week apart.
+
+    The counter lives in ``session.info``, so it restarts with every test's session
+    and default dates never depend on test order or selection.
+    """
+    slot = session.info.get(_SLOT_KEY, 0)
+    session.info[_SLOT_KEY] = slot + 1
+    start = FIRST_START + timedelta(days=7 * slot)
     return start, start + timedelta(days=2)
 
 
@@ -164,9 +172,10 @@ async def create_booking(
 
     ``claimed`` sets the claim columns (amount, description, ``claimed_at``).
     """
-    if starts_on is None:
-        starts_on, default_end = _next_dates()
-        ends_on = ends_on or default_end
+    if starts_on is None and ends_on is None:
+        starts_on, ends_on = _next_dates(session)
+    elif starts_on is None:
+        starts_on = ends_on - timedelta(days=2)
     elif ends_on is None:
         ends_on = starts_on + timedelta(days=2)
     deposit = asset.deposit_amount if deposit_amount is None else deposit_amount
