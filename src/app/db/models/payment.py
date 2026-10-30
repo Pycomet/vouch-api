@@ -21,6 +21,8 @@ class PaymentType(enum.StrEnum):
     payout = "payout"
     refund = "refund"
     damage_contribution = "damage_contribution"
+    # The one upfront payment that confirms a booking: D + C + R + F (A14).
+    booking = "booking"
 
 
 class PaymentStatus(enum.StrEnum):

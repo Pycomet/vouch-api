@@ -111,3 +111,8 @@ def test_payment_type_uses_damage_contribution() -> None:
     assert PaymentType.damage_contribution.value == "damage_contribution"
     assert "protection_waiver" not in {member.value for member in PaymentType}
     assert "damage_contribution" in _table("payments").c["type"].type.enums
+
+
+def test_payment_type_has_the_upfront_booking_payment() -> None:
+    assert PaymentType.booking.value == "booking"
+    assert "booking" in _table("payments").c["type"].type.enums

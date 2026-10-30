@@ -86,8 +86,25 @@ def alembic_config(output_buffer: StringIO | None = None) -> Config:
 def test_single_initial_migration_is_head() -> None:
     script = ScriptDirectory.from_config(alembic_config())
 
-    assert script.get_heads() == ["0003_schema_alignment"]
+    assert script.get_heads() == ["0004_booking_payment"]
+    assert script.get_revision("0004_booking_payment").down_revision == "0003_schema_alignment"
     assert script.get_revision("0001_initial_schema").down_revision is None
+
+
+def test_0004_sql_adds_and_removes_the_booking_payment_type() -> None:
+    upgrade = StringIO()
+    command.upgrade(alembic_config(upgrade), "0003_schema_alignment:0004_booking_payment", sql=True)
+    assert "alter type paymenttype add value 'booking'" in upgrade.getvalue().lower()
+
+    downgrade = StringIO()
+    command.downgrade(
+        alembic_config(downgrade), "0004_booking_payment:0003_schema_alignment", sql=True
+    )
+    sql = downgrade.getvalue().lower()
+    assert "raise exception" in sql
+    assert sql.index("raise exception") < sql.index("alter type paymenttype rename to")
+    assert "create type paymenttype as enum ('deposit', 'rental_balance'" in sql
+    assert "drop type paymenttype_old" in sql
 
 
 def test_env_overrides_url_from_validated_settings_in_offline_mode(

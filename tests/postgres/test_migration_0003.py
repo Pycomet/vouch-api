@@ -42,7 +42,7 @@ def _fetch_sync(query: str, *args):
 
 
 def test_upgrade_and_downgrade_on_empty_db(migrated_db: str, alembic_cfg: Config) -> None:
-    command.downgrade(alembic_cfg, "-1")
+    command.downgrade(alembic_cfg, REVISION_0002)  # undo 0003
     command.upgrade(alembic_cfg, "head")
     tables = {
         row["table_name"]
