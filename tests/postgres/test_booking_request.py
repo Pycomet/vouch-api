@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import FrozenClock
 from app.core.config import get_settings
-from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile
+from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile, LedgerEntry
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.user import KYCStatus, RenterRole, TrustTier, User
@@ -582,15 +582,69 @@ async def test_renter_cannot_accept_own_booking(db_session, clock, notifier) -> 
         )
 
 
-async def test_renter_cannot_withdraw_request(db_session, clock, notifier) -> None:
-    """Not in the spec 3.1 table (spec gap, R7): a requested booking has no cancel."""
+async def test_renter_withdraws_requested_free(db_session, clock, notifier) -> None:
+    """A13/R14: the renter may withdraw before the vendor answers; no money moves."""
+    asset = await create_asset(db_session)
+    renter = await create_user(db_session, kyc_verified=True)
+    other = await create_user(db_session, kyc_verified=True)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    notifier.calls.clear()
+    ledger_before = await db_session.scalar(select(func.count()).select_from(LedgerEntry))
+
+    withdrawn = await _transition(
+        db_session,
+        booking,
+        renter_actor(renter),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        payload={"reason": "  Shoot moved  "},
+    )
+
+    assert withdrawn.status == BookingStatus.cancelled_by_renter
+    assert withdrawn.cancelled_at == clock.now()
+    assert withdrawn.cancellation_reason == "Shoot moved"
+    assert await db_session.scalar(select(func.count()).select_from(LedgerEntry)) == ledger_before
+    audit = (await _audits(db_session, booking.id))[-1]
+    assert audit.action == "booking.cancelled_by_renter"
+    assert audit.actor_role == "renter"
+    assert (audit.before["status"], audit.after["status"]) == ("requested", "cancelled_by_renter")
+    assert audit.reason == "Shoot moved"
+    assert [(c.user_id, c.template) for c in notifier.calls] == [
+        (asset.vendor_id, "booking.withdrawn")
+    ]
+    # The dates are free again.
+    again = await _request(db_session, other, asset, clock, notifier)
+    assert again.status == BookingStatus.requested
+
+
+async def test_vendor_cannot_cancel_requested(db_session, clock, notifier) -> None:
+    """The vendor answers a request with decline, not cancel (R14)."""
     renter = await create_user(db_session, kyc_verified=True)
     asset = await create_asset(db_session)
     booking = await _request(db_session, renter, asset, clock, notifier)
 
     with pytest.raises(InvalidTransition):
         await _transition(
-            db_session, booking, renter_actor(renter), BookingEvent.cancel, clock, notifier
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.cancel,
+            clock,
+            notifier,
+            payload={"reason": "No"},
+        )
+
+
+async def test_stranger_cannot_withdraw_request(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    stranger = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, renter_actor(stranger), BookingEvent.cancel, clock, notifier
         )
 
 

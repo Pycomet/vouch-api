@@ -31,6 +31,9 @@ def test_money_rows_registered_with_their_roles() -> None:
         (BookingStatus.accepted, BookingEvent.payment_captured): {ActorRole.system},
         (BookingStatus.accepted, BookingEvent.expire_deposit): {ActorRole.system},
         (BookingStatus.confirmed, BookingEvent.cancel): {ActorRole.renter, ActorRole.vendor},
+        # A13/R14: free withdrawal before payment; the vendor declines a request.
+        (BookingStatus.requested, BookingEvent.cancel): {ActorRole.renter},
+        (BookingStatus.accepted, BookingEvent.cancel): {ActorRole.renter, ActorRole.vendor},
     }
     for key, roles in expected.items():
         assert table[key].roles == roles

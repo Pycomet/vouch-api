@@ -236,6 +236,8 @@ def money_snapshot(
     damage_contribution: str = "0.00",
     delivery_fee: str = "0.00",
     commission_rate: str = "0.15",
+    cancellation_fee_rate: str = "0.10",
+    cancellation_fee_vendor_share: str = "0.50",
 ) -> dict[str, str]:
     """A ``price_snapshot`` with the money keys the booking service reads."""
     return {
@@ -245,6 +247,8 @@ def money_snapshot(
         "deposit": deposit,
         "commission_rate": commission_rate,
         "damage_contribution": damage_contribution,
+        "cancellation_fee_rate": cancellation_fee_rate,
+        "cancellation_fee_vendor_share": cancellation_fee_vendor_share,
         "currency": "NGN",
     }
 

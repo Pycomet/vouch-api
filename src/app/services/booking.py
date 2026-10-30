@@ -69,6 +69,9 @@ from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
 from app.services.ledger import CENT, MAX_AMOUNT, Posting, post_txn
 from app.services.money import (
+    cancellation_fee_amount,
+    cancellation_fee_postings,
+    cancellation_fee_split,
     commission_amount,
     deposit_deduct_postings,
     deposit_forfeit_postings,
@@ -572,29 +575,82 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
     return _Outcome(notices=_both(booking, "booking.expired"))
 
 
-@_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
-async def _cancel(ctx: _Context) -> _Outcome:
-    """Renter before the start day, or vendor before the pickup; both refund in full (A8).
+async def _close_cancelled(ctx: _Context, status: BookingStatus, reason: str | None) -> None:
+    """Set the cancelled columns; a vendor cancel also writes the penalty audit row."""
+    booking = ctx.booking
+    booking.status = status
+    booking.cancelled_at = ctx.now
+    booking.cancellation_reason = reason
+    if status == BookingStatus.cancelled_by_vendor:
+        await record_audit(
+            ctx.session,
+            actor=ctx.actor,
+            entity="user",
+            entity_id=booking.vendor_id,
+            action="vendor.reliability_penalty",
+            before=None,
+            after={"booking_id": booking.id, "status": status},
+            reason=reason,
+        )
 
-    Nobody cancels once both parties have signed the pickup handover: the item has
-    changed hands, so the rental is under way whatever the booking status says.
+
+def _vendor_reason(ctx: _Context) -> str:
+    """A vendor cancellation always needs a reason (it carries a reliability penalty)."""
+    reason = _reason(ctx.payload)
+    if reason is None:
+        raise BookingGuardFailed("reason_required")
+    return reason
+
+
+@_register(BookingStatus.requested, BookingEvent.cancel, ActorRole.renter)
+@_register(BookingStatus.accepted, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
+async def _cancel_unpaid(ctx: _Context) -> _Outcome:
+    """Before payment nothing has moved, so nothing is refunded (A13, R14).
+
+    The renter withdraws for free (the vendor is told ``booking.withdrawn``). A
+    vendor may cancel an accepted booking with a reason, at the cost of the
+    reliability penalty (for a request, the vendor has ``decline``).
+    """
+    booking = ctx.booking
+    if ctx.actor.role == ActorRole.renter:
+        reason = _reason(ctx.payload)
+        await _close_cancelled(ctx, BookingStatus.cancelled_by_renter, reason)
+        notices: tuple[Notice, ...] = (_notice(booking, booking.vendor_id, "booking.withdrawn"),)
+    else:
+        reason = _vendor_reason(ctx)
+        await _close_cancelled(ctx, BookingStatus.cancelled_by_vendor, reason)
+        notices = _both(booking, "booking.cancelled")
+    return _Outcome(reason=reason, notices=notices)
+
+
+@_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
+async def _cancel_paid(ctx: _Context) -> _Outcome:
+    """Cancel a paid booking: everything goes back, less the renter's fee (A13, R15).
+
+    The renter may cancel until 00:00 (business zone) on ``starts_on`` and pays the
+    cancellation fee; the vendor may cancel any time before the pickup, with a
+    reason, a full refund to the renter and the reliability penalty. Nobody
+    cancels once both parties have signed the pickup handover: the item has changed
+    hands, so the rental is under way whatever the booking status says.
+
+    Postings: the capture is reversed in full with the existing recipes (each part
+    in its own txn_group, so every booking account returns to 0); then, for a
+    renter, one fee group keeps ``rental x cancellation_fee_rate`` as cash, split
+    between the vendor and Vouch at the rates frozen in ``price_snapshot``.
     """
     booking = ctx.booking
     if await _handover_done(ctx, HandoverDirection.pickup):
         raise BookingGuardFailed("handover_signed")
-    reason = _reason(ctx.payload)
     if ctx.actor.role == ActorRole.renter:
         cutoff = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
         if not ctx.now < cutoff:
             raise BookingGuardFailed("cancel_window_closed", {"cancel_before": _plain(cutoff)})
+        reason = _reason(ctx.payload)
         status = BookingStatus.cancelled_by_renter
     else:
-        if reason is None:
-            raise BookingGuardFailed("reason_required")
+        reason = _vendor_reason(ctx)
         status = BookingStatus.cancelled_by_vendor
 
-    # By `confirmed` the renter has paid everything upfront (A14). All of it goes
-    # back, each part in its own txn_group, so every booking account returns to 0.
     amounts = _money(booking)
     refund: dict[str, Any] = {
         "deposit": amounts.deposit,
@@ -612,26 +668,23 @@ async def _cancel(ctx: _Context) -> _Outcome:
         rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
         "cancel_rental_refund",
     )
-
-    booking.status = status
-    booking.cancelled_at = ctx.now
-    booking.cancellation_reason = reason
-    if status == BookingStatus.cancelled_by_vendor:
-        await record_audit(
-            ctx.session,
-            actor=ctx.actor,
-            entity="user",
-            entity_id=booking.vendor_id,
-            action="vendor.reliability_penalty",
-            before=None,
-            after={"booking_id": booking.id, "status": status},
-            reason=reason,
+    after: dict[str, Any] = {"refund": refund}
+    if status == BookingStatus.cancelled_by_renter:
+        fee = cancellation_fee_amount(
+            amounts.rental, Decimal(booking.price_snapshot["cancellation_fee_rate"])
         )
-    return _Outcome(
-        after={"refund": refund},
-        reason=reason,
-        notices=_both(booking, "booking.cancelled"),
-    )
+        vendor_part, platform_part = cancellation_fee_split(
+            fee, Decimal(booking.price_snapshot["cancellation_fee_vendor_share"])
+        )
+        await _post(ctx, cancellation_fee_postings(vendor_part, platform_part), "cancellation_fee")
+        after["cancellation_fee"] = {
+            "amount": fee,
+            "vendor_part": vendor_part,
+            "platform_part": platform_part,
+        }
+
+    await _close_cancelled(ctx, status, reason)
+    return _Outcome(after=after, reason=reason, notices=_both(booking, "booking.cancelled"))
 
 
 # ---------------------------------------------------------------------------

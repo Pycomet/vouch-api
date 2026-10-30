@@ -268,26 +268,23 @@ async def test_stranger_cannot_record_handover(db_session, clock, notifier) -> N
 
 
 # ---------------------------------------------------------------------------
-# confirmed + cancel: the whole upfront payment is reversed
+# confirmed + cancel: the whole upfront payment is reversed (less the renter's fee)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("role", "status"),
-    [
-        (ActorRole.renter, BookingStatus.cancelled_by_renter),
-        (ActorRole.vendor, BookingStatus.cancelled_by_vendor),
-    ],
-)
-async def test_cancel_confirmed_refunds_everything(
-    db_session, clock, notifier, role, status
-) -> None:
+async def test_vendor_cancel_confirmed_refunds_everything(db_session, clock, notifier) -> None:
+    status = BookingStatus.cancelled_by_vendor
     booking = await _paid(db_session, BookingStatus.confirmed)
     assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == VENDOR_SHARE
-    actor = renter_actor(booking) if role == ActorRole.renter else vendor_actor(booking)
 
     result = await _transition(
-        db_session, booking, actor, BookingEvent.cancel, clock, notifier, {"reason": "No go"}
+        db_session,
+        booking,
+        vendor_actor(booking),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        {"reason": "No go"},
     )
 
     assert result.status == status
@@ -1087,6 +1084,21 @@ async def test_row_requested_decline(db_session, clock, notifier) -> None:
     ]
 
 
+async def test_row_requested_cancel_renter(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.requested)
+
+    result = await _transition(
+        db_session, booking, renter_actor(booking), BookingEvent.cancel, clock, notifier
+    )
+
+    assert result.status == BookingStatus.cancelled_by_renter
+    assert await _ledger(db_session, booking.id) == []
+    assert (await _audits(db_session, booking.id))[-1].action == "booking.cancelled_by_renter"
+    assert [(c.user_id, c.template) for c in notifier.calls] == [
+        (booking.vendor_id, "booking.withdrawn")
+    ]
+
+
 async def test_row_requested_expire_hold(db_session, clock, notifier) -> None:
     booking = await _booking(db_session, BookingStatus.requested)
     clock.advance(booking.hold_expires_at - DEFAULT_NOW + timedelta(seconds=1))
@@ -1126,6 +1138,40 @@ async def test_row_accepted_payment_captured(db_session, clock, notifier) -> Non
     assert {c.user_id for c in notifier.calls} == {booking.renter_id, booking.vendor_id}
 
 
+async def test_row_accepted_cancel_renter(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+
+    result = await _transition(
+        db_session, booking, renter_actor(booking), BookingEvent.cancel, clock, notifier
+    )
+
+    assert result.status == BookingStatus.cancelled_by_renter
+    assert await _ledger(db_session, booking.id) == []
+    assert (await _audits(db_session, booking.id))[-1].action == "booking.cancelled_by_renter"
+    assert [(c.user_id, c.template) for c in notifier.calls] == [
+        (booking.vendor_id, "booking.withdrawn")
+    ]
+
+
+async def test_row_accepted_cancel_vendor(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+
+    result = await _transition(
+        db_session,
+        booking,
+        vendor_actor(booking),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        {"reason": "Body failed"},
+    )
+
+    assert result.status == BookingStatus.cancelled_by_vendor
+    assert await _ledger(db_session, booking.id) == []
+    penalty = (await _audits(db_session, booking.vendor_id))[-1]
+    assert penalty.action == "vendor.reliability_penalty"
+
+
 async def test_row_accepted_expire_deposit(db_session, clock, notifier) -> None:
     booking = await _booking(db_session, BookingStatus.accepted)
     clock.advance(booking.deposit_due_at - DEFAULT_NOW + timedelta(seconds=1))
@@ -1148,6 +1194,10 @@ async def test_row_confirmed_cancel_renter(db_session, clock, notifier) -> None:
     assert result.status == BookingStatus.cancelled_by_renter
     for account in (LedgerAccount.renter_deposit_liability, LedgerAccount.protection_pool):
         assert await _balance(db_session, account, booking.id) == ZERO
+    # The fee (10% of R) is split evenly between the vendor and Vouch (A13).
+    fee_part = D("7500.00")
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == fee_part
+    assert await _balance(db_session, LedgerAccount.platform_revenue, booking.id) == fee_part
     assert (await _audits(db_session, booking.id))[-1].action == "booking.cancelled_by_renter"
 
 
@@ -1301,16 +1351,19 @@ async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
 
 S, E = BookingStatus, BookingEvent
 
-# Written out by hand from spec 3.1 as amended (A3 vendor approval; A14 one upfront
-# payment, so no balance step), so a registry bug cannot silently shrink the forbidden list below.
+# Written out by hand from spec 3.1 as amended (A3 vendor approval; A13/R14 free
+# withdrawal; A14 one upfront payment, so no balance step), so a registry bug
+# cannot silently shrink the forbidden list below.
 EXPECTED_ALLOWED = frozenset(
     {
         (S.requested, E.accept),
         (S.requested, E.decline),
         (S.requested, E.approve_vendor),
         (S.requested, E.expire_hold),
+        (S.requested, E.cancel),
         (S.accepted, E.payment_captured),
         (S.accepted, E.expire_deposit),
+        (S.accepted, E.cancel),
         (S.confirmed, E.cancel),
         (S.confirmed, E.handover_completed),
         (S.in_progress, E.return_completed),
@@ -1351,7 +1404,7 @@ EVENT_ROLE = {
 def test_registry_is_exactly_the_spec_table() -> None:
     assert set(booking_service._TRANSITIONS) == EXPECTED_ALLOWED
     assert len(FORBIDDEN) == len(BookingStatus) * len(BookingEvent) - len(EXPECTED_ALLOWED)
-    assert len(FORBIDDEN) == 168
+    assert len(FORBIDDEN) == 166
     for (_status, event), rule in booking_service._TRANSITIONS.items():
         assert EVENT_ROLE[event] in rule.roles
 
