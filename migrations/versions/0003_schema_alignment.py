@@ -96,7 +96,10 @@ Part C: ledger, audit, webhooks
 * ``reject_mutation()`` is one shared function. It raises
   ``'<table> is append-only'`` from ``TG_TABLE_NAME`` and is attached to both
   tables by ``trg_ledger_no_update`` and ``trg_audit_no_update`` (BEFORE UPDATE OR
-  DELETE). Corrections are reversing entries.
+  DELETE) and by ``trg_ledger_no_truncate`` / ``trg_audit_no_truncate`` (BEFORE
+  TRUNCATE, FOR EACH STATEMENT), so a TRUNCATE ... CASCADE from a parent table is
+  rejected too. Corrections are reversing entries. Both trigger functions pin
+  ``search_path = pg_catalog, public``.
 * ``assert_txn_group_balanced()`` backs the constraint trigger
   ``trg_ledger_balanced`` (AFTER INSERT, DEFERRABLE INITIALLY DEFERRED, FOR EACH
   ROW). It runs at COMMIT, not at INSERT, so a transaction may insert a group
@@ -811,7 +814,8 @@ def _upgrade_ledger_audit_webhooks() -> None:
 
     op.execute(
         """
-        CREATE FUNCTION reject_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+        CREATE FUNCTION reject_mutation() RETURNS trigger LANGUAGE plpgsql
+        SET search_path = pg_catalog, public AS $$
         BEGIN
             RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
         END
@@ -826,13 +830,22 @@ def _upgrade_ledger_audit_webhooks() -> None:
         "CREATE TRIGGER trg_audit_no_update BEFORE UPDATE OR DELETE ON audit_events "
         "FOR EACH ROW EXECUTE FUNCTION reject_mutation()"
     )
+    op.execute(
+        "CREATE TRIGGER trg_ledger_no_truncate BEFORE TRUNCATE ON ledger_entries "
+        "FOR EACH STATEMENT EXECUTE FUNCTION reject_mutation()"
+    )
+    op.execute(
+        "CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_events "
+        "FOR EACH STATEMENT EXECUTE FUNCTION reject_mutation()"
+    )
 
     op.execute(
         """
-        CREATE FUNCTION assert_txn_group_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
+        CREATE FUNCTION assert_txn_group_balanced() RETURNS trigger LANGUAGE plpgsql
+        SET search_path = pg_catalog, public AS $$
         DECLARE
-            debits  NUMERIC(14,2);
-            credits NUMERIC(14,2);
+            debits  NUMERIC;
+            credits NUMERIC;
         BEGIN
             SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'dr'), 0),
                    COALESCE(SUM(amount) FILTER (WHERE direction = 'cr'), 0)
@@ -856,6 +869,8 @@ def _upgrade_ledger_audit_webhooks() -> None:
 
 def _downgrade_ledger_audit_webhooks() -> None:
     op.execute("DROP TRIGGER trg_ledger_balanced ON ledger_entries")
+    op.execute("DROP TRIGGER trg_audit_no_truncate ON audit_events")
+    op.execute("DROP TRIGGER trg_ledger_no_truncate ON ledger_entries")
     op.execute("DROP TRIGGER trg_audit_no_update ON audit_events")
     op.execute("DROP TRIGGER trg_ledger_no_update ON ledger_entries")
     op.execute("DROP FUNCTION assert_txn_group_balanced()")
