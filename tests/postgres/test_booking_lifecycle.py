@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import pytest
 from sqlalchemy import func, select, text
@@ -1606,7 +1606,9 @@ async def test_happy_path_ledger_at_every_step(db_session, clock, notifier) -> N
     delivery = D(snapshot["delivery_fee"])
     deposit = D(snapshot["deposit"])
     contribution = D(snapshot["damage_contribution"])
-    commission = (rental * D(snapshot["commission_rate"])).quantize(D("0.01"))
+    commission = (rental * D(snapshot["commission_rate"])).quantize(
+        D("0.01"), rounding=ROUND_HALF_UP
+    )
     assert (rental, delivery, deposit) == (RENTAL, DELIVERY, DEPOSIT)
     assert contribution > ZERO
     assert commission > ZERO
