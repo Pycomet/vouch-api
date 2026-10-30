@@ -1,0 +1,235 @@
+"""Live PostgreSQL tests for migration 0003 (schema alignment).
+
+Part A: reference tables, catalogue and the asset reshaping. Later parts add their
+own assertions to the seeded upgrade/downgrade tests below.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+
+import asyncpg
+import pytest
+from alembic import command
+from alembic.config import Config
+
+from tests.postgres.conftest import REVISION_0002, Seed0002, asyncpg_url
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("VOUCH_TEST_DATABASE_URL"),
+    reason="VOUCH_TEST_DATABASE_URL is required for live PostgreSQL checks",
+)
+
+CATEGORY_SLUGS = {"camera", "lens", "lighting", "audio", "drone", "gimbal", "accessory"}
+SERIAL_CATEGORIES = {"camera", "lens", "drone", "gimbal", "audio"}
+COUNT_CATEGORIES = {"lighting", "accessory"}
+
+
+async def _fetch(query: str, *args):
+    connection = await asyncpg.connect(asyncpg_url())
+    try:
+        return await connection.fetch(query, *args)
+    finally:
+        await connection.close()
+
+
+def _fetch_sync(query: str, *args):
+    return asyncio.run(_fetch(query, *args))
+
+
+def test_upgrade_and_downgrade_on_empty_db(migrated_db: str, alembic_cfg: Config) -> None:
+    command.downgrade(alembic_cfg, "-1")
+    command.upgrade(alembic_cfg, "head")
+    tables = {
+        row["table_name"]
+        for row in _fetch_sync(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+    }
+    assert {"cities", "categories", "catalogue_items", "assets"} <= tables
+
+
+async def test_reference_slugs_match_portal(migrated_db: str, conn: asyncpg.Connection) -> None:
+    cities = {row["slug"] for row in await conn.fetch("SELECT slug FROM cities")}
+    assert cities == {"abuja", "lagos"}
+    assert await conn.fetchval("SELECT bool_and(is_active) FROM cities")
+
+    rows = await conn.fetch("SELECT slug, checklist_template FROM categories")
+    assert {row["slug"] for row in rows} == CATEGORY_SLUGS
+    modes = {row["slug"]: row["checklist_template"] for row in rows}
+    for slug in SERIAL_CATEGORIES:
+        assert '"mode": "serial"' in modes[slug]
+    for slug in COUNT_CATEGORIES:
+        assert '"mode": "count"' in modes[slug]
+
+
+async def test_catalogue_search_index_exists(migrated_db: str, conn: asyncpg.Connection) -> None:
+    indexdef = await conn.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_catalogue_items_search'"
+    )
+    assert indexdef is not None
+    assert "gin" in indexdef.lower()
+    public = await conn.fetchval(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_assets_public'"
+    )
+    assert public is not None
+    assert "city_id, category_id, daily_rate, created_at, id" in public
+    old = await conn.fetchval(
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_assets_public_lagos'"
+    )
+    assert old == 0
+
+
+async def test_minimum_trust_tier_accepts_3_rejects_4(
+    migrated_db: str, conn: asyncpg.Connection
+) -> None:
+    vendor_id = await conn.fetchval(
+        "INSERT INTO users (phone, full_name, role, is_active) "
+        "VALUES ('+2348000000201', 'Tier Vendor', 'vendor', true) RETURNING id"
+    )
+    category_id = await conn.fetchval("SELECT id FROM categories WHERE slug = 'camera'")
+    city_id = await conn.fetchval("SELECT id FROM cities WHERE slug = 'abuja'")
+    item_id = await conn.fetchval(
+        "INSERT INTO catalogue_items (category_id, make, model, replacement_value_band) "
+        "VALUES ($1, 'Sony', 'FX3', 'C') RETURNING id",
+        category_id,
+    )
+    insert = (
+        "INSERT INTO assets (vendor_id, catalogue_item_id, city_id, category_id, "
+        "daily_rate, deposit_amount, minimum_trust_tier) "
+        "VALUES ($1, $2, $3, $4, 75000, 200000, $5) RETURNING id"
+    )
+    asset_id = await conn.fetchval(insert, vendor_id, item_id, city_id, category_id, 3)
+    assert asset_id is not None
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute(insert, vendor_id, item_id, city_id, category_id, 4)
+
+
+async def test_asset_rate_and_grade_checks(migrated_db: str, conn: asyncpg.Connection) -> None:
+    vendor_id = await conn.fetchval(
+        "INSERT INTO users (phone, full_name, role, is_active) "
+        "VALUES ('+2348000000202', 'Check Vendor', 'vendor', true) RETURNING id"
+    )
+    category_id = await conn.fetchval("SELECT id FROM categories WHERE slug = 'lens'")
+    city_id = await conn.fetchval("SELECT id FROM cities WHERE slug = 'abuja'")
+    item_id = await conn.fetchval(
+        "INSERT INTO catalogue_items (category_id, make, model, replacement_value_band) "
+        "VALUES ($1, 'Sigma', '18-35', 'A') RETURNING id",
+        category_id,
+    )
+    base = (
+        "INSERT INTO assets (vendor_id, catalogue_item_id, city_id, category_id, "
+        "daily_rate, deposit_amount, {col}) VALUES ($1, $2, $3, $4, 10000, 0, $5)"
+    )
+    args = (vendor_id, item_id, city_id, category_id)
+    for col, bad in (("weekend_rate", 0), ("weekly_rate", -1), ("condition_grade", "mint")):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(base.format(col=col), *args, bad)
+    row = await conn.fetchrow(
+        "INSERT INTO assets (vendor_id, catalogue_item_id, city_id, category_id, "
+        "daily_rate, deposit_amount, condition_grade) "
+        "VALUES ($1, $2, $3, $4, 10000, 0, 'good') "
+        "RETURNING name, included_accessories, fulfilment, minimum_trust_tier",
+        *args,
+    )
+    assert row["name"] is None
+    assert row["included_accessories"] == "[]"
+    assert row["fulfilment"] == '{"pickup": true, "delivery": false}'
+
+
+def test_upgrade_from_seeded_0002(db_at_0002: Seed0002, alembic_cfg: Config) -> None:
+    command.upgrade(alembic_cfg, "head")
+
+    asset = _fetch_sync(
+        "SELECT ci.slug AS city, ca.slug AS category, a.minimum_trust_tier, a.name, "
+        "c.make, c.model, c.replacement_value_band AS band, "
+        "c.specs->>'needs_review' AS needs_review, c.category_id = a.category_id AS same_cat "
+        "FROM assets a "
+        "JOIN cities ci ON ci.id = a.city_id "
+        "JOIN categories ca ON ca.id = a.category_id "
+        "JOIN catalogue_items c ON c.id = a.catalogue_item_id "
+        "WHERE a.id = $1",
+        db_at_0002.asset_id,
+    )[0]
+    assert asset["city"] == "lagos"
+    assert asset["category"] == "accessory"
+    assert asset["needs_review"] == "true"
+    assert asset["band"] == "B"
+    assert asset["minimum_trust_tier"] == 2
+    assert asset["make"] == "Unknown"
+    assert asset["model"] == f"Seed Rig #{str(db_at_0002.asset_id)[:8]}"
+    assert asset["name"] == "Seed Rig"
+    assert asset["same_cat"]
+
+
+def test_downgrade_from_seeded_restores_0002_shape(
+    db_at_0002: Seed0002, alembic_cfg: Config
+) -> None:
+    command.upgrade(alembic_cfg, "head")
+    # A listing created after 0003 with no display name and tier 3 must survive.
+    asyncio.run(_insert_post_0003_asset(db_at_0002.vendor_id))
+    command.downgrade(alembic_cfg, REVISION_0002)
+
+    enums = {
+        row["typname"]
+        for row in _fetch_sync(
+            "SELECT typname FROM pg_type WHERE typname IN ('city', 'assetcategory')"
+        )
+    }
+    assert enums == {"city", "assetcategory"}
+
+    seeded = _fetch_sync(
+        "SELECT category::text AS category, city::text AS city FROM assets WHERE id = $1",
+        db_at_0002.asset_id,
+    )[0]
+    assert seeded["category"] == "other"
+    assert seeded["city"] == "lagos"
+
+    created = _fetch_sync(
+        "SELECT name, category::text AS category, city::text AS city, minimum_trust_tier "
+        "FROM assets WHERE id <> $1",
+        db_at_0002.asset_id,
+    )[0]
+    assert created["name"] == "Sony FX3"
+    assert created["category"] == "camera"
+    assert created["city"] == "abuja"
+    assert created["minimum_trust_tier"] == 2
+
+    indexes = {
+        row["indexname"]
+        for row in _fetch_sync("SELECT indexname FROM pg_indexes WHERE tablename = 'assets'")
+    }
+    assert "ix_assets_public_lagos" in indexes
+    assert "ix_assets_public" not in indexes
+
+    tables = {
+        row["table_name"]
+        for row in _fetch_sync(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+    }
+    assert not {"cities", "categories", "catalogue_items"} & tables
+
+
+async def _insert_post_0003_asset(vendor_id) -> None:
+    connection = await asyncpg.connect(asyncpg_url())
+    try:
+        category_id = await connection.fetchval("SELECT id FROM categories WHERE slug = 'camera'")
+        city_id = await connection.fetchval("SELECT id FROM cities WHERE slug = 'abuja'")
+        item_id = await connection.fetchval(
+            "INSERT INTO catalogue_items (category_id, make, model, replacement_value_band) "
+            "VALUES ($1, 'Sony', 'FX3', 'C') RETURNING id",
+            category_id,
+        )
+        await connection.execute(
+            "INSERT INTO assets (vendor_id, catalogue_item_id, city_id, category_id, "
+            "daily_rate, deposit_amount, minimum_trust_tier) "
+            "VALUES ($1, $2, $3, $4, 75000, 200000, 3)",
+            vendor_id,
+            item_id,
+            city_id,
+            category_id,
+        )
+    finally:
+        await connection.close()
