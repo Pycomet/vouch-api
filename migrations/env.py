@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 import app.db.models  # noqa: F401
 from app.core.config import get_settings
 from app.db.base import Base
+from app.db.migration_filters import include_object
 
 # Alembic Config object — provides access to values in the .ini file.
 config = context.config
@@ -29,6 +30,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=url,
         target_metadata=target_metadata,
+        include_object=include_object,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -38,7 +40,11 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_object=include_object,
+    )
 
     with context.begin_transaction():
         context.run_migrations()

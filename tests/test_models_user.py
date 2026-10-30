@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, Integer, UniqueConstraint
+from sqlalchemy import CheckConstraint, Integer, Text, UniqueConstraint
 
 import app.db.models  # noqa: F401 — registers all models
 from app.db.base import Base
@@ -37,24 +37,47 @@ def test_kyc_profiles_user_id_fk_references_users() -> None:
     assert "users.id" in fk_targets
 
 
-def test_trust_tiers_require_increasing_verification() -> None:
-    assert trust_tier_policy(TrustTier.unverified).required_verifications == frozenset()
+def test_trust_tier_values() -> None:
+    assert [(tier.name, tier.value) for tier in TrustTier] == [
+        ("phone_verified", 0),
+        ("identity_verified", 1),
+        ("established", 2),
+        ("vendor_approved", 3),
+    ]
+
+
+def test_identity_verified_requires_national_id_liveness_and_address() -> None:
+    assert trust_tier_policy(TrustTier.phone_verified).required_verifications == frozenset()
     assert trust_tier_policy(TrustTier.identity_verified).required_verifications == frozenset(
-        {VerificationRequirement.national_id, VerificationRequirement.liveness}
-    )
-    assert trust_tier_policy(TrustTier.enhanced).required_verifications == frozenset(
         {
             VerificationRequirement.national_id,
             VerificationRequirement.liveness,
             VerificationRequirement.address,
         }
     )
+    for tier in (TrustTier.established, TrustTier.vendor_approved):
+        assert trust_tier_policy(tier).required_verifications == frozenset(VerificationRequirement)
+
+
+def test_users_restriction_columns() -> None:
+    table = _table("users")
+    assert table.c["restricted_at"].nullable
+    assert table.c["restricted_at"].type.timezone
+    assert isinstance(table.c["restricted_reason"].type, Text)
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks["ck_users_restriction_has_reason"] == (
+        "restricted_at IS NULL OR restricted_reason IS NOT NULL"
+    )
 
 
 def test_kyc_profiles_tier_uses_explicit_trust_tier_default() -> None:
     tier_col = _table("kyc_profiles").c["tier"]
     assert isinstance(tier_col.type, Integer)
-    assert tier_col.default.arg is TrustTier.unverified
+    assert tier_col.default.arg is TrustTier.phone_verified
 
 
 def test_kyc_profile_invariants_are_persisted() -> None:
@@ -70,7 +93,7 @@ def test_kyc_profile_invariants_are_persisted() -> None:
         if isinstance(constraint, UniqueConstraint)
     }
 
-    assert checks["ck_kyc_profiles_supported_tier"] == "tier BETWEEN 0 AND 2"
+    assert checks["ck_kyc_profiles_supported_tier"] == "tier BETWEEN 0 AND 1"
     assert (
         checks["ck_kyc_profiles_verified_at_required"]
         == "status <> 'verified' OR verified_at IS NOT NULL"
@@ -98,7 +121,7 @@ def test_kyc_profile_status_tier_and_timestamp_are_consistent() -> None:
     consistency = checks["ck_kyc_profiles_verification_consistency"]
     assert "status = 'verified'" in consistency
     assert "verified_at IS NOT NULL" in consistency
-    assert "tier BETWEEN 1 AND 2" in consistency
+    assert "tier = 1" in consistency
     assert "status <> 'verified'" in consistency
     assert "verified_at IS NULL" in consistency
     assert "tier = 0" in consistency
