@@ -74,6 +74,7 @@ from app.services.inventory import get_public_asset
 from app.services.ledger import Posting, post_txn
 from app.services.money import (
     balance_captured_postings,
+    balance_refund_postings,
     commission_amount,
     deposit_captured_postings,
     deposit_deduct_postings,
@@ -391,6 +392,11 @@ def _snapshot_amount(booking: Booking, key: str) -> Decimal:
     return money(booking.price_snapshot.get(key, "0"))
 
 
+def _snapshot_commission(booking: Booking, rental: Decimal) -> Decimal:
+    """K on ``rental`` at the rate frozen at request time (a rate, not money)."""
+    return commission_amount(rental, Decimal(booking.price_snapshot["commission_rate"]))
+
+
 def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
     """The payload's ``amount`` as a Decimal, or None if absent or not money."""
     raw = payload.get("amount")
@@ -534,12 +540,25 @@ async def _cancel(ctx: _Context) -> _Outcome:
             raise BookingGuardFailed("reason_required")
         status = BookingStatus.cancelled_by_vendor
 
-    # By `confirmed` the renter has paid the deposit and the damage contribution
-    # (the rental balance is due at handover); each goes back in its own txn_group.
+    # By `confirmed` the renter has paid the deposit and the damage contribution,
+    # and may already have paid the rental balance (balance first, handover later).
+    # Everything paid goes back, each part in its own txn_group.
     deposit = _snapshot_amount(booking, "deposit")
     contribution = _snapshot_amount(booking, "damage_contribution")
+    refund: dict[str, Any] = {"deposit": deposit, "damage_contribution": contribution}
+    balance_paid = await _balance_posted(ctx)
     await _post(ctx, deposit_release_postings(deposit), "cancel_deposit_refund")
     await _post(ctx, refund_contribution_postings(contribution), "cancel_contribution_refund")
+    if balance_paid:
+        rental = _snapshot_amount(booking, "rental_total")
+        delivery_fee = _snapshot_amount(booking, "delivery_fee")
+        commission = _snapshot_commission(booking, rental)
+        await _post(
+            ctx,
+            balance_refund_postings(rental, delivery_fee, commission),
+            "cancel_balance_refund",
+        )
+        refund.update(rental=rental, delivery_fee=delivery_fee, commission=commission)
 
     booking.status = status
     booking.cancelled_at = ctx.now
@@ -556,7 +575,7 @@ async def _cancel(ctx: _Context) -> _Outcome:
             reason=reason,
         )
     return _Outcome(
-        after={"refund": {"deposit": deposit, "damage_contribution": contribution}},
+        after={"refund": refund},
         reason=reason,
         notices=_both(booking, "booking.cancelled"),
     )
@@ -686,8 +705,7 @@ async def _balance_captured(ctx: _Context) -> _Outcome:
         )
     payment_id = await _balance_payment_id(ctx)
 
-    # The rate frozen at request time, unquantized (it is a rate, not money).
-    commission = commission_amount(rental, Decimal(booking.price_snapshot["commission_rate"]))
+    commission = _snapshot_commission(booking, rental)
     await _post(
         ctx,
         balance_captured_postings(rental, delivery_fee, commission),

@@ -73,6 +73,26 @@ def balance_captured_postings(
     )
 
 
+def balance_refund_postings(
+    rental: Decimal, delivery_fee: Decimal, commission: Decimal
+) -> list[Posting]:
+    """dr vendor_payable R+F-K / dr platform_revenue K / cr platform_cash R+F.
+
+    The exact reverse of :func:`balance_captured_postings`: the rental balance
+    goes back to the renter (a cancel after the balance was captured).
+    """
+    r = _amount(rental, "rental")
+    f = _amount(delivery_fee, "delivery_fee")
+    k = _amount(commission, "commission")
+    if k > r + f:
+        raise ValueError("commission must not exceed rental plus delivery fee")
+    return _group(
+        (LedgerAccount.vendor_payable, Direction.dr, r + f - k),
+        (LedgerAccount.platform_revenue, Direction.dr, k),
+        (LedgerAccount.platform_cash, Direction.cr, r + f),
+    )
+
+
 def deposit_release_postings(deposit: Decimal) -> list[Posting]:
     """dr renter_deposit_liability D / cr platform_cash D (the deposit goes back)."""
     d = _amount(deposit, "deposit")

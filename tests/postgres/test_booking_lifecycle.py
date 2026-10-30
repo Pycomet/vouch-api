@@ -396,6 +396,60 @@ async def test_commission_is_frozen_in_the_snapshot(db_session, clock, notifier)
 
 
 # ---------------------------------------------------------------------------
+# confirmed + cancel after the balance is captured (balance first, handover later)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("role", "status"),
+    [
+        (ActorRole.renter, BookingStatus.cancelled_by_renter),
+        (ActorRole.vendor, BookingStatus.cancelled_by_vendor),
+    ],
+)
+async def test_cancel_after_balance_refunds_everything(
+    db_session, clock, notifier, role, status
+) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.confirmed)
+    payload = await _balance_payload(db_session, booking)
+    await _transition(
+        db_session, booking, Actor.system(), BookingEvent.balance_captured, clock, notifier, payload
+    )
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == (
+        BALANCE - COMMISSION
+    )
+    actor = renter_actor(booking) if role == ActorRole.renter else vendor_actor(booking)
+
+    result = await _transition(
+        db_session, booking, actor, BookingEvent.cancel, clock, notifier, {"reason": "No go"}
+    )
+
+    assert result.status == status
+    for account in (
+        LedgerAccount.vendor_payable,
+        LedgerAccount.platform_revenue,
+        LedgerAccount.renter_deposit_liability,
+        LedgerAccount.protection_pool,
+        LedgerAccount.platform_cash,
+    ):
+        assert await _balance(db_session, account, booking.id) == ZERO, account
+    assert await _whole_ledger_balanced(db_session)
+    refund_rows = [
+        row for row in await _ledger(db_session, booking.id) if row.memo == "cancel_balance_refund"
+    ]
+    assert len(refund_rows) == 3
+    assert len({row.txn_group for row in refund_rows}) == 1
+    audit = [a for a in await _audits(db_session, booking.id) if a.action == f"booking.{status}"]
+    assert audit[0].after["refund"] == {
+        "deposit": str(DEPOSIT),
+        "damage_contribution": str(CONTRIBUTION),
+        "rental": str(RENTAL),
+        "delivery_fee": str(DELIVERY),
+        "commission": str(COMMISSION),
+    }
+
+
+# ---------------------------------------------------------------------------
 # in_progress + return_completed -> returned
 # ---------------------------------------------------------------------------
 

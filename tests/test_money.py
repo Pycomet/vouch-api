@@ -11,6 +11,7 @@ from app.db.models import Direction, LedgerAccount
 from app.services.ledger import Posting
 from app.services.money import (
     balance_captured_postings,
+    balance_refund_postings,
     commission_amount,
     deposit_captured_postings,
     deposit_deduct_postings,
@@ -43,6 +44,10 @@ CASES: list[tuple[str, Callable[..., list[Posting]], tuple[str, ...]]] = [
     ("balance_typical", balance_captured_postings, ("150000.00", "2500.00", "22500.00")),
     ("balance_max", balance_captured_postings, ("9999999999.98", "0.01", "0.01")),
     ("balance_all_commission", balance_captured_postings, ("100.00", "0", "100.00")),
+    ("balance_refund_small", balance_refund_postings, ("0.01", "0", "0")),
+    ("balance_refund_typical", balance_refund_postings, ("150000.00", "7500.00", "22500.00")),
+    ("balance_refund_max", balance_refund_postings, ("9999999999.98", "0.01", "0.01")),
+    ("balance_refund_all_commission", balance_refund_postings, ("100.00", "0", "100.00")),
     ("release_small", deposit_release_postings, ("0.01",)),
     ("release_max", deposit_release_postings, (MAX,)),
     ("deduct_partial", deposit_deduct_postings, ("150000.00", "0.01")),
@@ -98,6 +103,39 @@ def test_balance_captured_rejects_commission_above_total() -> None:
         balance_captured_postings(D("100.00"), D("0"), D("100.01"))
 
 
+def test_balance_refund_lines() -> None:
+    assert _lines(balance_refund_postings(D("150000.00"), D("7500.00"), D("22500.00"))) == {
+        ("vendor_payable", "dr", D("135000.00")),
+        ("platform_revenue", "dr", D("22500.00")),
+        ("platform_cash", "cr", D("157500.00")),
+    }
+
+
+def test_balance_refund_reverses_balance_captured() -> None:
+    args = (D("150000.00"), D("7500.00"), D("22500.00"))
+    captured = {(p.account, p.amount) for p in balance_captured_postings(*args)}
+    refunded = {(p.account, p.amount) for p in balance_refund_postings(*args)}
+    assert captured == refunded
+    for c, r in zip(
+        sorted(balance_captured_postings(*args), key=lambda p: p.account.value),
+        sorted(balance_refund_postings(*args), key=lambda p: p.account.value),
+        strict=True,
+    ):
+        assert c.direction != r.direction
+
+
+def test_balance_refund_omits_zero_commission() -> None:
+    assert _lines(balance_refund_postings(D("100.00"), D("0"), D("0"))) == {
+        ("vendor_payable", "dr", D("100.00")),
+        ("platform_cash", "cr", D("100.00")),
+    }
+
+
+def test_balance_refund_rejects_commission_above_total() -> None:
+    with pytest.raises(ValueError):
+        balance_refund_postings(D("100.00"), D("0"), D("100.01"))
+
+
 def test_release_forfeit_refund_payout_lines() -> None:
     assert _lines(deposit_release_postings(D("5.00"))) == {
         ("renter_deposit_liability", "dr", D("5.00")),
@@ -136,6 +174,7 @@ def test_deduct_splits_and_caps() -> None:
     [
         (deposit_captured_postings, ("0", "0")),
         (balance_captured_postings, ("0", "0", "0")),
+        (balance_refund_postings, ("0", "0", "0")),
         (deposit_release_postings, ("0",)),
         (deposit_deduct_postings, ("0", "10.00")),
         (deposit_forfeit_postings, ("0",)),
@@ -154,6 +193,8 @@ def test_zero_total_returns_empty(recipe, args) -> None:
         (deposit_captured_postings, ("1.00", "-1.00")),
         (balance_captured_postings, ("1.00", "-0.01", "0")),
         (balance_captured_postings, ("1.00", "0", "-0.01")),
+        (balance_refund_postings, ("-0.01", "0", "0")),
+        (balance_refund_postings, ("1.00", "0", "-0.01")),
         (deposit_release_postings, ("-1",)),
         (deposit_deduct_postings, ("10.00", "-1.00")),
         (deposit_forfeit_postings, ("-1",)),
