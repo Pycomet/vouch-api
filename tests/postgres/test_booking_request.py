@@ -523,6 +523,53 @@ async def test_vendor_approve_twice_is_invalid(db_session, clock, notifier) -> N
         await _transition(db_session, booking, vendor, BookingEvent.approve_vendor, clock, notifier)
 
 
+async def test_approve_after_hold_expired_refused(db_session, clock, notifier) -> None:
+    renter = await _tier2_renter(db_session)
+    asset = await create_asset(db_session, minimum_trust_tier=3, band="C")
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    clock.advance(timedelta(hours=4))  # exactly at expiry: the hold is over
+    audits = len(await _audits(db_session, booking.id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.approve_vendor,
+            clock,
+            notifier,
+        )
+
+    assert caught.value.code == "hold_expired"
+    await db_session.refresh(booking)
+    assert booking.vendor_approved_at is None
+    assert len(await _audits(db_session, booking.id)) == audits
+
+
+@pytest.mark.parametrize("minimum", [0, 1, 2])
+async def test_approve_on_non_tier3_refused(db_session, clock, notifier, minimum) -> None:
+    renter = await _tier2_renter(db_session)
+    asset = await create_asset(db_session, minimum_trust_tier=minimum)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    audits = len(await _audits(db_session, booking.id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.approve_vendor,
+            clock,
+            notifier,
+        )
+
+    assert caught.value.code == "approval_not_required"
+    assert caught.value.status_code == 409
+    await db_session.refresh(booking)
+    assert booking.vendor_approved_at is None
+    assert len(await _audits(db_session, booking.id)) == audits
+
+
 async def test_decline_releases_slot(db_session, clock, notifier) -> None:
     asset = await create_asset(db_session)
     first = await create_user(db_session, kyc_verified=True)
@@ -732,8 +779,13 @@ async def test_vendor_cannot_expire_hold(db_session, clock, notifier) -> None:
 async def test_each_transition_writes_one_audit_row(
     db_session, clock, notifier, event, actor_kind, advance
 ) -> None:
-    renter = await create_user(db_session, kyc_verified=True)
-    asset = await create_asset(db_session)
+    if event == BookingEvent.approve_vendor:
+        # Approval only applies to tier-3 items (R18).
+        renter = await _tier2_renter(db_session)
+        asset = await create_asset(db_session, minimum_trust_tier=3, band="C")
+    else:
+        renter = await create_user(db_session, kyc_verified=True)
+        asset = await create_asset(db_session)
     booking = await _request(db_session, renter, asset, clock, notifier)
     before = len(await _audits(db_session, booking.id))
     clock.advance(advance)

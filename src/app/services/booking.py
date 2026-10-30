@@ -366,9 +366,19 @@ async def _decline(ctx: _Context) -> _Outcome:
 
 @_register(BookingStatus.requested, BookingEvent.approve_vendor, ActorRole.vendor)
 async def _approve_vendor(ctx: _Context) -> _Outcome:
+    """The vendor approves the renter of a tier-3 item (A3), while the hold lasts (R18)."""
     booking = ctx.booking
     if booking.vendor_approved_at is not None:
         raise InvalidTransition(booking.status.value, ctx.event.value)
+    if not ctx.now < booking.hold_expires_at:
+        raise BookingGuardFailed(
+            "hold_expired", {"hold_expires_at": _plain(booking.hold_expires_at)}
+        )
+    minimum = await ctx.session.scalar(
+        select(Asset.minimum_trust_tier).where(Asset.id == booking.asset_id)
+    )
+    if minimum != TrustTier.vendor_approved:
+        raise BookingGuardFailed("approval_not_required", {"minimum_trust_tier": minimum})
     booking.vendor_approved_at = ctx.now
     return _Outcome(action="booking.vendor_approved")
 
