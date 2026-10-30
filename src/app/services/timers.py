@@ -26,8 +26,14 @@ without being counted. The predicates are the transition guards themselves
 (strict ``now > deadline``), so a second run over the same data does nothing.
 
 An :class:`InvalidTransition` or :class:`BookingGuardFailed` for one booking is
-logged and skipped, and its transaction rolls back; the run goes on. Any other
-error propagates (earlier bookings stay committed).
+logged at WARNING and skipped (not counted), and its transaction rolls back; the
+run goes on. Any other error from one booking is logged with its traceback (the
+booking id, the event and the exception type), counted in ``TimerReport.failed``,
+and its transaction rolls back; the run goes on with the next booking and the
+next sweeps, so one poison booking cannot block the rest. The exception is a
+database connectivity error (``OperationalError``, ``InterfaceError``,
+``DisconnectionError``): the database is unreachable, so it propagates (earlier
+bookings stay committed).
 
 Known limitation (M2)
 ---------------------
@@ -43,8 +49,10 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from enum import Enum
 
 from sqlalchemy import ColumnElement, select
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.clock import Clock, FrozenClock, business_date
@@ -70,6 +78,17 @@ class TimerReport:
     expired_deposits: int = 0
     completed: int = 0
     flagged_at_risk: int = 0
+    failed: int = 0
+
+
+class _Result(Enum):
+    moved = "moved"
+    skipped = "skipped"
+    failed = "failed"
+
+
+# The database is unreachable: carrying on with the next booking is pointless.
+_UNREACHABLE = (OperationalError, InterfaceError, DisconnectionError)
 
 
 def at_risk_last_end_date(now: datetime, settings: Settings) -> date:
@@ -152,10 +171,11 @@ async def _process(
     clock: Clock,
     notifier: Notifier,
     settings: Settings,
-) -> bool:
+) -> _Result:
     """Apply the sweep's event to one booking in its own transaction.
 
-    Returns True when the booking moved (the transaction committed).
+    Any error leaves the ``async with`` blocks, so the transaction rolls back and
+    the session closes before it is handled here.
     """
     try:
         async with session_factory() as session, session.begin():
@@ -165,7 +185,7 @@ async def _process(
                 .with_for_update(skip_locked=True)
             )
             if locked is None:
-                return False
+                return _Result.skipped
             await transition(
                 session,
                 booking_id,
@@ -182,8 +202,18 @@ async def _process(
             sweep.event.value,
             exc.code,
         )
-        return False
-    return True
+        return _Result.skipped
+    except _UNREACHABLE:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "timer_transition_failed booking_id=%s event=%s error=%s",
+            booking_id,
+            sweep.event.value,
+            type(exc).__name__,
+        )
+        return _Result.failed
+    return _Result.moved
 
 
 async def run_timers(
@@ -196,12 +226,12 @@ async def run_timers(
     """Run every sweep once at ``clock.now()`` and report what moved."""
     now = clock.now()
     run_clock = FrozenClock(now)
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = {"failed": 0}
     for sweep in _SWEEPS:
         where = sweep.predicate(now, settings)
         moved = 0
         for booking_id in await _candidates(session_factory, where):
-            if await _process(
+            result = await _process(
                 session_factory,
                 booking_id,
                 sweep,
@@ -209,7 +239,10 @@ async def run_timers(
                 clock=run_clock,
                 notifier=notifier,
                 settings=settings,
-            ):
+            )
+            if result is _Result.moved:
                 moved += 1
+            elif result is _Result.failed:
+                counts["failed"] += 1
         counts[sweep.field] = moved
     return TimerReport(**counts)

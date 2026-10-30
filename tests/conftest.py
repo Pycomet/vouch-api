@@ -36,7 +36,8 @@ def vouch_caplog(caplog, monkeypatch):
     Alembic's ``fileConfig`` (run by the migration fixtures) disables every logger
     that exists at that moment, so re-enable the project loggers for this test.
     """
-    for name in ("vouch", "vouch.timers", "vouch.notify"):
-        monkeypatch.setattr(logging.getLogger(name), "disabled", False)
+    for name, logger in list(logging.root.manager.loggerDict.items()):
+        if name.startswith("vouch") and isinstance(logger, logging.Logger):
+            monkeypatch.setattr(logger, "disabled", False)
     caplog.set_level(logging.INFO)
     return caplog

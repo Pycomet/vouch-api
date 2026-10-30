@@ -18,6 +18,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.clock import FrozenClock, start_of_business_day
@@ -381,14 +382,66 @@ async def test_timer_logs_and_skips_refused_transitions(
     assert report.expired_holds == 2
 
 
-async def test_timer_propagates_unexpected_errors(session_factory, monkeypatch) -> None:
+async def test_timer_isolates_a_poison_booking(session_factory, monkeypatch, vouch_caplog) -> None:
+    before = await _make(session_factory, BookingStatus.requested)
+    poison = await _make(
+        session_factory,
+        BookingStatus.requested,
+        starts_on=date(2027, 2, 1),
+        ends_on=date(2027, 2, 3),
+    )
+    after = await _make(
+        session_factory,
+        BookingStatus.requested,
+        starts_on=date(2027, 3, 1),
+        ends_on=date(2027, 3, 3),
+    )
+    unpaid = await _make(session_factory, BookingStatus.accepted)
+    real = timers_module.transition
+
+    async def poisoned(session, booking_id, *args, **kwargs):
+        booking = await real(session, booking_id, *args, **kwargs)
+        if booking_id == poison.id:
+            # The transition has flushed its writes; the failure must undo them.
+            raise RuntimeError("boom")
+        return booking
+
+    monkeypatch.setattr(timers_module, "transition", poisoned)
+    report = await _run(session_factory, LATER)
+
+    assert report == TimerReport(expired_holds=2, expired_deposits=1, failed=1)
+    assert (await _fetch(session_factory, before.id)).status == BookingStatus.expired
+    assert (await _fetch(session_factory, after.id)).status == BookingStatus.expired
+    assert (await _fetch(session_factory, unpaid.id)).status == BookingStatus.expired
+    assert (await _fetch(session_factory, poison.id)).status == BookingStatus.requested
+    assert await _actions(session_factory, poison.id) == []
+    failed = [r for r in vouch_caplog.records if "timer_transition_failed" in r.getMessage()]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.ERROR
+    assert str(poison.id) in failed[0].getMessage()
+    assert "RuntimeError" in failed[0].getMessage()
+    assert failed[0].exc_info is not None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationalError("SELECT 1", {}, Exception("server closed the connection")),
+        InterfaceError("SELECT 1", {}, Exception("connection is closed")),
+        DisconnectionError("connection invalidated"),
+    ],
+    ids=["operational", "interface", "disconnection"],
+)
+async def test_timer_propagates_database_connectivity_errors(
+    session_factory, monkeypatch, error
+) -> None:
     await _make(session_factory, BookingStatus.requested)
 
-    async def broken(*args, **kwargs):
-        raise RuntimeError("boom")
+    async def unreachable(*args, **kwargs):
+        raise error
 
-    monkeypatch.setattr(timers_module, "transition", broken)
-    with pytest.raises(RuntimeError, match="boom"):
+    monkeypatch.setattr(timers_module, "transition", unreachable)
+    with pytest.raises(type(error)):
         await _run(session_factory, LATER)
 
 
@@ -429,3 +482,36 @@ async def test_cli_loop_runs_again_after_interval(migrated_db, vouch_caplog) -> 
 
     assert code == 0
     assert vouch_caplog.text.count("timer_run ") >= 2
+
+
+async def test_cli_loop_survives_a_failed_run(migrated_db, vouch_caplog, monkeypatch) -> None:
+    stop = asyncio.Event()
+    calls: list[int] = []
+
+    async def flaky_run(*args, **kwargs) -> TimerReport:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("database hiccup")
+        stop.set()
+        return TimerReport()
+
+    monkeypatch.setattr(timers_cli, "run_timers", flaky_run)
+    code = await asyncio.wait_for(
+        timers_cli.serve(get_settings(), once=False, interval=0, stop=stop), 10
+    )
+
+    assert code == 0
+    assert len(calls) == 2
+    errors = [r for r in vouch_caplog.records if "timer_run_failed" in r.getMessage()]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert "timer_run expired_holds=0" in vouch_caplog.text
+
+
+async def test_cli_once_lets_a_failed_run_escape(migrated_db, monkeypatch) -> None:
+    async def broken_run(*args, **kwargs) -> TimerReport:
+        raise RuntimeError("database hiccup")
+
+    monkeypatch.setattr(timers_cli, "run_timers", broken_run)
+    with pytest.raises(RuntimeError, match="hiccup"):
+        await timers_cli.serve(get_settings(), once=True)

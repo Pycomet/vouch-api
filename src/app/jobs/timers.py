@@ -4,6 +4,10 @@ Without ``--once`` it runs :func:`app.services.timers.run_timers` every 60 secon
 until SIGINT or SIGTERM, then exits cleanly (status 0). Each run logs its
 :class:`~app.services.timers.TimerReport` as one line. Notifications go to the
 :class:`~app.services.notify.LoggingNotifier`.
+
+In the loop, a run that raises (the database is unreachable, say) is logged with
+its traceback and the loop carries on at the next tick. With ``--once`` the error
+escapes, so the process exits non-zero.
 """
 
 from __future__ import annotations
@@ -49,22 +53,31 @@ async def serve(
     notifier = LoggingNotifier()
     try:
         while True:
-            report = await run_timers(
-                session_factory, clock=clock, notifier=notifier, settings=settings
-            )
-            logger.info(
-                "timer_run expired_holds=%d expired_deposits=%d completed=%d flagged_at_risk=%d",
-                report.expired_holds,
-                report.expired_deposits,
-                report.completed,
-                report.flagged_at_risk,
-            )
+            try:
+                report = await run_timers(
+                    session_factory, clock=clock, notifier=notifier, settings=settings
+                )
+            except Exception:
+                if once:
+                    raise
+                logger.exception("timer_run_failed")
+            else:
+                logger.info(
+                    "timer_run expired_holds=%d expired_deposits=%d completed=%d "
+                    "flagged_at_risk=%d failed=%d",
+                    report.expired_holds,
+                    report.expired_deposits,
+                    report.completed,
+                    report.flagged_at_risk,
+                    report.failed,
+                )
             if once:
                 break
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            except TimeoutError:
-                continue
+            if not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                except TimeoutError:
+                    continue
             logger.info("timer_stopped")
             break
     finally:
