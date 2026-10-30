@@ -37,6 +37,30 @@ def test_money_rows_registered_with_their_roles() -> None:
         assert table[key].party_only is True
 
 
+def test_lifecycle_rows_registered_with_their_roles() -> None:
+    table = booking_service._TRANSITIONS
+    parties = {ActorRole.renter, ActorRole.vendor, ActorRole.system}
+    expected = {
+        (BookingStatus.confirmed, BookingEvent.handover_completed): parties,
+        (BookingStatus.confirmed, BookingEvent.balance_captured): {ActorRole.system},
+        (BookingStatus.in_progress, BookingEvent.return_completed): parties,
+        (BookingStatus.returned, BookingEvent.claim_raised): {ActorRole.vendor},
+        (BookingStatus.returned, BookingEvent.complete): {ActorRole.system},
+        (BookingStatus.disputed, BookingEvent.resolve): {ActorRole.admin},
+        (BookingStatus.in_progress, BookingEvent.flag_at_risk): {ActorRole.system},
+        (BookingStatus.in_progress, BookingEvent.mark_lost): {ActorRole.admin},
+    }
+    for key, roles in expected.items():
+        assert table[key].roles == roles
+        assert table[key].party_only is True
+
+
+def test_handover_incomplete_is_a_guard_code() -> None:
+    error = BookingGuardFailed("handover_incomplete")
+
+    assert (error.status_code, error.code) == (409, "handover_incomplete")
+
+
 def test_duplicate_registration_rejected() -> None:
     register = booking_service._register(
         BookingStatus.requested, BookingEvent.accept, ActorRole.vendor
