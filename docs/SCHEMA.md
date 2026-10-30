@@ -51,7 +51,7 @@ kyc_profiles ──1:N── kyc_attempts
 | `DepositStatus` | `held`, `released`, `claimed` | `payments.deposit_status` for deposit transactions |
 | `PayoutStatus` | `pending`, `eligible`, `paid` | `payments.payout_status` for payout transactions |
 
-`paymenttype.protection_waiver` does not authorize an insurance or waiver product. No insurance is in v1; this value must remain unused unless separately approved in a later phase.
+`paymenttype.protection_waiver` does not authorize a third-party cover product. No such product is in v1. Milestone 2 renames the value to `damage_contribution` (a Vouch-run damage contribution recorded in the `protection_pool` ledger account); amounts and terms remain subject to legal approval.
 
 ## 4. Current tables
 
@@ -291,7 +291,7 @@ An immutable booking subledger supporting deposit liability, rental collection, 
 | `metadata` JSONB | Minimized reconciliation details |
 | timestamps | Record time; rows immutable after posting |
 
-Final account design and tax entries require accounting/legal review. This is an internal ledger, not a claim that Vouch is an escrow or deposit-taking institution.
+Final account design and tax entries require accounting/legal review. This is an internal ledger, not a claim that Vouch is a regulated custodian or deposit-taking institution.
 
 ### Table: `disputes` — planned
 

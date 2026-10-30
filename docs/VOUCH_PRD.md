@@ -8,7 +8,7 @@ This document defines Phase 0 and v1 for Vouch. It combines the approved product
 - **Planned**: required for Phase 0/v1 but not yet implemented.
 - **Unresolved**: requires legal, compliance, commercial, or provider confirmation before launch.
 
-Vouch must not describe customer funds as **escrow** unless Nigerian counsel confirms the legal structure, the selected licensed provider contract supports that terminology and flow, and operations implement the approved controls. Until then, use **platform-controlled payment**, **deposit collection/hold**, or the provider's counsel-approved wording.
+Vouch describes customer funds only as a **deposit hold** unless Nigerian counsel approves other wording, the selected licensed provider contract supports that terminology and flow, and operations implement the approved controls. Use **platform-controlled payment**, **deposit collection/hold**, or the provider's counsel-approved wording.
 
 ## 2. Product summary
 
@@ -58,7 +58,7 @@ The current `users.role` model allows one role value (`renter`, `vendor`, or `ad
 ### 5.2 Out of scope for v1
 
 - Cars, property, event infrastructure, household goods, or a general rental marketplace.
-- Insurance or insurance-like protection products. There is **no insurance in v1**.
+- Third-party cover products. The only damage product is the optional **damage contribution**, subject to legal approval.
 - A platform-funded loss guarantee.
 - Instant booking without vendor/operations gates.
 - Cash payment as a normal supported path.
@@ -80,7 +80,7 @@ The current `PaymentType.protection_waiver` enum is a reserved implementation ar
 5. **Payout:** vendor payout becomes eligible only after both parties co-sign the return, required return evidence exists, and no dispute/hold blocks settlement.
 6. **Commission:** Vouch's commission is vendor-side and deducted from rental proceeds before vendor payout. The commission rate and tax treatment are **unresolved commercial/legal decisions**.
 7. **Deposit disposition:** an undisputed deposit is released/refunded according to the provider-supported flow. A claimed deposit requires a documented dispute decision; operators must not unilaterally move funds outside the approved process.
-8. **No escrow claim:** Paystack-first does not itself establish an escrow arrangement. The exact licensed custody/collection, dedicated virtual account, split, transfer, refund, and holding capabilities must be confirmed contractually and technically.
+8. **Deposit hold only:** Paystack-first does not itself establish a custodial holding arrangement. The exact licensed custody/collection, dedicated virtual account, split, transfer, refund, and holding capabilities must be confirmed contractually and technically.
 9. **Source of truth:** provider webhooks plus reconciliation determine settled payment state; a browser redirect or client assertion never does.
 
 ## 7. Trust infrastructure
@@ -347,7 +347,7 @@ All must hold:
 
 | Decision | Status | Launch consequence |
 |---|---|---|
-| Licensed provider and legal structure for platform deposit collection/hold/release | **Unresolved — counsel/provider** | Blocks live deposit collection and any escrow-like claim |
+| Licensed provider and legal structure for platform deposit collection/hold/release | **Unresolved — counsel/provider** | Blocks live deposit collection and any custodial-holding claim |
 | Paystack product capabilities for per-booking accounts, split/transfer timing, refunds, webhook guarantees | **Unresolved — provider validation** | Blocks final payment implementation |
 | Smile ID vs Dojah | **Unresolved — privacy/security/commercial review** | Blocks automated KYC |
 | Commission rate, VAT/withholding/tax treatment | **Unresolved — commercial/counsel/accounting** | Blocks payout calculation launch |
