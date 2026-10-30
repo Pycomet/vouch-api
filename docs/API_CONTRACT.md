@@ -126,7 +126,7 @@ Several aggregate fields are planned projections and do not currently exist as c
 }
 ```
 
-Provider initialization details are returned only to the booking renter. No response calls the arrangement escrow.
+Provider initialization details are returned only to the booking renter. Responses describe the arrangement only as a deposit hold.
 
 ### 3.4 Handover
 
@@ -257,7 +257,7 @@ Responses expose `allowed_actions`; the server remains authoritative.
 
 ## 8. Payment APIs — planned, Paystack first
 
-Paystack is the first integration. Exact support for deposit custody/hold/release, per-booking accounts, splits/transfers, and refunds is **unresolved pending provider validation and Nigerian legal review**. The contract describes Vouch's needed behavior, not a claim that Paystack currently provides escrow.
+Paystack is the first integration. Exact support for deposit custody/hold/release, per-booking accounts, splits/transfers, and refunds is **unresolved pending provider validation and Nigerian legal review**. The contract describes Vouch's needed behavior, not a claim that Paystack currently provides a custodial holding product.
 
 | Method | Path | Actor | Purpose |
 |---|---|---|---|
@@ -422,6 +422,6 @@ Only configured providers (`smile_id` or `dojah` after selection) are accepted. 
 
 Stricter limits apply to OTP/challenges, KYC initiation, evidence uploads, booking creation, payment initialization, and webhook endpoints. Limits are keyed using safe combinations of account, device/session, phone hash, IP/network, and provider as appropriate. Public search receives general throttling. Responses use `429` and `Retry-After` without exposing fraud rules.
 
-## 16. No-insurance and legal wording constraints
+## 16. Product and legal wording constraints
 
-No endpoint offers `insurance`, `coverage`, or `protection_waiver` in v1, despite the currently defined dormant payment enum value. Public and API copy must not call deposits or payment accounts escrow. The final licensed funds flow, provider product names, refund/claim rights, commission/tax treatment, and contractual language remain unresolved until counsel/provider approval.
+No endpoint offers third-party cover or `coverage` in v1. The optional damage contribution (Milestone 2, renamed from `protection_waiver`) is the only damage product, and its terms remain subject to legal approval. Public and API copy says **deposit hold** and **damage contribution**. The final licensed funds flow, provider product names, refund/claim rights, commission/tax treatment, and contractual language remain unresolved until counsel/provider approval.

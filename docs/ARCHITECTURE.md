@@ -96,7 +96,7 @@ Provider adapters translate external event/product vocabulary to domain commands
 6. Completed handover evidence is immutable; corrections are append-only events/disputes.
 7. Sensitive objects are private and served through authorized, short-lived links.
 8. Phase 0 manual approval remains a first-class gate rather than an undocumented workaround.
-9. No component or UI calls the funds flow escrow until counsel and provider contracts expressly approve it.
+9. Components and UI describe the funds flow only as a **deposit hold**, or with counsel-approved wording.
 
 ## 5. Trust and booking flow
 
@@ -128,7 +128,7 @@ Booking service -> PostgreSQL: pending -> confirmed in guarded transaction
 Outbox -> Worker: notifications/reconciliation follow-up
 ```
 
-The deposit is paid upfront to the platform through a licensed provider, subject to counsel/provider approval of the exact structure. The design does not assert that Paystack provides escrow or that Vouch may hold regulated funds.
+The deposit is paid upfront to the platform through a licensed provider, subject to counsel/provider approval of the exact structure. The design does not assert that Paystack provides a custodial holding product or that Vouch may hold regulated funds.
 
 ### 5.3 Pickup/balance activation
 
@@ -186,7 +186,7 @@ The `PaymentProvider` port should support:
 - fetch transaction/transfer state for reconciliation; and
 - return stable error categories without leaking sensitive provider payloads.
 
-Paystack is first, but each capability must be verified against the contracted Nigerian product. Unsupported capabilities require a revised, counsel-approved flow—not a simulated escrow layer.
+Paystack is first, but each capability must be verified against the contracted Nigerian product. Unsupported capabilities require a revised, counsel-approved flow—not a simulated custodial layer.
 
 ### 7.2 Accounting and reconciliation
 
@@ -395,4 +395,4 @@ Automation is enabled one transition at a time after shadow comparison against c
 | NDPA lawful bases, retention, transfers, DPO/DPIA duties | Counsel/DPO | Storage, deletion, contracts, evidence/KYC flow |
 | RPO/RTO and service SLOs | Operations/product | HA, backup cadence, capacity/cost |
 
-There is no insurance in v1. Any existing `protection_waiver` code value remains dormant and must not be wired into products, APIs, or payment flows.
+There is no third-party cover product in v1. The `protection_waiver` code value becomes `damage_contribution` in Milestone 2; its amounts and terms remain subject to legal approval.
