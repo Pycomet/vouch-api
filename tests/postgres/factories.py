@@ -29,6 +29,7 @@ from app.db.models import (
     CatalogueItem,
     Category,
     City,
+    HandoverRecord,
     KYCProfile,
     Payment,
     User,
@@ -36,6 +37,7 @@ from app.db.models import (
 )
 from app.db.models.asset import ListingStatus
 from app.db.models.booking import BookingStatus
+from app.db.models.handover import HandoverDirection, HandoverStatus
 from app.db.models.payment import DepositStatus, PaymentStatus, PaymentType
 from app.db.models.user import KYCStatus, RenterRole, TrustTier
 
@@ -276,3 +278,34 @@ async def create_payment(
     session.add(payment)
     await session.flush()
     return payment
+
+
+async def create_handover(
+    session: AsyncSession,
+    booking: Booking,
+    *,
+    direction: HandoverDirection = HandoverDirection.pickup,
+    completed: bool = True,
+    now: datetime = DEFAULT_NOW,
+) -> HandoverRecord:
+    """A handover record for ``booking``; ``completed`` means both parties signed.
+
+    A completed record carries both signers (the booking's own vendor and renter,
+    as the composite FKs require), both signing times and one evidence URL. An
+    incomplete one is a ``draft`` with nothing signed.
+    """
+    record = HandoverRecord(
+        booking_id=booking.id,
+        direction=direction,
+        status=HandoverStatus.completed if completed else HandoverStatus.draft,
+        condition_checklist={"body": "ok"},
+    )
+    if completed:
+        record.vendor_signer_id = booking.vendor_id
+        record.renter_signer_id = booking.renter_id
+        record.vendor_signed_at = now
+        record.renter_signed_at = now
+        record.evidence_urls = ["https://evidence.example/handover.jpg"]
+    session.add(record)
+    await session.flush()
+    return record

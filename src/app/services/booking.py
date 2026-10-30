@@ -45,10 +45,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import Clock, business_date, start_of_business_day
 from app.core.config import Settings
-from app.db.models import Asset, AvailabilityWindow, Booking, Payment, User
+from app.db.models import (
+    Asset,
+    AuditEvent,
+    AvailabilityWindow,
+    Booking,
+    Direction,
+    HandoverRecord,
+    LedgerAccount,
+    LedgerEntry,
+    Payment,
+    User,
+)
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
-from app.db.models.payment import PaymentType
+from app.db.models.handover import HandoverDirection, HandoverStatus
+from app.db.models.payment import PaymentStatus, PaymentType
 from app.db.models.user import TrustTier
 from app.schemas.errors import (
     BookingGuardFailed,
@@ -60,6 +72,8 @@ from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
 from app.services.ledger import Posting, post_txn
 from app.services.money import (
+    balance_captured_postings,
+    commission_amount,
     deposit_captured_postings,
     deposit_release_postings,
     refund_contribution_postings,
@@ -70,6 +84,7 @@ from app.services.trust import required_tier_met, tier_effective
 
 HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
+CLAIM_WINDOW = timedelta(hours=24)
 
 AUDIT_ENTITY = "booking"
 REQUEST_EVENT = "request"
@@ -539,6 +554,166 @@ async def _cancel(ctx: _Context) -> _Outcome:
         after={"refund": {"deposit": deposit, "damage_contribution": contribution}},
         reason=reason,
         notices=_both(booking, "booking.cancelled"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers: handover, balance and return (confirmed, in_progress)
+# ---------------------------------------------------------------------------
+
+
+async def _handover_done(ctx: _Context, direction: HandoverDirection) -> bool:
+    """Whether this booking's ``direction`` handover record is completed (both signed)."""
+    return bool(
+        await ctx.session.scalar(
+            select(
+                exists().where(
+                    HandoverRecord.booking_id == ctx.booking.id,
+                    HandoverRecord.direction == direction,
+                    HandoverRecord.status == HandoverStatus.completed,
+                )
+            )
+        )
+    )
+
+
+async def _balance_posted(ctx: _Context) -> bool:
+    """Whether ``balance_captured`` has already run for this booking.
+
+    Its ledger group is the only one that credits ``vendor_payable`` or
+    ``platform_revenue`` before the booking leaves ``confirmed``.
+    """
+    return bool(
+        await ctx.session.scalar(
+            select(
+                exists().where(
+                    LedgerEntry.booking_id == ctx.booking.id,
+                    LedgerEntry.direction == Direction.cr.value,
+                    LedgerEntry.account.in_(
+                        (LedgerAccount.vendor_payable.value, LedgerAccount.platform_revenue.value)
+                    ),
+                )
+            )
+        )
+    )
+
+
+async def _handover_signal_recorded(ctx: _Context) -> bool:
+    """Whether an earlier ``handover_completed`` left a ``booking.handover_signed`` row."""
+    return bool(
+        await ctx.session.scalar(
+            select(
+                exists().where(
+                    AuditEvent.entity == AUDIT_ENTITY,
+                    AuditEvent.entity_id == ctx.booking.id,
+                    AuditEvent.action == "booking.handover_signed",
+                )
+            )
+        )
+    )
+
+
+async def _balance_payment_id(ctx: _Context) -> uuid.UUID:
+    """The payload's ``payment_id``: this booking's captured rental-balance payment."""
+    raw = ctx.payload.get("payment_id")
+    try:
+        payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+    except ValueError:
+        payment_id = None
+    found = payment_id is not None and await ctx.session.scalar(
+        select(
+            exists().where(
+                Payment.id == payment_id,
+                Payment.booking_id == ctx.booking.id,
+                Payment.type == PaymentType.rental_balance,
+                Payment.status == PaymentStatus.captured,
+            )
+        )
+    )
+    if not found:
+        raise InvalidRequestError(
+            "The payment is not this booking's captured rental balance.",
+            {"payment_id": _plain(raw)},
+        )
+    return payment_id
+
+
+def _start_rental(booking: Booking, outcome_after: Mapping[str, Any]) -> _Outcome:
+    """Both in_progress facts hold: confirmed -> in_progress."""
+    booking.status = BookingStatus.in_progress
+    return _Outcome(after=outcome_after, notices=_both(booking, "booking.in_progress"))
+
+
+@_register(
+    BookingStatus.confirmed,
+    BookingEvent.handover_completed,
+    ActorRole.renter,
+    ActorRole.vendor,
+    ActorRole.system,
+)
+async def _handover_completed(ctx: _Context) -> _Outcome:
+    """Record the signed pickup; start the rental if the balance is already captured."""
+    if await _handover_signal_recorded(ctx):
+        raise InvalidTransition(ctx.booking.status.value, ctx.event.value)
+    if not await _handover_done(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("handover_incomplete", {"direction": "pickup"})
+
+    after = {"handover": HandoverDirection.pickup.value}
+    if await _balance_posted(ctx):
+        return _start_rental(ctx.booking, after)
+    return _Outcome(action="booking.handover_signed", after=after)
+
+
+@_register(BookingStatus.confirmed, BookingEvent.balance_captured, ActorRole.system)
+async def _balance_captured(ctx: _Context) -> _Outcome:
+    """Post R + F (vendor share and commission K); start the rental if handed over."""
+    booking = ctx.booking
+    if await _balance_posted(ctx):
+        raise InvalidTransition(booking.status.value, ctx.event.value)
+    rental = _snapshot_amount(booking, "rental_total")
+    delivery_fee = _snapshot_amount(booking, "delivery_fee")
+    expected = rental + delivery_fee
+    amount = _payload_amount(ctx.payload)
+    if amount is None or amount != expected:
+        raise BookingGuardFailed(
+            "amount_mismatch",
+            {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
+        )
+    payment_id = await _balance_payment_id(ctx)
+
+    # The rate frozen at request time, unquantized (it is a rate, not money).
+    commission = commission_amount(rental, Decimal(booking.price_snapshot["commission_rate"]))
+    await _post(
+        ctx,
+        balance_captured_postings(rental, delivery_fee, commission),
+        "balance_captured",
+        payment_id,
+    )
+
+    after = {"amount": money(amount), "payment_id": payment_id, "commission": commission}
+    if await _handover_done(ctx, HandoverDirection.pickup):
+        return _start_rental(booking, after)
+    return _Outcome(action="booking.balance_captured", after=after)
+
+
+@_register(
+    BookingStatus.in_progress,
+    BookingEvent.return_completed,
+    ActorRole.renter,
+    ActorRole.vendor,
+    ActorRole.system,
+)
+async def _return_completed(ctx: _Context) -> _Outcome:
+    """Both return signatures: open the 24-hour claim window."""
+    if not await _handover_done(ctx, HandoverDirection.return_):
+        raise BookingGuardFailed("handover_incomplete", {"direction": "return"})
+    booking = ctx.booking
+    booking.status = BookingStatus.returned
+    booking.claim_window_ends_at = ctx.now + CLAIM_WINDOW
+    return _Outcome(
+        notices=_both(
+            booking, "booking.returned", claim_window_ends_at=booking.claim_window_ends_at
+        )
     )
 
 
