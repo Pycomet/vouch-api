@@ -110,6 +110,7 @@ def test_lifespan_builds_and_cleans_up_injected_database(
             (
                 settings.database_url,
                 {
+                    "hide_parameters": True,
                     "pool_pre_ping": True,
                     "pool_size": settings.database_pool_size,
                     "max_overflow": settings.database_max_overflow,
