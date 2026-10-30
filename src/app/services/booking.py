@@ -75,6 +75,8 @@ from app.services.money import (
     balance_captured_postings,
     commission_amount,
     deposit_captured_postings,
+    deposit_deduct_postings,
+    deposit_forfeit_postings,
     deposit_release_postings,
     refund_contribution_postings,
 )
@@ -85,6 +87,7 @@ from app.services.trust import required_tier_met, tier_effective
 HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
 CLAIM_WINDOW = timedelta(hours=24)
+ZERO = Decimal("0.00")
 
 AUDIT_ENTITY = "booking"
 REQUEST_EVENT = "request"
@@ -714,6 +717,132 @@ async def _return_completed(ctx: _Context) -> _Outcome:
         notices=_both(
             booking, "booking.returned", claim_window_ends_at=booking.claim_window_ends_at
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers: claim, completion and dispute resolution (returned, disputed)
+# ---------------------------------------------------------------------------
+
+
+def _claim_fields(payload: Mapping[str, Any]) -> tuple[Decimal, str, list[str]]:
+    """The claim's amount (> 0), description and evidence list, or 400."""
+    amount = _payload_amount(payload)
+    if amount is None or amount <= 0:
+        raise InvalidRequestError("The claim amount must be a positive sum of money.")
+    description = payload.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise InvalidRequestError("The claim needs a description.")
+    evidence = payload.get("evidence")
+    if (
+        not isinstance(evidence, list)
+        or not evidence
+        or not all(isinstance(item, str) and item.strip() for item in evidence)
+    ):
+        raise InvalidRequestError("The claim needs at least one piece of evidence.")
+    return money(amount), description.strip(), list(evidence)
+
+
+@_register(BookingStatus.returned, BookingEvent.claim_raised, ActorRole.vendor)
+async def _claim_raised(ctx: _Context) -> _Outcome:
+    """The vendor claims against the deposit inside the window; it stays held."""
+    booking = ctx.booking
+    if not ctx.now < booking.claim_window_ends_at:
+        raise BookingGuardFailed(
+            "claim_window_closed", {"claim_window_ends_at": _plain(booking.claim_window_ends_at)}
+        )
+    amount, description, evidence = _claim_fields(ctx.payload)
+
+    # Disputed freezes the deposit and the payout: nothing moves on the ledger.
+    booking.status = BookingStatus.disputed
+    booking.claim_amount = amount
+    booking.claim_description = description
+    booking.claim_evidence = evidence
+    booking.claimed_at = ctx.now
+    return _Outcome(
+        notices=(
+            Notice(
+                None,
+                "ops.claim_raised",
+                {
+                    "booking_id": str(booking.id),
+                    "vendor_id": str(booking.vendor_id),
+                    "claim_amount": str(amount),
+                },
+            ),
+        )
+    )
+
+
+async def _deposit_audit(ctx: _Context, action: str, **after: Any) -> None:
+    """The ``deposit.<released|deducted|forfeited>`` row beside the booking's own."""
+    await record_audit(
+        ctx.session,
+        actor=ctx.actor,
+        entity=AUDIT_ENTITY,
+        entity_id=ctx.booking.id,
+        action=action,
+        before=None,
+        after=after,
+        reason=_reason(ctx.payload),
+    )
+
+
+@_register(BookingStatus.returned, BookingEvent.complete, ActorRole.system)
+async def _complete(ctx: _Context) -> _Outcome:
+    """After the claim window with no claim: release the deposit."""
+    booking = ctx.booking
+    if not ctx.now > booking.claim_window_ends_at or booking.claimed_at is not None:
+        raise InvalidTransition(booking.status.value, ctx.event.value)
+    deposit = _snapshot_amount(booking, "deposit")
+    await _post(ctx, deposit_release_postings(deposit), "deposit_released")
+    await _deposit_audit(ctx, "deposit.released", deposit=deposit)
+    # "Payout eligible": the vendor_payable balance is now final (payouts are Step 5).
+    booking.status = BookingStatus.completed
+    return _Outcome(notices=_both(booking, "booking.completed"))
+
+
+_RESOLVE_DECISIONS = ("release", "deduct", "forfeit")
+
+
+@_register(BookingStatus.disputed, BookingEvent.resolve, ActorRole.admin)
+async def _resolve(ctx: _Context) -> _Outcome:
+    """An admin settles the claim: release, deduct (capped at D) or forfeit."""
+    booking = ctx.booking
+    reason = _reason(ctx.payload)
+    if reason is None:
+        raise BookingGuardFailed("reason_required")
+    decision = ctx.payload.get("decision")
+    if decision not in _RESOLVE_DECISIONS:
+        raise InvalidRequestError(
+            "The decision must be release, deduct or forfeit.", {"decision": _plain(decision)}
+        )
+    deposit = _snapshot_amount(booking, "deposit")
+    after: dict[str, Any] = {"decision": decision}
+    if decision == "deduct":
+        requested = _payload_amount(ctx.payload)
+        if requested is None or requested <= 0:
+            raise InvalidRequestError("A deduction needs a positive amount.")
+        deduction = min(money(requested), deposit)
+        after.update(amount=deduction, requested_amount=money(requested))
+        postings = deposit_deduct_postings(deposit, deduction)
+        action = "deposit.deducted"
+    elif decision == "forfeit":
+        after["amount"] = deposit
+        postings = deposit_forfeit_postings(deposit)
+        action = "deposit.forfeited"
+    else:
+        after["amount"] = ZERO
+        postings = deposit_release_postings(deposit)
+        action = "deposit.released"
+
+    await _post(ctx, postings, f"resolve_{decision}")
+    await _deposit_audit(ctx, action, deposit=deposit, **after)
+    booking.status = BookingStatus.completed
+    return _Outcome(
+        after=after,
+        reason=reason,
+        notices=_both(booking, "booking.completed", decision=decision),
     )
 
 

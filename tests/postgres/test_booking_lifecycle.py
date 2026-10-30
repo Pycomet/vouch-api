@@ -431,3 +431,303 @@ async def test_return_without_completed_return_record_is_refused(
     assert await _counts(db_session) == counts
     await db_session.refresh(booking)
     assert booking.status == BookingStatus.in_progress
+
+
+# ---------------------------------------------------------------------------
+# returned + claim_raised -> disputed
+# ---------------------------------------------------------------------------
+
+CLAIM = {
+    "amount": "40000.00",
+    "description": "Cracked LCD screen",
+    "evidence": ["https://evidence.example/crack.jpg"],
+}
+
+
+async def test_claim_within_window_disputes(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned)
+    clock.advance(booking.claim_window_ends_at - DEFAULT_NOW - timedelta(seconds=1))
+
+    result = await _transition(
+        db_session,
+        booking,
+        vendor_actor(booking),
+        BookingEvent.claim_raised,
+        clock,
+        notifier,
+        CLAIM,
+    )
+
+    assert result.status == BookingStatus.disputed
+    assert result.claim_amount == D("40000.00")
+    assert result.claim_description == "Cracked LCD screen"
+    assert result.claim_evidence == CLAIM["evidence"]
+    assert result.claimed_at == clock.now()
+    audit = (await _audits(db_session, booking.id))[-1]
+    assert audit.action == "booking.disputed"
+    assert audit.actor_role == "vendor"
+    assert audit.after["claim_amount"] == "40000.00"
+    # The deposit stays held: nothing moves on the ledger while disputed.
+    assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == DEPOSIT
+    ops = [call for call in notifier.calls if call.user_id is None]
+    assert [call.template for call in ops] == ["ops.claim_raised"]
+    assert ops[0].data["claim_amount"] == "40000.00"
+
+
+async def test_claim_after_window_409(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned)
+    clock.advance(booking.claim_window_ends_at - DEFAULT_NOW)  # exactly at the end
+    counts = await _counts(db_session)
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(booking),
+            BookingEvent.claim_raised,
+            clock,
+            notifier,
+            CLAIM,
+        )
+
+    assert caught.value.code == "claim_window_closed"
+    assert caught.value.status_code == 409
+    assert await _counts(db_session) == counts
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.returned
+    assert booking.claimed_at is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"amount": "0"},
+        {"amount": "-5.00"},
+        {"amount": 100.5},
+        {"amount": None},
+        {"description": "   "},
+        {"description": None},
+        {"evidence": []},
+        {"evidence": "https://evidence.example/a.jpg"},
+        {"evidence": None},
+    ],
+)
+async def test_claim_payload_is_validated(db_session, clock, notifier, change) -> None:
+    booking = await _booking(db_session, BookingStatus.returned)
+    payload = {**CLAIM, **change}
+    payload = {key: value for key, value in payload.items() if value is not None}
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidRequestError):
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(booking),
+            BookingEvent.claim_raised,
+            clock,
+            notifier,
+            payload,
+        )
+    assert await _counts(db_session) == counts
+
+
+async def test_renter_cannot_raise_claim(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.returned)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session,
+            booking,
+            renter_actor(booking),
+            BookingEvent.claim_raised,
+            clock,
+            notifier,
+            CLAIM,
+        )
+
+
+# ---------------------------------------------------------------------------
+# returned + complete (timer) -> completed
+# ---------------------------------------------------------------------------
+
+
+async def test_complete_after_window_releases_deposit(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned)
+    clock.advance(booking.claim_window_ends_at - DEFAULT_NOW + timedelta(seconds=1))
+
+    result = await _transition(
+        db_session, booking, Actor.system(), BookingEvent.complete, clock, notifier
+    )
+
+    assert result.status == BookingStatus.completed
+    assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
+    audits = await _audits(db_session, booking.id)
+    assert [a.action for a in audits[-2:]] == ["deposit.released", "booking.completed"]
+    assert audits[-2].after["deposit"] == str(DEPOSIT)
+    assert {call.user_id for call in notifier.calls} == {booking.renter_id, booking.vendor_id}
+    assert set(notifier.templates()) == {"booking.completed"}
+
+
+async def test_complete_at_window_end_is_invalid(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned)
+    clock.advance(booking.claim_window_ends_at - DEFAULT_NOW)
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, Actor.system(), BookingEvent.complete, clock, notifier
+        )
+    assert await _counts(db_session) == counts
+
+
+async def test_complete_with_claim_is_invalid(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned, claimed=True)
+    clock.advance(timedelta(days=3))
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, Actor.system(), BookingEvent.complete, clock, notifier
+        )
+
+
+async def test_vendor_cannot_complete(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.returned)
+    clock.advance(timedelta(days=3))
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, vendor_actor(booking), BookingEvent.complete, clock, notifier
+        )
+
+
+# ---------------------------------------------------------------------------
+# disputed + resolve (admin) -> completed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("decision", "amount", "action", "vendor_gets", "cash_out"),
+    [
+        ("release", None, "deposit.released", ZERO, DEPOSIT),
+        ("deduct", "40000.00", "deposit.deducted", D("40000.00"), D("110000.00")),
+        ("forfeit", None, "deposit.forfeited", DEPOSIT, ZERO),
+    ],
+)
+async def test_resolve_decisions(
+    db_session, clock, notifier, decision, amount, action, vendor_gets, cash_out
+) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    admin = await admin_actor(db_session)
+    cash_before = await _balance(db_session, LedgerAccount.platform_cash, booking.id)
+    payload = {"decision": decision, "reason": "  Photos reviewed  "}
+    if amount is not None:
+        payload["amount"] = amount
+
+    result = await _transition(
+        db_session, booking, admin, BookingEvent.resolve, clock, notifier, payload
+    )
+
+    assert result.status == BookingStatus.completed
+    assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == vendor_gets
+    cash_after = await _balance(db_session, LedgerAccount.platform_cash, booking.id)
+    assert cash_after - cash_before == cash_out
+    audits = await _audits(db_session, booking.id)
+    assert [a.action for a in audits[-2:]] == [action, "booking.completed"]
+    final = audits[-1]
+    assert final.actor_role == "admin"
+    assert final.reason == "Photos reviewed"
+    assert final.after["decision"] == decision
+    assert final.before["status"] == "disputed"
+    assert {call.user_id for call in notifier.calls} == {booking.renter_id, booking.vendor_id}
+
+
+async def test_resolve_deduct_capped_at_deposit(db_session, clock, notifier) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    admin = await admin_actor(db_session)
+
+    await _transition(
+        db_session,
+        booking,
+        admin,
+        BookingEvent.resolve,
+        clock,
+        notifier,
+        {"decision": "deduct", "amount": "900000.00", "reason": "Total loss of the body"},
+    )
+
+    assert await _balance(db_session, LedgerAccount.vendor_payable, booking.id) == DEPOSIT
+    assert await _balance(db_session, LedgerAccount.renter_deposit_liability, booking.id) == ZERO
+    final = (await _audits(db_session, booking.id))[-1]
+    assert final.after["amount"] == str(DEPOSIT)
+    assert final.after["requested_amount"] == "900000.00"
+
+
+@pytest.mark.parametrize("reason", [None, "", "   ", 5])
+async def test_resolve_requires_reason(db_session, clock, notifier, reason) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    admin = await admin_actor(db_session)
+    payload = {"decision": "release"}
+    if reason is not None:
+        payload["reason"] = reason
+    counts = await _counts(db_session)
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session, booking, admin, BookingEvent.resolve, clock, notifier, payload
+        )
+
+    assert caught.value.code == "reason_required"
+    assert await _counts(db_session) == counts
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.disputed
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"decision": "split"},
+        {},
+        {"decision": "deduct"},
+        {"decision": "deduct", "amount": "0"},
+        {"decision": "deduct", "amount": 10.0},
+        {"decision": "deduct", "amount": "abc"},
+    ],
+)
+async def test_resolve_payload_is_validated(db_session, clock, notifier, payload) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    admin = await admin_actor(db_session)
+    counts = await _counts(db_session)
+
+    with pytest.raises(InvalidRequestError):
+        await _transition(
+            db_session,
+            booking,
+            admin,
+            BookingEvent.resolve,
+            clock,
+            notifier,
+            {**payload, "reason": "Reviewed"},
+        )
+    assert await _counts(db_session) == counts
+
+
+@pytest.mark.parametrize("role", ["renter", "vendor", "system"])
+async def test_only_admin_resolves(db_session, clock, notifier, role) -> None:
+    booking = await _with_deposit(db_session, BookingStatus.disputed, claimed=True)
+    actor = {
+        "renter": renter_actor(booking),
+        "vendor": vendor_actor(booking),
+        "system": Actor.system(),
+    }[role]
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session,
+            booking,
+            actor,
+            BookingEvent.resolve,
+            clock,
+            notifier,
+            {"decision": "release", "reason": "x"},
+        )
