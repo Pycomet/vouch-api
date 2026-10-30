@@ -20,8 +20,9 @@ Unknown and not-yet-launched cities get the same error.
 Date-range filter (when both ``starts_on`` and ``ends_on`` are provided)
 --------------------------------------------------------------------------
 * Exclude assets with a blocked availability window overlapping the range.
-* Exclude assets with a booking in a live status (``LIVE_BOOKING_STATUSES``)
-  overlapping the range.
+* Exclude assets with a booking in one of the live booking statuses
+  (``app.db.models.booking.LIVE_BOOKING_STATUSES``, the same set the exclusion
+  constraint ``ex_bookings_no_live_overlap`` uses) overlapping the range.
   Overlap check: ``starts_at/starts_on <= ends_on AND ends_at/ends_on >= starts_on``
   (both ends inclusive, matching the GiST exclusion semantics).
 
@@ -50,19 +51,12 @@ from sqlalchemy import Select, and_, exists, func, literal_column, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.asset import Asset, AvailabilityWindow, ListingStatus
-from app.db.models.booking import Booking, BookingStatus
+from app.db.models.booking import LIVE_BOOKING_STATUSES, Booking
 from app.db.models.catalogue import CATALOGUE_SEARCH_FUNCTION, CatalogueItem
 from app.db.models.reference import Category, City
 from app.db.models.user import User
 from app.schemas.errors import CityNotLaunchedError, ResourceNotFoundError
 from app.schemas.pagination import MAX_PAGE_LIMIT, decode_cursor, encode_cursor
-
-# Booking statuses that hold inventory. Task 2.3 replaces this with
-# ``LIVE_BOOKING_STATUSES`` from ``app.db.models.booking``.
-LIVE_BOOKING_STATUSES: tuple[BookingStatus, ...] = (
-    BookingStatus.confirmed,
-    BookingStatus.active,
-)
 
 
 @dataclass(frozen=True)
@@ -127,7 +121,7 @@ def _date_overlap_clauses(asset_id_col, starts_on: datetime.date, ends_on: datet
         )
     )
 
-    # Live booking overlapping [starts_on, ends_on] inclusive.
+    # Booking in a live booking status overlapping [starts_on, ends_on] inclusive.
     live_booking = exists(
         select(Booking.id).where(
             Booking.asset_id == asset_id_col,

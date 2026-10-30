@@ -91,7 +91,12 @@ class Seed0002:
 
 
 async def seed_0002(url: str) -> Seed0002:
-    """Seed a database at revision 0002 with raw SQL (no ORM: models track head)."""
+    """Seed a database at revision 0002 with raw SQL (no ORM: models track head).
+
+    Rows: a renter and a vendor, one vendor asset in ``lagos`` with category
+    ``other`` and ``minimum_trust_tier = 1``, kyc rows at old tiers 2 and 1, and a
+    ``pending`` and a ``cancelled`` booking of the asset on the same dates.
+    """
     connection = await asyncpg.connect(url)
     try:
         renter_id = await connection.fetchval(
@@ -110,7 +115,29 @@ async def seed_0002(url: str) -> Seed0002:
             "RETURNING id",
             vendor_id,
         )
-        return Seed0002(renter_id=renter_id, vendor_id=vendor_id, asset_id=asset_id)
+        # Old trust tiers: the renter at old tier 2 (ID + liveness + address), the
+        # vendor at old tier 1 (ID + liveness only).
+        extra = {}
+        for key, user_id, tier in (("kyc_tier2", renter_id, 2), ("kyc_tier1", vendor_id, 1)):
+            extra[key] = await connection.fetchval(
+                "INSERT INTO kyc_profiles (user_id, provider, status, tier, verified_at) "
+                "VALUES ($1, 'seed', 'verified', $2, now()) RETURNING id",
+                user_id,
+                tier,
+            )
+        # Old booking statuses on the same dates (the old constraint ignored both).
+        for key, status in (("booking_pending", "pending"), ("booking_cancelled", "cancelled")):
+            extra[key] = await connection.fetchval(
+                "INSERT INTO bookings (asset_id, renter_id, vendor_id, starts_on, ends_on, "
+                "status, total_rental_fee, deposit_amount) "
+                "VALUES ($1, $2, $3, DATE '2026-11-01', DATE '2026-11-05', $4, "
+                "250000, 150000) RETURNING id",
+                asset_id,
+                renter_id,
+                vendor_id,
+                status,
+            )
+        return Seed0002(renter_id=renter_id, vendor_id=vendor_id, asset_id=asset_id, extra=extra)
     finally:
         await connection.close()
 

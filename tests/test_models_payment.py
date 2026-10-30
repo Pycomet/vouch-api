@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 import app.db.models  # noqa: F401
 from app.db.base import Base
-from app.db.models.payment import DepositStatus, PayoutStatus
+from app.db.models.payment import DepositStatus, PaymentType, PayoutStatus
 
 
 def _table(name: str):
@@ -105,3 +105,9 @@ def test_payment_lifecycle_columns_match_transaction_type() -> None:
     assert "deposit_claimed_at IS NOT NULL" in checks["ck_payments_deposit_status_timestamps"]
     assert "payout_eligible_at IS NOT NULL" in checks["ck_payments_payout_status_timestamps"]
     assert "paid_at IS NOT NULL" in checks["ck_payments_payout_status_timestamps"]
+
+
+def test_payment_type_uses_damage_contribution() -> None:
+    assert PaymentType.damage_contribution.value == "damage_contribution"
+    assert "protection_waiver" not in {member.value for member in PaymentType}
+    assert "damage_contribution" in _table("payments").c["type"].type.enums

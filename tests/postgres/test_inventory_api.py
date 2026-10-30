@@ -245,19 +245,17 @@ def test_live_booking_hides_asset_for_dates(client: TestClient, seed: InventoryS
     assert str(seed.abuja_camera) in _ids(client.get("/api/v1/assets", params=params))
 
 
-@pytest.mark.xfail(
-    raises=asyncpg.InvalidTextRepresentationError,
-    strict=True,
-    reason="'requested' arrives with the booking status rename (Task 2.3); remove this mark then",
-)
 def test_requested_booking_hides_asset_for_dates(client: TestClient, seed: InventorySeed) -> None:
     asyncio.run(_insert_booking(seed, "requested"))
     params = {"starts_on": "2026-11-03", "ends_on": "2026-11-04"}
     assert str(seed.abuja_camera) not in _ids(client.get("/api/v1/assets", params=params))
 
 
-def test_pending_booking_does_not_hide_asset(client: TestClient, seed: InventorySeed) -> None:
-    asyncio.run(_insert_booking(seed, "pending"))
+@pytest.mark.parametrize("status", ["declined", "expired", "cancelled_by_renter", "completed"])
+def test_released_booking_does_not_hide_asset(
+    client: TestClient, seed: InventorySeed, status: str
+) -> None:
+    asyncio.run(_insert_booking(seed, status))
     params = {"starts_on": "2026-11-03", "ends_on": "2026-11-04"}
     assert str(seed.abuja_camera) in _ids(client.get("/api/v1/assets", params=params))
 
@@ -312,8 +310,9 @@ async def _insert_booking(seed: InventorySeed, status: str) -> None:
     await _execute(
         "INSERT INTO bookings "
         "(asset_id, renter_id, vendor_id, starts_on, ends_on, status, "
-        "total_rental_fee, deposit_amount) "
-        "VALUES ($1, $2, $3, $4, $5, $6, 225000, 200000)",
+        "total_rental_fee, deposit_amount, price_snapshot, fulfilment_choice, hold_expires_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, 225000, 200000, '{}', 'pickup', "
+        "now() + interval '4 hours')",
         seed.abuja_camera,
         seed.renter_id,
         seed.vendor_id,

@@ -20,7 +20,7 @@ class PaymentType(enum.StrEnum):
     rental_balance = "rental_balance"
     payout = "payout"
     refund = "refund"
-    protection_waiver = "protection_waiver"
+    damage_contribution = "damage_contribution"
 
 
 class PaymentStatus(enum.StrEnum):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from sqlalchemy import CheckConstraint, Enum, Index, Numeric, SmallInteger
+from sqlalchemy.dialects.postgresql import ExcludeConstraint, dialect
+from sqlalchemy.schema import CreateTable
 
 import app.db.models  # noqa: F401
 from app.db.base import Base
@@ -197,3 +199,12 @@ def test_listing_status_docstring_names_no_city() -> None:
     assert "a launched city" in doc
     assert "lagos" not in doc
     assert "abuja" not in doc
+
+
+def test_blocked_availability_windows_cannot_overlap() -> None:
+    table = Base.metadata.tables["availability_windows"]
+    constraints = [c for c in table.constraints if isinstance(c, ExcludeConstraint)]
+    assert [c.name for c in constraints] == ["ex_availability_windows_no_blocked_overlap"]
+    assert str(constraints[0].where) == "is_blocked"
+    compiled = str(CreateTable(table).compile(dialect=dialect()))
+    assert "daterange(starts_at, ends_at, '[]') WITH &&" in compiled

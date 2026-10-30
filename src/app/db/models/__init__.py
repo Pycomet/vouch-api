@@ -4,6 +4,7 @@ from app.db.models.catalogue import CatalogueItem
 from app.db.models.handover import HandoverRecord
 from app.db.models.payment import Payment
 from app.db.models.reference import Category, City
+from app.db.models.trust import VendorReference
 from app.db.models.user import KYCProfile, User
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "KYCProfile",
     "Payment",
     "User",
+    "VendorReference",
 ]

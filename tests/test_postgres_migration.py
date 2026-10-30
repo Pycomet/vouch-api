@@ -79,9 +79,9 @@ async def _exercise_constraints() -> None:
         await connection.execute(
             "INSERT INTO bookings "
             "(asset_id, renter_id, vendor_id, starts_on, ends_on, status, "
-            "total_rental_fee, deposit_amount) "
+            "total_rental_fee, deposit_amount, price_snapshot, fulfilment_choice) "
             "VALUES ($1, $2, $3, DATE '2026-10-10', DATE '2026-10-12', "
-            "'confirmed', 225000, 200000)",
+            "'confirmed', 225000, 200000, '{}', 'pickup')",
             asset_id,
             renter_id,
             vendor_id,
@@ -91,9 +91,9 @@ async def _exercise_constraints() -> None:
             await connection.execute(
                 "INSERT INTO bookings "
                 "(asset_id, renter_id, vendor_id, starts_on, ends_on, status, "
-                "total_rental_fee, deposit_amount) "
+                "total_rental_fee, deposit_amount, price_snapshot, fulfilment_choice) "
                 "VALUES ($1, $2, $3, DATE '2026-10-12', DATE '2026-10-14', "
-                "'active', 225000, 200000)",
+                "'in_progress', 225000, 200000, '{}', 'pickup')",
                 asset_id,
                 renter_id,
                 vendor_id,

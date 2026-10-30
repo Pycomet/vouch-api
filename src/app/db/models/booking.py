@@ -1,4 +1,9 @@
-"""ORM model for the bookings table."""
+"""ORM model for the bookings table and the booking state machine's status sets.
+
+``LIVE_BOOKING_STATUSES`` is the one definition of "a booking that holds the unit".
+The exclusion constraint ``ex_bookings_no_live_overlap`` and the inventory date
+filter are both built from it.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ExcludeConstraint
+from sqlalchemy.dialects.postgresql import JSONB, ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -27,12 +32,62 @@ from app.db.mixins import TimestampMixin
 
 
 class BookingStatus(StrEnum):
-    pending = "pending"
+    requested = "requested"
+    accepted = "accepted"
+    deposit_paid = "deposit_paid"
     confirmed = "confirmed"
-    active = "active"
+    in_progress = "in_progress"
+    returned = "returned"
     completed = "completed"
-    cancelled = "cancelled"
+    declined = "declined"
+    expired = "expired"
+    cancelled_by_renter = "cancelled_by_renter"
+    cancelled_by_vendor = "cancelled_by_vendor"
     disputed = "disputed"
+    lost = "lost"
+
+
+# A live booking holds the unit for its dates. ``returned`` still holds it until
+# ``completed`` (claim window and turnaround buffer).
+LIVE_BOOKING_STATUSES: frozenset[BookingStatus] = frozenset(
+    {
+        BookingStatus.requested,
+        BookingStatus.accepted,
+        BookingStatus.deposit_paid,
+        BookingStatus.confirmed,
+        BookingStatus.in_progress,
+        BookingStatus.returned,
+    }
+)
+
+# No transition leaves these. ``disputed`` is neither live nor terminal.
+TERMINAL_BOOKING_STATUSES: frozenset[BookingStatus] = frozenset(
+    {
+        BookingStatus.completed,
+        BookingStatus.declined,
+        BookingStatus.expired,
+        BookingStatus.cancelled_by_renter,
+        BookingStatus.cancelled_by_vendor,
+        BookingStatus.lost,
+    }
+)
+
+
+def live_status_predicate() -> str:
+    """SQL ``status IN (...)`` over the live statuses, in declaration order."""
+    values = ", ".join(
+        f"'{status.value}'" for status in BookingStatus if status in LIVE_BOOKING_STATUSES
+    )
+    return f"status IN ({values})"
+
+
+# Claim columns are all empty, or amount, description and claimed_at are all set
+# (evidence is optional).
+CLAIM_COMPLETE = (
+    "(claim_amount IS NULL AND claim_description IS NULL AND claim_evidence IS NULL "
+    "AND claimed_at IS NULL) OR "
+    "(claim_amount IS NOT NULL AND claim_description IS NOT NULL AND claimed_at IS NOT NULL)"
+)
 
 
 class Booking(TimestampMixin, Base):
@@ -58,8 +113,8 @@ class Booking(TimestampMixin, Base):
     ends_on: Mapped[datetime.date] = mapped_column(Date, nullable=False)
     status: Mapped[BookingStatus] = mapped_column(
         Enum(BookingStatus, name="bookingstatus"),
-        default=BookingStatus.pending,
-        server_default=BookingStatus.pending.value,
+        default=BookingStatus.requested,
+        server_default=BookingStatus.requested.value,
         nullable=False,
     )
     total_rental_fee: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -69,16 +124,59 @@ class Booking(TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
     cancellation_reason: Mapped[str | None] = mapped_column(nullable=True)
+    hold_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deposit_due_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    claim_window_ends_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    vendor_approved_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    at_risk_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Rate basis, rates, delivery fee, deposit and commission frozen at request time.
+    price_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    fulfilment_choice: Mapped[str] = mapped_column(Text, nullable=False)
+    claim_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    claim_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claim_evidence: Mapped[list | dict | None] = mapped_column(JSONB, nullable=True)
+    claimed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint("total_rental_fee > 0", name="ck_bookings_total_rental_fee_positive"),
         CheckConstraint("deposit_amount >= 0", name="ck_bookings_deposit_amount_nonnegative"),
         CheckConstraint("starts_on <= ends_on", name="ck_bookings_valid_date_range"),
+        CheckConstraint(
+            "fulfilment_choice IN ('pickup', 'delivery')",
+            name="ck_bookings_fulfilment_choice_valid",
+        ),
+        CheckConstraint("claim_amount > 0", name="ck_bookings_claim_amount_positive"),
+        CheckConstraint(
+            "status <> 'requested' OR hold_expires_at IS NOT NULL",
+            name="ck_bookings_requested_has_hold",
+        ),
+        CheckConstraint(
+            "status <> 'accepted' OR deposit_due_at IS NOT NULL",
+            name="ck_bookings_accepted_has_deposit_due",
+        ),
+        CheckConstraint(
+            "status NOT IN ('returned', 'disputed') OR claim_window_ends_at IS NOT NULL",
+            name="ck_bookings_returned_has_claim_window",
+        ),
+        CheckConstraint(CLAIM_COMPLETE, name="ck_bookings_claim_complete"),
+        CheckConstraint("renter_id <> vendor_id", name="ck_bookings_not_self"),
         ExcludeConstraint(
             ("asset_id", "="),
             (text("daterange(starts_on, ends_on, '[]')"), "&&"),
-            where=text("status IN ('confirmed', 'active')"),
-            name="ex_bookings_no_active_asset_overlap",
+            where=text(live_status_predicate()),
+            name="ex_bookings_no_live_overlap",
             using="gist",
         ),
         Index("ix_bookings_asset_id", "asset_id"),

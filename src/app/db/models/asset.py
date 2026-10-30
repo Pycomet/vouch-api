@@ -22,7 +22,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -224,6 +224,13 @@ class AvailabilityWindow(TimestampMixin, Base):
         CheckConstraint(
             "starts_at <= ends_at",
             name="ck_availability_windows_valid_date_range",
+        ),
+        ExcludeConstraint(
+            ("asset_id", "="),
+            (text("daterange(starts_at, ends_at, '[]')"), "&&"),
+            where=text("is_blocked"),
+            name="ex_availability_windows_no_blocked_overlap",
+            using="gist",
         ),
         Index("ix_availability_windows_asset_id", "asset_id"),
     )
