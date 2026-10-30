@@ -112,13 +112,35 @@ async def _book(
 
 
 async def test_concurrent_requested_overlap_one_wins(parties: Parties) -> None:
-    # Two open transactions on separate connections. The second INSERT runs while
-    # the first is still uncommitted, so it blocks on the first's row and fails
-    # with an exclusion violation once the first commits. (When both INSERTs reach
-    # the constraint check at the same instant, Postgres may instead abort one
-    # with a deadlock error; the booking service must treat that as a conflict.)
+    # Two open transactions on separate connections. The first inserts and stays
+    # open until pg_stat_activity shows the second backend waiting on a Lock (so the
+    # second INSERT provably blocked on the first's uncommitted row); only then does
+    # the first commit, and the second fails with an exclusion violation. (When both
+    # INSERTs reach the constraint check at the same instant, Postgres may instead
+    # abort one with a deadlock error; the booking service must treat that as a
+    # conflict.)
     first_inserted = asyncio.Event()
     order: list[str] = []
+    observed_lock_wait: list[bool] = []
+
+    async def wait_for_blocked_backend(first_pid: int) -> bool:
+        monitor = await asyncpg.connect(asyncpg_url())
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                waiting = await monitor.fetchval(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> $1 "
+                    "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' "
+                    "AND query LIKE 'INSERT INTO bookings%'",
+                    first_pid,
+                )
+                if waiting:
+                    return True
+                await asyncio.sleep(0.05)
+            return False
+        finally:
+            await monitor.close()
 
     async def attempt(name: str, offset: int) -> uuid.UUID:
         connection = await asyncpg.connect(asyncpg_url())
@@ -131,8 +153,8 @@ async def test_concurrent_requested_overlap_one_wins(parties: Parties) -> None:
                 )
                 if name == "first":
                     first_inserted.set()
-                    # Hold the transaction open while the second INSERT is in flight.
-                    await asyncio.sleep(0.3)
+                    pid = await connection.fetchval("SELECT pg_backend_pid()")
+                    observed_lock_wait.append(await wait_for_blocked_backend(pid))
                     order.append("first commits")
                 return booking_id
         except asyncpg.PostgresError:
@@ -150,7 +172,8 @@ async def test_concurrent_requested_overlap_one_wins(parties: Parties) -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], asyncpg.ExclusionViolationError)
     assert "ex_bookings_no_live_overlap" in str(errors[0])
-    # The loser waited for the winner's transaction rather than failing up front.
+    # The loser was seen waiting on a Lock before the winner committed.
+    assert observed_lock_wait == [True]
     assert order == ["first commits", "second failed"]
 
 

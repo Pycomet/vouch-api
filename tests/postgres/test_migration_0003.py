@@ -295,6 +295,26 @@ def test_downgrade_from_seeded_restores_0002_shape(
     }
     assert "protection_waiver" in payment_types
 
+    # assets.name, city and category are NOT NULL again.
+    nullable = {
+        row["column_name"]: row["is_nullable"]
+        for row in _fetch_sync(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_name = 'assets' AND column_name IN ('name', 'city', 'category')"
+        )
+    }
+    assert nullable == {"name": "NO", "city": "NO", "category": "NO"}
+
+    # The 0-2 trust-tier CHECK is back: tier 3 is rejected.
+    with pytest.raises(asyncpg.CheckViolationError):
+        _fetch_sync(
+            "INSERT INTO assets (vendor_id, name, category, daily_rate, deposit_amount, "
+            "city, listing_status, minimum_trust_tier) "
+            "VALUES ($1, 'Tier Three', 'camera', 1000, 1000, 'abuja', 'active', 3) "
+            "RETURNING id",
+            db_at_0002.vendor_id,
+        )
+
 
 async def _insert_post_0003_asset(vendor_id, renter_id=None) -> None:
     connection = await asyncpg.connect(asyncpg_url())
