@@ -46,6 +46,68 @@ def commission_amount(rental: Decimal, commission_rate: Decimal) -> Decimal:
     )
 
 
+def payment_captured_postings(
+    deposit: Decimal,
+    contribution: Decimal,
+    rental: Decimal,
+    delivery_fee: Decimal,
+    commission: Decimal,
+) -> list[Posting]:
+    """The one upfront payment (A14): everything the renter owes, in one group.
+
+    dr platform_cash D+C+R+F / cr renter_deposit_liability D / cr protection_pool C
+    / cr vendor_payable R+F-K / cr platform_revenue K.
+    """
+    d = _amount(deposit, "deposit")
+    c = _amount(contribution, "contribution")
+    r = _amount(rental, "rental")
+    f = _amount(delivery_fee, "delivery_fee")
+    k = _amount(commission, "commission")
+    if k > r + f:
+        raise ValueError("commission must not exceed rental plus delivery fee")
+    return _group(
+        (LedgerAccount.platform_cash, Direction.dr, d + c + r + f),
+        (LedgerAccount.renter_deposit_liability, Direction.cr, d),
+        (LedgerAccount.protection_pool, Direction.cr, c),
+        (LedgerAccount.vendor_payable, Direction.cr, r + f - k),
+        (LedgerAccount.platform_revenue, Direction.cr, k),
+    )
+
+
+def cancellation_fee_amount(rental: Decimal, fee_rate: Decimal) -> Decimal:
+    """The renter cancellation fee (A13): rental x fee rate, to the cent, half up."""
+    return (_amount(rental, "rental") * _amount(fee_rate, "fee_rate")).quantize(
+        CENT, rounding=ROUND_HALF_UP
+    )
+
+
+def cancellation_fee_split(fee: Decimal, vendor_share: Decimal) -> tuple[Decimal, Decimal]:
+    """``(vendor_part, platform_part)`` of the fee; the parts always sum to ``fee``.
+
+    vendor_part = fee x vendor_share, to the cent, half up; Vouch gets the rest.
+    """
+    total = _amount(fee, "fee")
+    vendor_part = (total * _amount(vendor_share, "vendor_share")).quantize(
+        CENT, rounding=ROUND_HALF_UP
+    )
+    return vendor_part, total - vendor_part
+
+
+def cancellation_fee_postings(vendor_part: Decimal, platform_part: Decimal) -> list[Posting]:
+    """The fee kept from a renter's refund (R15).
+
+    dr platform_cash fee / cr vendor_payable vendor_part / cr platform_revenue
+    platform_part. Posted after the capture group has been reversed in full.
+    """
+    v = _amount(vendor_part, "vendor_part")
+    p = _amount(platform_part, "platform_part")
+    return _group(
+        (LedgerAccount.platform_cash, Direction.dr, v + p),
+        (LedgerAccount.vendor_payable, Direction.cr, v),
+        (LedgerAccount.platform_revenue, Direction.cr, p),
+    )
+
+
 def deposit_captured_postings(deposit: Decimal, contribution: Decimal) -> list[Posting]:
     """dr platform_cash D+C / cr renter_deposit_liability D / cr protection_pool C."""
     d = _amount(deposit, "deposit")

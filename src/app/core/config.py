@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # Placeholders pending legal advice.
     commission_rate: Decimal = Decimal("0.15")
     damage_contribution_rate: Decimal = Decimal("0.05")
+    # Renter cancellation of a paid booking (A13), also placeholders pending legal
+    # advice: the fee is this fraction of the rental, and the vendor's share of the
+    # fee is the second fraction (Vouch keeps the rest). Frozen into price_snapshot.
+    renter_cancellation_fee_rate: Decimal = Decimal("0.10")
+    cancellation_fee_vendor_share: Decimal = Decimal("0.50")
     business_timezone: str = "Africa/Lagos"
 
     @field_validator("launched_cities", mode="before")
@@ -66,7 +71,12 @@ class Settings(BaseSettings):
                 raise ValueError(f"invalid city slug: {city!r}")
         return value
 
-    @field_validator("commission_rate", "damage_contribution_rate")
+    @field_validator(
+        "commission_rate",
+        "damage_contribution_rate",
+        "renter_cancellation_fee_rate",
+        "cancellation_fee_vendor_share",
+    )
     @classmethod
     def validate_rate(cls, value: Decimal) -> Decimal:
         if not Decimal(0) <= value < Decimal(1):

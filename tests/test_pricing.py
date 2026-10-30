@@ -39,6 +39,8 @@ def test_price_daily() -> None:
     assert snapshot["deposit"] == "150000.00"
     assert snapshot["commission_rate"] == str(SETTINGS.commission_rate)
     assert snapshot["damage_contribution"] == "0.00"
+    assert snapshot["cancellation_fee_rate"] == "0.10"
+    assert snapshot["cancellation_fee_vendor_share"] == "0.50"
     assert snapshot["currency"] == "NGN"
     assert all(isinstance(value, str) for value in snapshot.values())
 
@@ -105,3 +107,16 @@ def test_delivery_fee_defaults_to_zero() -> None:
     snapshot = price_snapshot(asset, MONDAY, MONDAY, "delivery", False, SETTINGS)
 
     assert snapshot["delivery_fee"] == "0.00"
+
+
+def test_cancellation_fee_rates_frozen_from_settings() -> None:
+    settings = Settings(
+        _env_file=None,
+        renter_cancellation_fee_rate=Decimal("0.125"),
+        cancellation_fee_vendor_share=Decimal("0.4"),
+    )
+
+    snapshot = price_snapshot(_asset(), MONDAY, MONDAY, "pickup", False, settings)
+
+    assert snapshot["cancellation_fee_rate"] == "0.125"
+    assert snapshot["cancellation_fee_vendor_share"] == "0.4"

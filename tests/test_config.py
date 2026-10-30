@@ -71,6 +71,10 @@ def test_rates_are_decimal() -> None:
     assert settings.damage_contribution_rate == Decimal("0.05")
     assert isinstance(settings.commission_rate, Decimal)
     assert isinstance(settings.damage_contribution_rate, Decimal)
+    assert settings.renter_cancellation_fee_rate == Decimal("0.10")
+    assert settings.cancellation_fee_vendor_share == Decimal("0.50")
+    assert isinstance(settings.renter_cancellation_fee_rate, Decimal)
+    assert isinstance(settings.cancellation_fee_vendor_share, Decimal)
     assert settings.business_timezone == "Africa/Lagos"
 
 
@@ -80,6 +84,10 @@ def test_rates_must_be_between_zero_and_one(value: str) -> None:
         Settings(_env_file=None, commission_rate=Decimal(value))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, damage_contribution_rate=Decimal(value))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, renter_cancellation_fee_rate=Decimal(value))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, cancellation_fee_vendor_share=Decimal(value))
 
 
 def test_business_timezone_is_a_real_zone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,3 +111,13 @@ def test_rate_env_parsed_as_decimal(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert isinstance(rate, Decimal)
     assert rate == Decimal("0.12")
+
+
+def test_cancellation_fee_env_parsed_as_decimal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOUCH_RENTER_CANCELLATION_FEE_RATE", "0.2")
+    monkeypatch.setenv("VOUCH_CANCELLATION_FEE_VENDOR_SHARE", "0.25")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.renter_cancellation_fee_rate == Decimal("0.2")
+    assert settings.cancellation_fee_vendor_share == Decimal("0.25")

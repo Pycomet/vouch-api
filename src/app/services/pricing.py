@@ -11,8 +11,10 @@ Rate basis, in order:
 Days are inclusive of both ends. ``rental_total`` is the rental alone; the
 delivery fee (from ``assets.fulfilment.delivery_fee``, default 0, charged only
 for delivery) and the damage contribution (``damage_contribution_rate`` of the
-rental, when chosen) are separate keys. Every value is a string, money as
-``"150000.00"`` (amendment A8 placeholders come from settings).
+rental, when chosen) are separate keys. The rates are frozen too:
+``commission_rate``, and the renter cancellation fee's ``cancellation_fee_rate``
+and ``cancellation_fee_vendor_share`` (A13). Every value is a string, money as
+``"150000.00"`` (amendment A8/A13 placeholders come from settings).
 """
 
 from __future__ import annotations
@@ -85,6 +87,8 @@ def price_snapshot(
         "deposit": str(money(asset.deposit_amount)),
         "commission_rate": str(settings.commission_rate),
         "damage_contribution": str(contribution),
+        "cancellation_fee_rate": str(settings.renter_cancellation_fee_rate),
+        "cancellation_fee_vendor_share": str(settings.cancellation_fee_vendor_share),
         "currency": CURRENCY,
     }
     return {key: value for key, value in snapshot.items() if value is not None}
