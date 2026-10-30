@@ -312,7 +312,7 @@ async def test_timer_flags_at_risk_once(session_factory) -> None:
 async def test_timer_at_risk_boundary(session_factory) -> None:
     ends_on = date(2026, 10, 30)
     zone = get_settings().business_zone
-    cutoff = start_of_business_day(ends_on + timedelta(days=1), zone) + timedelta(hours=48)
+    cutoff = start_of_business_day(ends_on + timedelta(days=1), zone)  # A15: no wait
     overdue = await _make(
         session_factory,
         BookingStatus.in_progress,
@@ -331,12 +331,12 @@ async def test_timer_at_risk_boundary(session_factory) -> None:
 
 
 async def test_timer_does_not_flag_returned_on_time(session_factory) -> None:
-    # A booking that is still in progress but not yet past its return day + 48h.
+    # A booking still in progress on its last day (LATER is 2026-11-04 10:00 UTC).
     current = await _make(
         session_factory,
         BookingStatus.in_progress,
-        starts_on=date(2026, 11, 1),
-        ends_on=date(2026, 11, 3),
+        starts_on=date(2026, 11, 2),
+        ends_on=date(2026, 11, 4),
     )
 
     report = await _run(session_factory, LATER)

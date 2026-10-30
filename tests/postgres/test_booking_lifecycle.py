@@ -63,7 +63,7 @@ COMMISSION = D("22500.00")  # 15% of the rental (not of the delivery fee)
 TOTAL = DEPOSIT + CONTRIBUTION + RENTAL + DELIVERY  # the one upfront payment (A14)
 VENDOR_SHARE = RENTAL + DELIVERY - COMMISSION
 START = date(2027, 1, 4)
-# Ends 2026-10-29, so at risk from 2026-10-31 23:00 UTC: before DEFAULT_NOW.
+# Ends 2026-10-29, so at risk from 2026-10-29 23:00 UTC: before DEFAULT_NOW.
 OVERDUE_START = date(2026, 10, 27)
 
 
@@ -767,9 +767,9 @@ async def test_at_risk_keeps_an_existing_restriction(db_session, clock, notifier
 
 
 def _at_risk_from(booking: Booking) -> datetime:
-    """start_of_business_day(ends_on + 1 day) + 48h: the first at-risk instant."""
+    """start_of_business_day(ends_on + 1 day): the first at-risk instant (A15)."""
     zone = get_settings().business_zone
-    return start_of_business_day(booking.ends_on + timedelta(days=1), zone) + timedelta(hours=48)
+    return start_of_business_day(booking.ends_on + timedelta(days=1), zone)
 
 
 async def test_flag_at_risk_before_the_cutoff_is_invalid(db_session, notifier) -> None:
@@ -801,6 +801,36 @@ async def test_flag_at_risk_at_the_cutoff_flags(db_session, notifier) -> None:
 
     assert result.at_risk_at == at.now()
     assert notifier.templates() == ["ops.at_risk"]
+
+
+@pytest.mark.parametrize(
+    ("instant", "allowed"),
+    [
+        (datetime(2027, 1, 6, 22, 59, 59, tzinfo=UTC), False),  # 23:59:59 WAT, last day
+        (datetime(2027, 1, 6, 23, 0, 0, tzinfo=UTC), True),  # 00:00 WAT on the 7th
+    ],
+)
+async def test_at_risk_at_end_of_last_day(db_session, notifier, instant, allowed) -> None:
+    """ends_on 2027-01-06: at risk from Africa/Lagos midnight, 23:00Z on the 6th."""
+    assert get_settings().business_timezone == "Africa/Lagos"
+    booking = await _paid(db_session, BookingStatus.in_progress, ends_on=date(2027, 1, 6))
+
+    async def flag() -> Booking:
+        return await _transition(
+            db_session,
+            booking,
+            Actor.system(),
+            BookingEvent.flag_at_risk,
+            FrozenClock(instant),
+            notifier,
+        )
+
+    if allowed:
+        assert (await flag()).at_risk_at == instant
+    else:
+        with pytest.raises(InvalidTransition):
+            await flag()
+        assert booking.at_risk_at is None
 
 
 async def test_vendor_cannot_flag_at_risk(db_session, clock, notifier) -> None:
