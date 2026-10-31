@@ -5,18 +5,23 @@ absent (the same pattern as ``tests/test_postgres_migration.py``).
 
 Fixtures
 --------
+``head_db`` (session scope)
+    Rebuilds the schema at ``head`` once per test session (see "One fresh head
+    schema per session" below for how later tests reuse or rebuild it).
 ``migrated_db``
-    Drops the schema to ``base`` and upgrades to ``head``. Yields the asyncpg URL.
+    A fresh schema at ``head`` (rebuilt only if an earlier test left it stale) that
+    the test may commit to or move. Yields the asyncpg URL.
 ``db_at_0002``
-    Drops the schema to ``base``, upgrades to ``0002_listing_publication_fields`` and
-    seeds it with raw SQL (see :func:`seed_0002`). Yields a :class:`Seed0002` with the
-    ids of the seeded rows. Later tasks extend :func:`seed_0002` and ``Seed0002``.
+    Drops the schema, upgrades to ``0002_listing_publication_fields`` and seeds it
+    with raw SQL (see :func:`seed_0002`). Yields a :class:`Seed0002` with the ids of
+    the seeded rows. Later tasks extend :func:`seed_0002` and ``Seed0002``.
 ``conn``
     An asyncpg connection to the test database. Request it after ``migrated_db`` or
     ``db_at_0002`` so it sees the prepared schema.
 ``db_session``
-    An ``AsyncSession`` on a fresh ``head`` schema, inside one outer transaction
-    that is rolled back at teardown (the append-only tables cannot be truncated).
+    An ``AsyncSession`` on the session's fresh ``head`` schema (no migration per
+    test), inside one outer transaction that is rolled back at teardown (the
+    append-only tables cannot be truncated).
     ``SET CONSTRAINTS ALL IMMEDIATE`` runs first, so the deferred ledger balance
     trigger fires at the end of each INSERT statement instead of at a COMMIT that
     never comes. ``session.commit()`` inside a test only releases a SAVEPOINT.
@@ -63,24 +68,94 @@ def alembic_config() -> Config:
     return config
 
 
-@pytest.fixture
-def alembic_cfg(monkeypatch) -> Iterator[Config]:
-    """Alembic config pointed at the test database (skips without one)."""
+# ---------------------------------------------------------------------------
+# One fresh head schema per session (R17)
+# ---------------------------------------------------------------------------
+#
+# ``_HEAD["fresh"]`` is True while the database is a just-migrated ``head`` schema
+# holding nothing but the migration's own seed rows. Rolled-back ``db_session``
+# work keeps it fresh. Anything that may commit or move the schema (every
+# ``alembic_cfg`` or ``conn`` user, so ``migrated_db``, ``db_at_0002`` and
+# ``session_factory`` too) marks it stale at teardown, and the next fixture that
+# needs a fresh schema rebuilds it with :func:`rebuild_head`. Tests run file by
+# file, so a stretch of ``db_session`` tests costs one rebuild at most.
+
+_HEAD = {"fresh": False}
+
+# Tables a fresh schema leaves empty; ``db_session`` refuses to start otherwise.
+_EMPTY_WHEN_FRESH = ("users", "assets", "bookings", "payments", "ledger_entries", "audit_events")
+
+
+async def _drop_public_schema(url: str) -> None:
+    connection = await asyncpg.connect(url)
+    try:
+        await connection.execute("DROP SCHEMA public CASCADE")
+        await connection.execute("CREATE SCHEMA public")
+    finally:
+        await connection.close()
+
+
+def rebuild_head(config: Config) -> None:
+    """Drop every object and migrate an empty database to ``head``.
+
+    Dropping the schema is the only way to remove committed rows from the
+    append-only tables (their triggers refuse UPDATE, DELETE and TRUNCATE), and it
+    is faster than ``downgrade base``.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("VOUCH_DATABASE_URL", DATABASE_URL)
+        get_settings.cache_clear()
+        try:
+            asyncio.run(_drop_public_schema(asyncpg_url()))
+            command.upgrade(config, "head")
+        finally:
+            get_settings.cache_clear()
+    _HEAD["fresh"] = True
+
+
+def _mark_stale() -> None:
+    _HEAD["fresh"] = False
+
+
+@pytest.fixture(scope="session")
+def head_db() -> Config:
+    """The session's database, rebuilt at ``head`` once, when the first test needs it."""
     if not DATABASE_URL:
         pytest.skip("VOUCH_TEST_DATABASE_URL is required for live PostgreSQL checks")
+    config = alembic_config()
+    rebuild_head(config)
+    return config
+
+
+@pytest.fixture
+def fresh_head(head_db: Config) -> str:
+    """A fresh ``head`` schema, rebuilt only if an earlier test left it stale."""
+    if not _HEAD["fresh"]:
+        rebuild_head(head_db)
+    return asyncpg_url()
+
+
+@pytest.fixture
+def alembic_cfg(head_db: Config, monkeypatch) -> Iterator[Config]:
+    """Alembic config pointed at the test database (skips without one).
+
+    The test may commit or move the schema, so the schema counts as stale after it.
+    """
     monkeypatch.setenv("VOUCH_DATABASE_URL", DATABASE_URL)
     get_settings.cache_clear()
     try:
         yield alembic_config()
     finally:
+        _mark_stale()
         get_settings.cache_clear()
 
 
 @pytest.fixture
 def migrated_db(alembic_cfg: Config) -> Iterator[str]:
-    """A fresh schema at ``head``."""
-    command.downgrade(alembic_cfg, "base")
-    command.upgrade(alembic_cfg, "head")
+    """A fresh schema at ``head`` that the test may commit to or move."""
+    if not _HEAD["fresh"]:
+        rebuild_head(alembic_cfg)
+    _mark_stale()
     try:
         yield asyncpg_url()
     finally:
@@ -156,36 +231,41 @@ async def seed_0002(url: str) -> Seed0002:
 
 @pytest.fixture
 def db_at_0002(alembic_cfg: Config) -> Iterator[Seed0002]:
-    """A fresh schema at 0002 holding the :func:`seed_0002` rows."""
-    command.downgrade(alembic_cfg, "base")
+    """A fresh schema at 0002 holding the :func:`seed_0002` rows; ``head`` after."""
+    asyncio.run(_drop_public_schema(asyncpg_url()))
     command.upgrade(alembic_cfg, REVISION_0002)
     try:
         yield asyncio.run(seed_0002(asyncpg_url()))
     finally:
-        command.downgrade(alembic_cfg, "base")
         command.upgrade(alembic_cfg, "head")
 
 
 @pytest.fixture
 async def conn() -> AsyncIterator[asyncpg.Connection]:
-    """An asyncpg connection to the test database."""
+    """An asyncpg connection to the test database (autocommit, so stale after)."""
     if not DATABASE_URL:
         pytest.skip("VOUCH_TEST_DATABASE_URL is required for live PostgreSQL checks")
     connection = await asyncpg.connect(asyncpg_url())
     try:
         yield connection
     finally:
+        _mark_stale()
         await connection.close()
 
 
 @pytest.fixture
-async def db_session(migrated_db: str) -> AsyncIterator[AsyncSession]:
-    """A session whose work is rolled back at teardown, with constraints immediate."""
+async def db_session(fresh_head: str) -> AsyncIterator[AsyncSession]:
+    """A session whose work is rolled back at teardown, with constraints immediate.
+
+    It runs on the session's fresh ``head`` schema; rolling back keeps it fresh,
+    so the next ``db_session`` test does not migrate again.
+    """
     assert DATABASE_URL is not None
     engine = create_async_engine(DATABASE_URL)
     try:
         async with engine.connect() as connection:
             outer = await connection.begin()
+            await _assert_fresh(connection)
             await connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
             session = AsyncSession(
                 bind=connection,
@@ -202,9 +282,27 @@ async def db_session(migrated_db: str) -> AsyncIterator[AsyncSession]:
         await engine.dispose()
 
 
+async def _assert_fresh(connection) -> None:
+    """Fail loudly if committed rows leaked into the shared schema.
+
+    A leak means some test committed without going through a fixture that marks
+    the schema stale (``alembic_cfg``, ``conn``, ``migrated_db``, ``session_factory``).
+    """
+    checks = " UNION ALL ".join(
+        f"SELECT '{table}' WHERE EXISTS (SELECT 1 FROM {table})" for table in _EMPTY_WHEN_FRESH
+    )
+    leaked = (await connection.execute(text(checks))).scalars().all()
+    if leaked:
+        _mark_stale()
+        pytest.fail(
+            f"committed rows leaked into the shared test schema: {', '.join(leaked)}; "
+            "use migrated_db or session_factory for tests that commit"
+        )
+
+
 @pytest.fixture
 async def session_factory(migrated_db: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Sessions that really commit, on a fresh ``head`` schema."""
+    """Sessions that really commit, on a fresh ``head`` schema (stale after)."""
     assert DATABASE_URL is not None
     engine = create_async_engine(DATABASE_URL)
     try:
