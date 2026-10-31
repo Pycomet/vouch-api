@@ -15,8 +15,8 @@ Error codes are stable machine-readable strings.  HTTP status codes follow the
 contract defined in ``docs/API_CONTRACT.md``.
 
 Only the error envelope, minimal exception classes, and exception handlers are
-defined here.  Auth-specific (401/403) and write-command-specific (409
-idempotency_key_reused) codes are added alongside the features that produce them.
+defined here.  Write-command-specific codes (409 idempotency_key_reused) are added
+alongside the features that produce them.
 """
 
 from __future__ import annotations
@@ -50,6 +50,8 @@ class VouchAPIError(Exception):
     status_code: int = 500
     code: str = "internal_error"
     message: str = "An unexpected error occurred."
+    # Extra response headers (e.g. ``WWW-Authenticate`` on a 401).
+    headers: dict[str, str] = {}
 
     def __init__(self, message: str | None = None, details: dict | None = None) -> None:
         super().__init__(message or self.message)
@@ -75,6 +77,30 @@ class ResourceNotFoundError(VouchAPIError):
     status_code = 404
     code = "resource_not_found"
     message = "The requested resource was not found."
+
+
+class UnauthenticatedError(VouchAPIError):
+    """Raised when the bearer token is missing, expired, tampered or malformed.
+
+    Returns 401 ``unauthenticated`` with ``WWW-Authenticate: Bearer``. The message
+    never says which check failed.
+    """
+
+    status_code = 401
+    code = "unauthenticated"
+    message = "Authentication is required."
+    headers = {"WWW-Authenticate": "Bearer"}
+
+
+class ForbiddenError(VouchAPIError):
+    """Raised when an authenticated caller's role may not use this route.
+
+    Returns 403 ``forbidden``.
+    """
+
+    status_code = 403
+    code = "forbidden"
+    message = "You do not have permission to do this."
 
 
 class InvalidRequestError(VouchAPIError):
