@@ -27,7 +27,7 @@ from pydantic import (
 
 from app.services.pricing import money
 
-MONEY_PATTERN = r"^\d{1,10}(\.\d{1,2})?$"
+MONEY_PATTERN = r"^[0-9]{1,10}(\.[0-9]{1,2})?$"
 _MONEY = re.compile(MONEY_PATTERN)
 
 
