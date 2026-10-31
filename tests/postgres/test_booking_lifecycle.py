@@ -1607,3 +1607,114 @@ async def test_happy_path_ledger_at_every_step(db_session, clock, notifier) -> N
         ("in_progress", "returned"),
         ("returned", "completed"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# request_id (R16): every audit row a transition writes carries the caller's id
+# ---------------------------------------------------------------------------
+
+
+async def _last_audit_id(session: AsyncSession) -> int:
+    return await session.scalar(select(func.coalesce(func.max(AuditEvent.id), 0)))
+
+
+async def _audits_after(session: AsyncSession, last_id: int) -> list[AuditEvent]:
+    result = await session.execute(
+        select(AuditEvent).where(AuditEvent.id > last_id).order_by(AuditEvent.id)
+    )
+    return list(result.scalars())
+
+
+async def _transition_as_request(session, booking, actor, event, clock, notifier, payload):
+    return await transition(
+        session,
+        booking.id,
+        actor,
+        event,
+        payload,
+        clock=clock,
+        notifier=notifier,
+        settings=get_settings(),
+        request_id="req_test",
+    )
+
+
+async def test_mark_lost_writes_request_id_on_every_audit_row(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.in_progress)
+    admin = await admin_actor(db_session)
+    last_id = await _last_audit_id(db_session)
+
+    await _transition_as_request(
+        db_session,
+        booking,
+        admin,
+        BookingEvent.mark_lost,
+        FrozenClock(_lost_from(booking)),
+        notifier,
+        {"reason": "Unreachable"},
+    )
+
+    rows = await _audits_after(db_session, last_id)
+    assert [row.action for row in rows] == [
+        "deposit.forfeited",
+        "user.restricted",
+        "asset.paused",
+        "booking.lost",
+    ]
+    assert {row.request_id for row in rows} == {"req_test"}
+
+
+async def test_payment_captured_writes_request_id_on_both_rows(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    payment = await create_payment(db_session, booking, type=PaymentType.booking, amount=TOTAL)
+    last_id = await _last_audit_id(db_session)
+
+    await _transition_as_request(
+        db_session,
+        booking,
+        Actor.system(),
+        BookingEvent.payment_captured,
+        clock,
+        notifier,
+        {"amount": TOTAL, "payment_id": payment.id},
+    )
+
+    rows = await _audits_after(db_session, last_id)
+    assert [row.action for row in rows] == ["booking.deposit_paid", "booking.confirmed"]
+    assert {row.request_id for row in rows} == {"req_test"}
+
+
+async def test_vendor_cancel_writes_request_id_on_the_penalty_row(
+    db_session, clock, notifier
+) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    last_id = await _last_audit_id(db_session)
+
+    await _transition_as_request(
+        db_session,
+        booking,
+        vendor_actor(booking),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        {"reason": "Lens is broken"},
+    )
+
+    rows = await _audits_after(db_session, last_id)
+    assert [row.action for row in rows] == [
+        "vendor.reliability_penalty",
+        "booking.cancelled_by_vendor",
+    ]
+    assert {row.request_id for row in rows} == {"req_test"}
+
+
+async def test_transition_without_request_id_stores_none(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    last_id = await _last_audit_id(db_session)
+
+    await _transition(
+        db_session, booking, renter_actor(booking), BookingEvent.cancel, clock, notifier
+    )
+
+    rows = await _audits_after(db_session, last_id)
+    assert [row.request_id for row in rows] == [None]

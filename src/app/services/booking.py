@@ -147,6 +147,8 @@ class _Context:
     clock: Clock
     notifier: Notifier
     settings: Settings
+    # The caller's request id (R16), written on every audit row of this transition.
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,8 +236,12 @@ async def transition(
     clock: Clock,
     notifier: Notifier,
     settings: Settings,
+    request_id: str | None = None,
 ) -> Booking:
     """Apply ``event`` to the booking as ``actor``; flush, never commit.
+
+    ``request_id`` (the HTTP request's id, R16) is stored on every audit row the
+    transition writes, the handlers' own rows included.
 
     Raises :class:`ResourceNotFoundError` for an unknown booking,
     :class:`InvalidTransition` when the table has no such row or the actor may not
@@ -267,6 +273,7 @@ async def transition(
         clock=clock,
         notifier=notifier,
         settings=settings,
+        request_id=request_id,
     )
     outcome = await rule.handler(context)
 
@@ -291,6 +298,7 @@ async def transition(
         before=before,
         after=after,
         reason=outcome.reason,
+        request_id=request_id,
     )
     for notice in outcome.notices:
         await notifier.send(notice.user_id, notice.template, notice.data)
@@ -539,6 +547,7 @@ async def _payment_captured(ctx: _Context) -> _Outcome:
             "payment_id": payment_id,
             "commission": amounts.commission,
         },
+        request_id=ctx.request_id,
     )
     await _post(
         ctx,
@@ -600,6 +609,7 @@ async def _close_cancelled(ctx: _Context, status: BookingStatus, reason: str | N
             before=None,
             after={"booking_id": booking.id, "status": status},
             reason=reason,
+            request_id=ctx.request_id,
         )
 
 
@@ -821,6 +831,7 @@ async def _deposit_audit(ctx: _Context, action: str, **after: Any) -> None:
         before=None,
         after=after,
         reason=_reason(ctx.payload),
+        request_id=ctx.request_id,
     )
 
 
@@ -914,6 +925,7 @@ async def _restrict_renter(ctx: _Context, reason: str, *, override: bool) -> Non
             "booking_id": ctx.booking.id,
         },
         reason=_reason(ctx.payload),
+        request_id=ctx.request_id,
     )
 
 
@@ -986,6 +998,7 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
             before={"listing_status": previous},
             after={"listing_status": ListingStatus.paused, "booking_id": booking.id},
             reason=reason,
+            request_id=ctx.request_id,
         )
 
     booking.status = BookingStatus.lost
@@ -1053,8 +1066,12 @@ async def request_booking(
     clock: Clock,
     notifier: Notifier,
     settings: Settings,
+    request_id: str | None = None,
 ) -> Booking:
-    """Create a ``requested`` booking holding the unit for four hours."""
+    """Create a ``requested`` booking holding the unit for four hours.
+
+    ``request_id`` (the HTTP request's id, R16) is stored on the audit row.
+    """
     if renter.role != ActorRole.renter:
         raise InvalidTransition(None, REQUEST_EVENT)
 
@@ -1130,6 +1147,7 @@ async def request_booking(
             "deposit_amount": booking.deposit_amount,
             "price_snapshot": booking.price_snapshot,
         },
+        request_id=request_id,
     )
     notice = _notice(
         booking, booking.vendor_id, "booking.requested", hold_expires_at=booking.hold_expires_at

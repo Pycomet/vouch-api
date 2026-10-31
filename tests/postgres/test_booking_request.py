@@ -123,6 +123,16 @@ async def _audits(session: AsyncSession, booking_id: uuid.UUID) -> list[AuditEve
 # ---------------------------------------------------------------------------
 
 
+async def test_request_writes_request_id_on_its_audit_row(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session, minimum_trust_tier=1)
+
+    booking = await _request(db_session, renter, asset, clock, notifier, request_id="req_test")
+
+    rows = await _audits(db_session, booking.id)
+    assert [(row.action, row.request_id) for row in rows] == [("booking.requested", "req_test")]
+
+
 async def test_request_sets_hold_and_snapshot(db_session, clock, notifier) -> None:
     renter = await create_user(db_session, kyc_verified=True)
     asset = await create_asset(
