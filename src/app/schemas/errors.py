@@ -21,6 +21,10 @@ alongside the features that produce them.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import ClassVar
+
 from pydantic import BaseModel, Field
 
 
@@ -50,8 +54,8 @@ class VouchAPIError(Exception):
     status_code: int = 500
     code: str = "internal_error"
     message: str = "An unexpected error occurred."
-    # Extra response headers (e.g. ``WWW-Authenticate`` on a 401).
-    headers: dict[str, str] = {}
+    # Extra response headers (e.g. ``WWW-Authenticate`` on a 401); read-only.
+    headers: ClassVar[Mapping[str, str]] = MappingProxyType({})
 
     def __init__(self, message: str | None = None, details: dict | None = None) -> None:
         super().__init__(message or self.message)
@@ -89,7 +93,7 @@ class UnauthenticatedError(VouchAPIError):
     status_code = 401
     code = "unauthenticated"
     message = "Authentication is required."
-    headers = {"WWW-Authenticate": "Bearer"}
+    headers: ClassVar[Mapping[str, str]] = MappingProxyType({"WWW-Authenticate": "Bearer"})
 
 
 class ForbiddenError(VouchAPIError):

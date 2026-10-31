@@ -20,7 +20,7 @@ from app.core.config import Environment, Settings
 from app.core.security import decode_token, issue_token
 from app.db.models import ActorRole
 from app.main import create_app
-from app.schemas.errors import UnauthenticatedError
+from app.schemas.errors import ForbiddenError, UnauthenticatedError, VouchAPIError
 from app.services.audit import Actor
 from tests.helpers.auth import bearer
 
@@ -198,6 +198,37 @@ def test_production_accepts_a_real_secret() -> None:
     assert settings.is_production
 
 
+@pytest.mark.parametrize(
+    "secret",
+    ["", "   ", "short", "x" * 31, " " + "x" * 30 + " "],
+    ids=["empty", "blank", "short", "31", "padded"],
+)
+def test_production_refuses_a_weak_secret(secret: str) -> None:
+    with pytest.raises(ValidationError, match="at least 32 bytes"):
+        Settings(_env_file=None, environment=Environment.PRODUCTION, jwt_secret=SecretStr(secret))
+
+
+def test_production_accepts_a_32_byte_secret() -> None:
+    settings = Settings(
+        _env_file=None, environment=Environment.PRODUCTION, jwt_secret=SecretStr("k" * 32)
+    )
+
+    assert settings.jwt_secret.get_secret_value() == "k" * 32
+
+
+def test_production_refuses_an_empty_secret_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An empty env value is ignored (env_ignore_empty), so the placeholder applies.
+    monkeypatch.setenv("VOUCH_JWT_SECRET", "")
+
+    with pytest.raises(ValidationError, match="jwt_secret"):
+        Settings(_env_file=None, environment=Environment.PRODUCTION)
+
+
+@pytest.mark.parametrize("secret", ["", "short"])
+def test_development_does_not_check_secret_length(secret: str) -> None:
+    assert Settings(_env_file=None, jwt_secret=SecretStr(secret)).jwt_secret is not None
+
+
 def test_jwt_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VOUCH_JWT_SECRET", "from-the-environment")
     monkeypatch.setenv("VOUCH_JWT_TTL_MINUTES", "15")
@@ -289,6 +320,14 @@ def test_allowed_role_200(auth_client: TestClient, auth_settings: Settings, role
 
 def test_role_route_without_token_401(auth_client: TestClient) -> None:
     _assert_error(auth_client.get("/test-auth/vendor-only"), 401, "unauthenticated")
+
+
+@pytest.mark.parametrize("error", [VouchAPIError, UnauthenticatedError, ForbiddenError])
+def test_error_headers_are_read_only(error: type[VouchAPIError]) -> None:
+    with pytest.raises(TypeError):
+        error.headers["X-Leak"] = "1"  # type: ignore[index]
+
+    assert "X-Leak" not in VouchAPIError.headers
 
 
 def test_require_role_needs_a_role() -> None:

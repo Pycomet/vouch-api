@@ -15,6 +15,8 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 _CITY_SLUG = re.compile(r"^[a-z][a-z-]*$")
 # The ``.env.example`` value; never acceptable in production.
 JWT_SECRET_PLACEHOLDER = "change-me"
+# HS256 keys shorter than the hash output (32 bytes) are refused in production.
+JWT_SECRET_MIN_BYTES = 32
 
 
 class Environment(StrEnum):
@@ -101,11 +103,14 @@ class Settings(BaseSettings):
     def enforce_production_safety(self) -> Settings:
         if self.environment == Environment.PRODUCTION and self.debug:
             raise ValueError("debug must be disabled in production")
-        if (
-            self.environment == Environment.PRODUCTION
-            and self.jwt_secret.get_secret_value() == JWT_SECRET_PLACEHOLDER
-        ):
-            raise ValueError("jwt_secret must be set in production")
+        if self.environment == Environment.PRODUCTION:
+            secret = self.jwt_secret.get_secret_value()
+            if secret == JWT_SECRET_PLACEHOLDER:
+                raise ValueError("jwt_secret must be set in production")
+            if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
+                raise ValueError(
+                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in production"
+                )
         return self
 
     @property
