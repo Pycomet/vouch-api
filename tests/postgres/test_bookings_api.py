@@ -21,6 +21,7 @@ from decimal import Decimal
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +66,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 D = Decimal
+# One Settings for the app and the tokens, with a secret long enough for HS256.
+SETTINGS = get_settings().model_copy(
+    update={"jwt_secret": SecretStr("test-secret-that-is-long-enough-for-hs256")}
+)
 API = "/api/v1/bookings"
 DEPOSIT = D("150000.00")
 CONTRIBUTION = D("7500.00")
@@ -87,7 +92,7 @@ def notifier() -> RecordingNotifier:
 async def client(
     db_session: AsyncSession, clock: FrozenClock, notifier: RecordingNotifier
 ) -> AsyncIterator[AsyncClient]:
-    app = create_app(get_settings())
+    app = create_app(SETTINGS)
 
     async def session_override() -> AsyncIterator[AsyncSession]:
         await db_session.commit()
@@ -104,7 +109,7 @@ async def client(
 
 
 def auth(user_id: uuid.UUID, role: ActorRole) -> dict[str, str]:
-    return bearer(user_id, role, get_settings())
+    return bearer(user_id, role, SETTINGS)
 
 
 class Parties:
@@ -691,6 +696,7 @@ async def test_return_both_sign_opens_claim_window(client, db_session, clock, no
         ("1e3", 422),
         ("-5", 422),
         ("10.001", 422),
+        ("\u0661\u0660.\u0665\u0660", 422),
         ("12345678901.00", 422),
         (10.5, 422),
         ("10.50", 200),
@@ -873,3 +879,22 @@ async def test_request_id_recorded_on_audit(client, db_session) -> None:
         ("booking.requested", "req_create_1"),
         ("booking.accepted", "req_accept_1"),
     ]
+
+
+async def test_money_line_after_vendor_cancel_of_paid_booking(
+    client, db_session, clock, notifier
+) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+
+    response = await client.post(
+        f"{API}/{booking_id}/cancel", json={"reason": "Kit unavailable"}, headers=parties.vendor
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "cancelled_by_vendor"
+    assert body["money_line"] == {
+        "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+        "rental": {"amount": "150000.00", "status": "refunded"},
+        "next": {"label": "Closed", "amount_due": "0.00"},
+    }
