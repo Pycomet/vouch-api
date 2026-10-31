@@ -106,10 +106,16 @@ async def create_asset(
     weekly_rate: Decimal | None = None,
     fulfilment: dict | None = None,
     listing_status: ListingStatus = ListingStatus.active,
+    make: str = "TestMake",
+    model: str | None = None,
+    aliases: list[str] | None = None,
+    name: str | None = None,
 ) -> Asset:
     """An active asset in a launched city, with its own catalogue item.
 
     Creates a verified vendor when ``vendor`` is not given (``asset.vendor_id``).
+    ``make``, ``model`` and ``aliases`` name the catalogue item (the model gets a
+    random suffix when not given); ``name`` is the asset's display override.
     """
     if vendor is None:
         vendor = await create_user(session, role=RenterRole.vendor, kyc_verified=True)
@@ -119,14 +125,16 @@ async def create_asset(
     city = await launched_city(session)
     item = CatalogueItem(
         category_id=category.id,
-        make="TestMake",
-        model=f"Model {uuid.uuid4().hex[:12]}",
+        make=make,
+        model=model or f"Model {uuid.uuid4().hex[:12]}",
+        aliases=aliases or [],
         replacement_value_band=band,
     )
     session.add(item)
     await session.flush()
     asset = Asset(
         vendor_id=vendor.id,
+        name=name,
         catalogue_item_id=item.id,
         category_id=category.id,
         city_id=city.id,

@@ -43,6 +43,21 @@ class ErrorEnvelope(BaseModel):
     error: ErrorDetail
 
 
+class ValidationIssue(BaseModel):
+    """One problem FastAPI found while validating the request."""
+
+    type: str
+    loc: list[str | int]
+    msg: str
+    input: object | None = None
+
+
+class ValidationErrorResponse(BaseModel):
+    """The 422 body FastAPI returns when a request fails validation."""
+
+    detail: list[ValidationIssue]
+
+
 # ---------------------------------------------------------------------------
 # Domain exception classes
 # ---------------------------------------------------------------------------
