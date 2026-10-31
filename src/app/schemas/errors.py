@@ -170,6 +170,7 @@ _GUARD_MESSAGES = {
     "handover_incomplete": "Both parties have not signed the handover yet.",
     "handover_signed": "The item has been handed over; the booking can no longer be cancelled.",
     "approval_not_required": "This item does not need the vendor's approval of the renter.",
+    "handover_already_signed": "You have already signed this handover record.",
 }
 
 
