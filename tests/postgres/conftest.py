@@ -89,6 +89,8 @@ _EMPTY_WHEN_FRESH = ("users", "assets", "bookings", "payments", "ledger_entries"
 async def _drop_public_schema(url: str) -> None:
     connection = await asyncpg.connect(url)
     try:
+        # A leaked open transaction makes the rebuild fail fast instead of hanging.
+        await connection.execute("SET lock_timeout = '10s'")
         await connection.execute("DROP SCHEMA public CASCADE")
         await connection.execute("CREATE SCHEMA public")
     finally:
