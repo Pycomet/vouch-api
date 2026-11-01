@@ -26,6 +26,7 @@ from pydantic import (
     StringConstraints,
     WithJsonSchema,
     model_serializer,
+    model_validator,
 )
 
 from app.services.pricing import money
@@ -148,7 +149,11 @@ class ClaimCreate(BaseModel):
 
 
 class Resolve(BaseModel):
-    """``/resolve``: an admin settles a disputed booking."""
+    """``/resolve``: an admin settles a disputed booking.
+
+    ``amount`` is required for ``deduct`` and refused for ``release`` and
+    ``forfeit`` (422). The service checks it again (positive, within the deposit).
+    """
 
     model_config = ConfigDict(
         extra="forbid",
@@ -162,6 +167,14 @@ class Resolve(BaseModel):
     decision: Literal["release", "deduct", "forfeit"]
     reason: str = Field(min_length=1, max_length=2000)
     amount: MoneyStr | None = None
+
+    @model_validator(mode="after")
+    def _amount_only_for_deduct(self) -> Resolve:
+        if self.decision == "deduct" and self.amount is None:
+            raise ValueError("amount is required when the decision is deduct")
+        if self.decision != "deduct" and self.amount is not None:
+            raise ValueError(f"amount must not be given when the decision is {self.decision}")
+        return self
 
 
 # ---------------------------------------------------------------------------

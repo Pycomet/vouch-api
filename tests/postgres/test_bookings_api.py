@@ -835,6 +835,10 @@ async def test_resolve_deducts(client, db_session, clock, notifier) -> None:
         {"decision": "keep", "reason": "x"},
         {"decision": "release", "reason": ""},
         {"decision": "deduct", "reason": "x", "amount": 20000},
+        # A deduction needs its amount; release and forfeit take none.
+        {"decision": "deduct", "reason": "x"},
+        {"decision": "release", "reason": "x", "amount": "100.00"},
+        {"decision": "forfeit", "reason": "x", "amount": "100.00"},
     ],
 )
 async def test_resolve_validation_422(client, db_session, body) -> None:
