@@ -30,7 +30,9 @@ Text query
 ----------
 ``q`` matches the catalogue item's make, model and aliases with
 ``plainto_tsquery('simple', q)`` against the same expression that backs the GIN
-index ``ix_catalogue_items_search``.
+index ``ix_catalogue_items_search``. :func:`matching_categories` returns the
+category slugs of the active catalogue items ``q`` matches, whether or not any
+unit is visible, so ``/catalogue/search`` can offer equivalents of the same kind.
 
 Cursor pagination
 -----------------
@@ -160,6 +162,7 @@ async def search_public_assets(
     launched_cities: Sequence[str],
     city: str | None = None,
     category: str | None = None,
+    categories: Sequence[str] | None = None,
     starts_on: datetime.date | None = None,
     ends_on: datetime.date | None = None,
     min_daily_rate: Decimal | None = None,
@@ -180,6 +183,8 @@ async def search_public_assets(
         Optional city slug filter; must be one of ``launched_cities``.
     category:
         Optional category slug filter.
+    categories:
+        Optional set of category slugs; an asset in any of them matches.
     starts_on / ends_on:
         Inclusive date range for availability filtering.  Both must be provided
         together; if only one is given, the date filter is skipped (callers
@@ -208,6 +213,9 @@ async def search_public_assets(
 
     if category is not None:
         stmt = stmt.where(Category.slug == category)
+
+    if categories is not None:
+        stmt = stmt.where(Category.slug.in_(list(categories)))
 
     if min_daily_rate is not None:
         stmt = stmt.where(Asset.daily_rate >= min_daily_rate)
@@ -252,6 +260,20 @@ async def search_public_assets(
         next_cursor = None
 
     return AssetPage(items=rows, next_cursor=next_cursor)
+
+
+async def matching_categories(session: AsyncSession, q: str) -> list[str]:
+    """Slugs of the categories of the active catalogue items ``q`` matches (sorted)."""
+    if not q.strip():
+        return []
+    result = await session.execute(
+        select(Category.slug)
+        .join(CatalogueItem, CatalogueItem.category_id == Category.id)
+        .where(CatalogueItem.is_active.is_(True), _text_match(q))
+        .distinct()
+        .order_by(Category.slug)
+    )
+    return list(result.scalars().all())
 
 
 async def get_public_asset(

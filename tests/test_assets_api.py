@@ -277,6 +277,10 @@ def test_no_city_literals_in_inventory_code() -> None:
         ROOT / "src" / "app" / "services" / "inventory.py",
         ROOT / "src" / "app" / "schemas" / "assets.py",
         ROOT / "src" / "app" / "api" / "routes" / "assets.py",
+        ROOT / "src" / "app" / "api" / "routes" / "catalogue.py",
+        ROOT / "src" / "app" / "api" / "routes" / "home.py",
+        ROOT / "src" / "app" / "services" / "home.py",
+        ROOT / "src" / "app" / "schemas" / "home.py",
     )
     pattern = re.compile("abuja|lagos", re.IGNORECASE)
     hits = [
