@@ -62,7 +62,7 @@ def _operations(schema: dict[str, Any]):
 def test_every_operation_has_examples(schema) -> None:
     missing: list[str] = []
     operations = list(_operations(schema))
-    assert len(operations) >= 17  # health x2, assets x2, bookings x10, home x2, catalogue
+    assert len(operations) >= 18  # health x2, assets x2, bookings x11, home x2, catalogue
 
     for name, operation in operations:
         responses = operation["responses"]
@@ -142,6 +142,15 @@ ACTION = f"{BOOKINGS}/{{booking_id}}"
         (f"{ACTION}/return", {"invalid_transition", "handover_already_signed"}),
         (f"{ACTION}/claim", {"invalid_transition", "claim_window_closed"}),
         (f"{ACTION}/resolve", {"invalid_transition", "reason_required"}),
+        (
+            f"{ACTION}/no-show",
+            {
+                "invalid_transition",
+                "no_show_too_early",
+                "handover_signed",
+                "vendor_signed_handover",
+            },
+        ),
     ],
 )
 def test_booking_routes_name_their_guard_codes(schema, path, codes) -> None:
@@ -180,10 +189,22 @@ def test_cancelled_example_adds_up() -> None:
     assert Decimal(fee["vendor_part"]) + Decimal(fee["platform_part"]) == Decimal(fee["amount"])
 
 
+def test_no_show_example_refunds_everything(schema) -> None:
+    line = examples.NO_SHOW_BOOKING_EXAMPLE["money_line"]
+    paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert Decimal(line["refund"]["amount"]) == paid
+    assert "cancellation_fee" not in line
+    assert (line["deposit"]["status"], line["rental"]["status"]) == ("released", "refunded")
+    route = schema["paths"][f"{ACTION}/no-show"]["post"]["responses"]["200"]
+    example = route["content"]["application/json"]["example"]
+    assert (example["status"], example["money_line"]) == ("cancelled_by_vendor", line)
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
         (BookingOut, examples.CANCELLED_BOOKING_EXAMPLE),
+        (BookingOut, examples.NO_SHOW_BOOKING_EXAMPLE),
         (PublicAsset, examples.PUBLIC_ASSET_EXAMPLE),
         (Page[PublicAsset], examples.PAGE_EXAMPLE),
         (CatalogueSearchPage, examples.SEARCH_EXAMPLE),

@@ -106,6 +106,17 @@ class ReasonBody(BaseModel):
     reason: str | None = Field(default=None, max_length=2000)
 
 
+class NoShowReport(BaseModel):
+    """``/no-show``: the renter reports that the vendor never handed the item over."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"reason": "Nobody at the pickup address"}]},
+    )
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class HandoverSubmit(BaseModel):
     """``/handover`` and ``/return``: the caller's side of the handover record."""
 

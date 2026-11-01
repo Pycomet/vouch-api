@@ -28,6 +28,7 @@ from app.api.deps import get_clock, get_current_actor, get_notifier, require_rol
 from app.api.examples import (
     BOOKING_EXAMPLE,
     CANCELLED_BOOKING_EXAMPLE,
+    NO_SHOW_BOOKING_EXAMPLE,
     REQUESTED_BOOKING_EXAMPLE,
     Err,
     documented,
@@ -43,6 +44,7 @@ from app.schemas.bookings import (
     BookingOut,
     ClaimCreate,
     HandoverSubmit,
+    NoShowReport,
     PriceOut,
     ReasonBody,
     Resolve,
@@ -133,6 +135,12 @@ _CANCEL_ERRORS = _action(
     guard("handover_signed"),
     _REASON_REQUIRED,
     example=CANCELLED_BOOKING_EXAMPLE,
+)
+_NO_SHOW_ERRORS = _action(
+    guard("no_show_too_early", {"report_from": "2026-11-12T23:00:00+00:00"}),
+    guard("handover_signed"),
+    guard("vendor_signed_handover"),
+    example=NO_SHOW_BOOKING_EXAMPLE,
 )
 _HANDOVER_ERRORS = _action(_EVIDENCE_FULL, _ALREADY_SIGNED)
 _CLAIM_ERRORS = _action(
@@ -397,6 +405,30 @@ async def cancel_booking(
     the server, never by the client."""
     return await _apply(
         request, session, booking, actor, BookingEvent.cancel, _reason(body), clock, notifier
+    )
+
+
+@router.post(
+    "/{booking_id}/no-show",
+    response_model=BookingOut,
+    summary="Report that the vendor did not hand the item over (renter)",
+    responses=_NO_SHOW_ERRORS,
+)
+async def report_no_show(
+    request: Request,
+    body: NoShowReport | None = None,
+    booking: Booking = Depends(booking_for(ActorRole.renter)),
+    actor: Actor = Depends(get_current_actor),
+    session: AsyncSession = Depends(get_session),
+    clock: Clock = Depends(get_clock),
+    notifier: Notifier = Depends(get_notifier),
+) -> BookingOut:
+    """From 00:00 on the start day, while the vendor has not signed the pickup
+    handover. The booking is cancelled by the vendor: everything paid is refunded
+    with no fee, and the vendor takes the reliability penalty."""
+    payload = {} if body is None or body.reason is None else {"reason": body.reason}
+    return await _apply(
+        request, session, booking, actor, BookingEvent.report_no_show, payload, clock, notifier
     )
 
 

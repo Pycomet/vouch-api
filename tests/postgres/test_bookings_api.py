@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, get_notifier
-from app.core.clock import FrozenClock
+from app.core.clock import FrozenClock, start_of_business_day
 from app.core.config import get_settings
 from app.db.models import (
     Asset,
@@ -1005,3 +1005,142 @@ async def test_money_line_after_vendor_cancel_of_paid_booking(
     # (c) vendor cancel: refund == D + C + R + F.
     paid_in = sum(D(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
     assert D(line["refund"]["amount"]) == paid_in == TOTAL
+
+
+# ---------------------------------------------------------------------------
+# no-show (A17)
+# ---------------------------------------------------------------------------
+
+
+async def _at_no_show_start(session, booking_id, clock: FrozenClock) -> None:
+    """Move the clock to 00:00 (business zone) on the booking's start day."""
+    booking = await _load(session, booking_id)
+    opens = start_of_business_day(booking.starts_on, SETTINGS.business_zone)
+    clock.advance(opens - clock.now())
+
+
+async def _ledger_rows(session, booking_id) -> int:
+    rows = await session.scalars(select(LedgerEntry.id).where(LedgerEntry.booking_id == booking_id))
+    return len(rows.all())
+
+
+async def test_no_show_refunds_in_full_via_api(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    await _at_no_show_start(db_session, booking_id, clock)
+    notifier.calls.clear()
+
+    response = await client.post(
+        f"{API}/{booking_id}/no-show",
+        json={"reason": "Nobody answered the door"},
+        headers={**parties.renter, "X-Request-ID": "req_no_show_1"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "cancelled_by_vendor"
+    assert body["money_line"] == {
+        "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+        "contribution": {"amount": "7500.00", "status": "refunded"},
+        "rental": {"amount": "150000.00", "status": "refunded"},
+        "refund": {"amount": "307500.00"},
+        "next": {"label": "Closed", "amount_due": "0.00"},
+    }
+    assert D(body["money_line"]["refund"]["amount"]) == TOTAL
+    for account in LedgerAccount:
+        assert await _balance(db_session, account, booking_id) == D("0.00"), account
+    booking = await _load(db_session, booking_id)
+    assert booking.cancellation_reason == "vendor_no_show: Nobody answered the door"
+    rows = await db_session.execute(
+        select(AuditEvent.entity, AuditEvent.action, AuditEvent.reason, AuditEvent.request_id)
+        .where(AuditEvent.request_id == "req_no_show_1")
+        .order_by(AuditEvent.id)
+    )
+    assert rows.all() == [
+        ("user", "vendor.reliability_penalty", "vendor_no_show", "req_no_show_1"),
+        (
+            "booking",
+            "booking.cancelled_by_vendor",
+            "vendor_no_show: Nobody answered the door",
+            "req_no_show_1",
+        ),
+    ]
+    assert notifier.templates() == [
+        "booking.no_show_refunded",
+        "booking.no_show_reported",
+        "ops.vendor_no_show",
+    ]
+
+
+async def test_no_show_without_body(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    await _at_no_show_start(db_session, booking_id, clock)
+
+    response = await client.post(f"{API}/{booking_id}/no-show", headers=parties.renter)
+
+    assert response.status_code == 200
+    assert (await _load(db_session, booking_id)).cancellation_reason == "vendor_no_show"
+
+
+async def test_no_show_before_the_start_409(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    ledger_before = await _ledger_rows(db_session, booking_id)
+
+    response = await client.post(f"{API}/{booking_id}/no-show", headers=parties.renter)
+
+    assert response.status_code == 409
+    error = _error(response)
+    assert error["code"] == "no_show_too_early"
+    assert "report_from" in error["details"]
+    assert await _ledger_rows(db_session, booking_id) == ledger_before
+    assert (await _load(db_session, booking_id)).status == BookingStatus.confirmed
+
+
+async def test_no_show_after_the_vendor_signed_409(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    signed = await client.post(
+        f"{API}/{booking_id}/handover", json=_handover(), headers=parties.vendor
+    )
+    assert signed.status_code == 200
+    await _at_no_show_start(db_session, booking_id, clock)
+
+    response = await client.post(f"{API}/{booking_id}/no-show", headers=parties.renter)
+
+    assert response.status_code == 409
+    assert _error(response)["code"] == "vendor_signed_handover"
+    assert (await _load(db_session, booking_id)).status == BookingStatus.confirmed
+
+
+async def test_no_show_on_an_unpaid_booking_is_an_invalid_transition(client, db_session) -> None:
+    booking_id, parties = await _booking(db_session, BookingStatus.accepted)
+
+    response = await client.post(f"{API}/{booking_id}/no-show", headers=parties.renter)
+
+    assert response.status_code == 409
+    assert _error(response)["details"] == {"from": "accepted", "event": "report_no_show"}
+
+
+async def test_no_show_visibility(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    await _at_no_show_start(db_session, booking_id, clock)
+    stranger = auth((await create_user(db_session)).id, ActorRole.renter)
+    path = f"{API}/{booking_id}/no-show"
+
+    hidden = await client.post(path, headers=stranger)
+    assert hidden.status_code == 404
+    assert _error(hidden)["code"] == "resource_not_found"
+    for headers in (parties.vendor, await _admin(db_session)):
+        response = await client.post(path, headers=headers)
+        assert response.status_code == 403
+        assert _error(response)["code"] == "forbidden"
+    assert (await _load(db_session, booking_id)).status == BookingStatus.confirmed
+
+
+async def test_no_show_reason_is_capped(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    await _at_no_show_start(db_session, booking_id, clock)
+
+    response = await client.post(
+        f"{API}/{booking_id}/no-show", json={"reason": "x" * 501}, headers=parties.renter
+    )
+
+    assert response.status_code == 422

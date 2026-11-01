@@ -237,6 +237,21 @@ CANCELLED_BOOKING_EXAMPLE: dict[str, Any] = {
     "money_line": CANCELLED_MONEY_LINE,
 }
 
+# A renter-reported vendor no-show (A17): everything paid comes back, no fee.
+NO_SHOW_MONEY_LINE: dict[str, Any] = {
+    "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+    "contribution": {"amount": "7500.00", "status": "refunded"},
+    "rental": {"amount": "150000.00", "status": "refunded"},
+    "refund": {"amount": "307500.00"},
+    "next": {"label": "Closed", "amount_due": "0.00"},
+}
+
+NO_SHOW_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "cancelled_by_vendor",
+    "money_line": NO_SHOW_MONEY_LINE,
+}
+
 REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
     **BOOKING_EXAMPLE,
     "status": "requested",
