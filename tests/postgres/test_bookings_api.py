@@ -313,6 +313,25 @@ async def test_create_booking_overlap_409(client, db_session) -> None:
     assert _error(response)["code"] == "dates_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("overrides", "details"),
+    [
+        ({"ends_on": "2999-01-01"}, {"max_rental_days": 90}),
+        ({"starts_on": "2999-01-01", "ends_on": "2999-01-01"}, {"booking_horizon_days": 365}),
+    ],
+)
+async def test_create_booking_hostile_dates_400(client, db_session, overrides, details) -> None:
+    asset_id, parties = await _asset(db_session)
+
+    response = await client.post(
+        API, json=_create_body(asset_id, **overrides), headers=parties.renter
+    )
+
+    assert response.status_code == 400
+    assert _error(response)["code"] == "invalid_request"
+    assert _error(response)["details"] == details
+
+
 # ---------------------------------------------------------------------------
 # accept / decline / approve
 # ---------------------------------------------------------------------------

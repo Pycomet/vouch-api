@@ -121,3 +121,16 @@ def test_cancellation_fee_env_parsed_as_decimal(monkeypatch: pytest.MonkeyPatch)
 
     assert settings.renter_cancellation_fee_rate == Decimal("0.2")
     assert settings.cancellation_fee_vendor_share == Decimal("0.25")
+
+
+def test_booking_limits_default() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.max_rental_days == 90
+    assert settings.booking_horizon_days == 365
+
+
+@pytest.mark.parametrize("field", ["max_rental_days", "booking_horizon_days"])
+def test_booking_limits_must_be_at_least_one(field: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: 0})

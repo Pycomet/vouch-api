@@ -98,6 +98,8 @@ _EXCLUSION_VIOLATION = "23P01"
 _DEADLOCK_DETECTED = "40P01"
 _CHECK_VIOLATION = "23514"
 _NOT_SELF_CONSTRAINT = "ck_bookings_not_self"
+# An amount too large for its Numeric column (the date limits normally stop this).
+_NUMERIC_VALUE_OUT_OF_RANGE = "22003"
 
 # Columns never reported in an audit diff (maintained by the database).
 _UNAUDITED_COLUMNS = frozenset({"created_at", "updated_at"})
@@ -1014,10 +1016,15 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
 # ---------------------------------------------------------------------------
 
 
+def _sqlstate(exc: DBAPIError) -> str | None:
+    orig = exc.orig
+    return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+
+
 def _insert_conflict(exc: DBAPIError) -> str | None:
     """The guard code for a booking insert failure, or None to re-raise it."""
     orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    sqlstate = _sqlstate(exc)
     if sqlstate in (_EXCLUSION_VIOLATION, _DEADLOCK_DETECTED):
         return "dates_unavailable"
     if sqlstate == _CHECK_VIOLATION:
@@ -1080,10 +1087,21 @@ async def request_booking(
     ).asset
 
     now = clock.now()
+    today = business_date(now, settings.business_zone)
     if starts_on > ends_on:
         raise InvalidRequestError("The start date must not be after the end date.")
-    if starts_on < business_date(now, settings.business_zone):
+    if starts_on < today:
         raise InvalidRequestError("The start date must not be in the past.")
+    if (ends_on - starts_on).days + 1 > settings.max_rental_days:
+        raise InvalidRequestError(
+            "The rental is longer than the maximum allowed.",
+            {"max_rental_days": settings.max_rental_days},
+        )
+    if (starts_on - today).days > settings.booking_horizon_days:
+        raise InvalidRequestError(
+            "The start date is too far ahead.",
+            {"booking_horizon_days": settings.booking_horizon_days},
+        )
     if fulfilment not in ("pickup", "delivery") or not (asset.fulfilment or {}).get(fulfilment):
         raise InvalidRequestError(
             "This item does not offer that fulfilment.", {"fulfilment": fulfilment}
@@ -1124,6 +1142,8 @@ async def request_booking(
             session.add(booking)
             await session.flush()
     except DBAPIError as exc:
+        if _sqlstate(exc) == _NUMERIC_VALUE_OUT_OF_RANGE:
+            raise InvalidRequestError("An amount for this booking is out of range.") from exc
         code = _insert_conflict(exc)
         if code is None:
             raise

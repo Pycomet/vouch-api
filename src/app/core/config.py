@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     renter_cancellation_fee_rate: Decimal = Decimal("0.10")
     cancellation_fee_vendor_share: Decimal = Decimal("0.50")
     business_timezone: str = "Africa/Lagos"
+    # Booking request limits: the longest rental (days, inclusive) and how far
+    # ahead (days after today in the business zone) a rental may start.
+    max_rental_days: int = Field(default=90, ge=1)
+    booking_horizon_days: int = Field(default=365, ge=1)
     # HS256 signing key for access tokens. The placeholder is refused in production.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)

@@ -809,3 +809,73 @@ async def test_each_transition_writes_one_audit_row(
     assert audit.entity == "booking"
     assert audit.before["status"] == "requested"
     assert audit.after["status"] == result.status.value
+
+
+# ---------------------------------------------------------------------------
+# Date-range limits (rental length and start horizon)
+# ---------------------------------------------------------------------------
+
+
+async def test_request_longer_than_max_rental_days_400(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        # 91 days, inclusive.
+        await _request(
+            db_session, renter, asset, clock, notifier, ends_on=START + timedelta(days=90)
+        )
+
+    assert caught.value.error_details == {"max_rental_days": 90}
+
+
+async def test_request_of_max_rental_days_ok(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    booking = await _request(
+        db_session, renter, asset, clock, notifier, ends_on=START + timedelta(days=89)
+    )
+
+    assert (booking.ends_on - booking.starts_on).days + 1 == 90
+
+
+async def test_request_beyond_booking_horizon_400(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    start = DEFAULT_NOW.date() + timedelta(days=366)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        await _request(db_session, renter, asset, clock, notifier, starts_on=start, ends_on=start)
+
+    assert caught.value.error_details == {"booking_horizon_days": 365}
+
+
+async def test_request_at_booking_horizon_ok(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    start = DEFAULT_NOW.date() + timedelta(days=365)
+
+    booking = await _request(
+        db_session, renter, asset, clock, notifier, starts_on=start, ends_on=start
+    )
+
+    assert booking.starts_on == start
+
+
+async def test_amount_overflow_on_insert_maps_to_400(db_session, clock, notifier, monkeypatch):
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    class NumericOverflow(Exception):
+        sqlstate = "22003"
+
+    async def overflow(*args, **kwargs):
+        raise DBAPIError("INSERT INTO bookings", {}, NumericOverflow("numeric field overflow"))
+
+    monkeypatch.setattr(db_session, "flush", overflow)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        await _request(db_session, renter, asset, clock, notifier)
+
+    assert "out of range" in caught.value.detail_message
