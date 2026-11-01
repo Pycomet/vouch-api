@@ -183,35 +183,43 @@ def test_jwt_defaults() -> None:
     assert "change-me" not in repr(settings)
 
 
-def test_production_refuses_default_secret() -> None:
-    with pytest.raises(ValidationError, match="jwt_secret must be set in production"):
-        Settings(_env_file=None, environment=Environment.PRODUCTION)
+# The secret rules hold in every environment except development and test.
+GUARDED = pytest.mark.parametrize(
+    "environment", [Environment.STAGING, Environment.PRODUCTION], ids=["staging", "production"]
+)
 
 
-def test_production_accepts_a_real_secret() -> None:
+@GUARDED
+def test_guarded_environment_refuses_default_secret(environment: Environment) -> None:
+    with pytest.raises(ValidationError, match=f"jwt_secret must be set in {environment.value}"):
+        Settings(_env_file=None, environment=environment)
+
+
+@GUARDED
+def test_guarded_environment_accepts_a_real_secret(environment: Environment) -> None:
     settings = Settings(
         _env_file=None,
-        environment=Environment.PRODUCTION,
+        environment=environment,
         jwt_secret=SecretStr("a-real-production-secret-of-decent-length"),
     )
 
-    assert settings.is_production
+    assert settings.environment == environment
 
 
+@GUARDED
 @pytest.mark.parametrize(
     "secret",
     ["", "   ", "short", "x" * 31, " " + "x" * 30 + " "],
     ids=["empty", "blank", "short", "31", "padded"],
 )
-def test_production_refuses_a_weak_secret(secret: str) -> None:
+def test_guarded_environment_refuses_a_weak_secret(environment: Environment, secret: str) -> None:
     with pytest.raises(ValidationError, match="at least 32 bytes"):
-        Settings(_env_file=None, environment=Environment.PRODUCTION, jwt_secret=SecretStr(secret))
+        Settings(_env_file=None, environment=environment, jwt_secret=SecretStr(secret))
 
 
-def test_production_accepts_a_32_byte_secret() -> None:
-    settings = Settings(
-        _env_file=None, environment=Environment.PRODUCTION, jwt_secret=SecretStr("k" * 32)
-    )
+@GUARDED
+def test_guarded_environment_accepts_a_32_byte_secret(environment: Environment) -> None:
+    settings = Settings(_env_file=None, environment=environment, jwt_secret=SecretStr("k" * 32))
 
     assert settings.jwt_secret.get_secret_value() == "k" * 32
 
@@ -224,9 +232,14 @@ def test_production_refuses_an_empty_secret_from_env(monkeypatch: pytest.MonkeyP
         Settings(_env_file=None, environment=Environment.PRODUCTION)
 
 
-@pytest.mark.parametrize("secret", ["", "short"])
-def test_development_does_not_check_secret_length(secret: str) -> None:
-    assert Settings(_env_file=None, jwt_secret=SecretStr(secret)).jwt_secret is not None
+@pytest.mark.parametrize("environment", [Environment.DEVELOPMENT, Environment.TEST])
+@pytest.mark.parametrize("secret", ["", "short", "change-me"])
+def test_development_and_test_do_not_check_the_secret(
+    environment: Environment, secret: str
+) -> None:
+    settings = Settings(_env_file=None, environment=environment, jwt_secret=SecretStr(secret))
+
+    assert settings.jwt_secret is not None
 
 
 def test_jwt_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

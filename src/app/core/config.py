@@ -13,9 +13,9 @@ from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_valida
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _CITY_SLUG = re.compile(r"^[a-z][a-z-]*$")
-# The ``.env.example`` value; never acceptable in production.
+# The ``.env.example`` value; refused outside development and test.
 JWT_SECRET_PLACEHOLDER = "change-me"
-# HS256 keys shorter than the hash output (32 bytes) are refused in production.
+# HS256 keys shorter than the hash output (32 bytes) are refused outside development and test.
 JWT_SECRET_MIN_BYTES = 32
 
 
@@ -24,6 +24,10 @@ class Environment(StrEnum):
     TEST = "test"
     STAGING = "staging"
     PRODUCTION = "production"
+
+
+# Environments where the JWT secret rules are not enforced.
+_UNGUARDED_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
 
 
 class Settings(BaseSettings):
@@ -61,7 +65,7 @@ class Settings(BaseSettings):
     # ahead (days after today in the business zone) a rental may start.
     max_rental_days: int = Field(default=90, ge=1)
     booking_horizon_days: int = Field(default=365, ge=1)
-    # HS256 signing key for access tokens. The placeholder is refused in production.
+    # HS256 signing key for access tokens; checked outside development and test.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
 
@@ -107,13 +111,16 @@ class Settings(BaseSettings):
     def enforce_production_safety(self) -> Settings:
         if self.environment == Environment.PRODUCTION and self.debug:
             raise ValueError("debug must be disabled in production")
-        if self.environment == Environment.PRODUCTION:
+        # The signing key is checked everywhere except local development and tests,
+        # so a staging deployment cannot run on the placeholder or a weak key either.
+        if self.environment not in _UNGUARDED_ENVIRONMENTS:
+            env = self.environment.value
             secret = self.jwt_secret.get_secret_value()
             if secret == JWT_SECRET_PLACEHOLDER:
-                raise ValueError("jwt_secret must be set in production")
+                raise ValueError(f"jwt_secret must be set in {env}")
             if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
                 raise ValueError(
-                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in production"
+                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}"
                 )
         return self
 
