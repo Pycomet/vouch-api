@@ -200,3 +200,12 @@ def test_cancelled_example_adds_up() -> None:
 )
 def test_examples_match_their_models(model: type[BaseModel], payload: dict) -> None:
     model.model_validate(payload)
+
+
+def test_next_payout_description_names_every_closed_source(schema) -> None:
+    description = schema["components"]["schemas"]["VendorHome"]["properties"]["next_payout"][
+        "description"
+    ].lower()
+
+    for source in ("completed", "cancellation fee", "lost", "closed"):
+        assert source in description

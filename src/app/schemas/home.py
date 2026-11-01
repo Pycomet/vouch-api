@@ -51,7 +51,10 @@ class VendorHome(BaseModel):
     )
     today: VendorToday
     next_payout: str = Field(
-        description="What completed bookings still owe the vendor (NGN).", examples=["127500.00"]
+        description="What the vendor's closed bookings still owe the vendor (NGN), net of "
+        "payouts: completed rentals, the vendor's share of the cancellation fee when a "
+        "renter cancels a paid booking, and the forfeited deposit when an item is lost.",
+        examples=["127500.00"],
     )
     utilisation_7d: str = Field(
         description="Booked asset-days over today and the next six days, divided by "
