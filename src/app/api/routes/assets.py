@@ -103,15 +103,19 @@ async def list_assets(
     ``starts_on`` and ``ends_on``; supplying only one returns 400.
     """
     # --- Validate date pair ---
+    # Details name only the dates that were given (no "None" strings).
+    given = {
+        key: day.isoformat() for key, day in (("starts_on", starts_on), ("ends_on", ends_on)) if day
+    }
     if (starts_on is None) != (ends_on is None):
         raise InvalidRequestError(
             message="Both 'starts_on' and 'ends_on' are required together for date filtering.",
-            details={"starts_on": str(starts_on), "ends_on": str(ends_on)},
+            details=given,
         )
     if starts_on is not None and ends_on is not None and starts_on > ends_on:
         raise InvalidRequestError(
             message="'starts_on' must not be after 'ends_on'.",
-            details={"starts_on": str(starts_on), "ends_on": str(ends_on)},
+            details=given,
         )
 
     # --- Validate cursor early so a bad cursor returns 400 before DB access ---

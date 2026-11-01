@@ -302,6 +302,16 @@ def test_list_assets_missing_ends_on_returns_400(client: TestClient, monkeypatch
     resp = client.get("/api/v1/assets?starts_on=2026-11-01")
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_request"
+    # Only the date that was given; never a literal "None".
+    assert resp.json()["error"]["details"] == {"starts_on": "2026-11-01"}
+
+
+def test_list_assets_missing_starts_on_details_name_only_ends_on(
+    client: TestClient, monkeypatch
+) -> None:
+    resp = client.get("/api/v1/assets?ends_on=2026-11-03")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["details"] == {"ends_on": "2026-11-03"}
 
 
 def test_list_assets_reversed_dates_returns_400(client: TestClient, monkeypatch) -> None:
@@ -314,6 +324,7 @@ def test_list_assets_reversed_dates_returns_400(client: TestClient, monkeypatch)
     resp = client.get("/api/v1/assets?starts_on=2026-11-05&ends_on=2026-11-01")
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_request"
+    assert resp.json()["error"]["details"] == {"starts_on": "2026-11-05", "ends_on": "2026-11-01"}
 
 
 def test_list_assets_malformed_cursor_returns_400(client: TestClient, monkeypatch) -> None:
