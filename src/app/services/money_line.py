@@ -21,6 +21,16 @@ Rental status (R + F): ``due`` before payment; ``received`` once the one upfront
 payment is captured (A14); ``refunded`` after a paid cancellation; ``paid_out``
 when payout postings cover the booking's whole vendor payable.
 
+Contribution (C, shown only when C > 0): ``due`` before payment, ``received``
+once paid, ``refunded`` after a paid cancellation.
+
+Cancellation fee (shown only after a paid renter cancellation): the amount and
+its vendor and platform parts, read from that cancellation's audit row (the
+``after`` the fee group was posted with), never stored on the booking.
+
+Refund (shown only on a booking cancelled after payment): D + C + R + F less the
+cancellation fee, so refund + fee always equals everything paid.
+
 A booking that closed before any payment (declined, expired, withdrawn) keeps
 ``due`` for both parts (nothing was ever received) and its next step is
 ``Closed`` with nothing to pay.
@@ -40,7 +50,16 @@ from app.core.config import Settings
 from app.db.models import AuditEvent, Booking, Direction, LedgerAccount, LedgerEntry, Payment
 from app.db.models.booking import BookingStatus
 from app.db.models.payment import PaymentType
-from app.schemas.bookings import DepositLine, MoneyLine, NextStep, RentalLine, format_money
+from app.schemas.bookings import (
+    CancellationFeeLine,
+    ContributionLine,
+    DepositLine,
+    MoneyLine,
+    NextStep,
+    RefundLine,
+    RentalLine,
+    format_money,
+)
 from app.services.pricing import money
 
 ZERO = Decimal("0.00")
@@ -182,6 +201,36 @@ def _next_step(booking: Booking, zone: ZoneInfo, total: Decimal) -> NextStep:
     return NextStep(label=label, amount_due=format_money(amount_due))
 
 
+def _contribution_status(booking: Booking, ledger: _Ledger) -> str:
+    if not ledger.paid:
+        return "due"
+    if booking.status in _CANCELLED:
+        return "refunded"
+    return "received"
+
+
+async def _cancellation_fee(session: AsyncSession, booking: Booking) -> CancellationFeeLine | None:
+    """The fee a paid renter cancellation kept, from that cancellation's audit row."""
+    after = await session.scalar(
+        select(AuditEvent.after)
+        .where(
+            AuditEvent.entity == "booking",
+            AuditEvent.entity_id == booking.id,
+            AuditEvent.action == f"booking.{BookingStatus.cancelled_by_renter.value}",
+        )
+        .order_by(AuditEvent.id.desc())
+        .limit(1)
+    )
+    fee = (after or {}).get("cancellation_fee")
+    if not fee:
+        return None
+    return CancellationFeeLine(
+        amount=format_money(money(fee["amount"])),
+        vendor_part=format_money(money(fee["vendor_part"])),
+        platform_part=format_money(money(fee["platform_part"])),
+    )
+
+
 async def compute_money_line(
     session: AsyncSession, booking: Booking, *, settings: Settings
 ) -> MoneyLine:
@@ -189,12 +238,29 @@ async def compute_money_line(
     deposit = _amount(booking, "deposit")
     contribution = _amount(booking, "damage_contribution")
     rental = _amount(booking, "rental_total") + _amount(booking, "delivery_fee")
+    total = deposit + contribution + rental
     ledger = await _ledger(session, booking)
+
+    contribution_line = None
+    if contribution > 0:
+        contribution_line = ContributionLine(
+            amount=format_money(contribution), status=_contribution_status(booking, ledger)
+        )
+    fee_line = None
+    refund_line = None
+    if booking.status in _CANCELLED and ledger.paid:
+        fee_line = await _cancellation_fee(session, booking)
+        fee = money(fee_line.amount) if fee_line is not None else ZERO
+        refund_line = RefundLine(amount=format_money(total - fee))
+
     return MoneyLine(
         deposit=DepositLine(
             amount=format_money(deposit),
             status=await _deposit_status(session, booking, ledger),
         ),
+        contribution=contribution_line,
         rental=RentalLine(amount=format_money(rental), status=_rental_status(booking, ledger)),
-        next=_next_step(booking, settings.business_zone, deposit + contribution + rental),
+        cancellation_fee=fee_line,
+        refund=refund_line,
+        next=_next_step(booking, settings.business_zone, total),
     )

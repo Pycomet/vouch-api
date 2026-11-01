@@ -802,10 +802,18 @@ async def test_resolve_validation_422(client, db_session, body) -> None:
 async def test_money_line_through_lifecycle(client, db_session, clock, notifier) -> None:
     asset_id, parties = await _asset(db_session, deposit_amount=DEPOSIT)
 
-    def check(body: dict, deposit: str, rental: str, label: str, due: Decimal) -> None:
+    def check(
+        body: dict, deposit: str, rental: str, label: str, due: Decimal, contribution: str = ""
+    ) -> None:
         line = body["money_line"]
         assert line["deposit"]["status"] == deposit, body["status"]
         assert line["rental"]["status"] == rental, body["status"]
+        expected_contribution = contribution or ("due" if deposit == "due" else "received")
+        assert line["contribution"] == {
+            "amount": body["price"]["damage_contribution"],
+            "status": expected_contribution,
+        }, body["status"]
+        assert "refund" not in line and "cancellation_fee" not in line, body["status"]
         assert line["next"]["label"] == label, body["status"]
         assert line["next"]["amount_due"] == f"{due:.2f}", body["status"]
         assert D(line["next"]["amount_due"]) == due
@@ -827,6 +835,13 @@ async def test_money_line_through_lifecycle(client, db_session, clock, notifier)
 
     body = (await client.post(f"{API}/{booking_id}/accept", headers=parties.vendor)).json()
     check(body, "due", "due", "Payment due Mon 2 Nov 22:00", total)
+    # (a) accepted: next.amount_due == deposit + contribution + rental.
+    line = body["money_line"]
+    assert D(line["next"]["amount_due"]) == (
+        D(line["deposit"]["amount"])
+        + D(line["contribution"]["amount"])
+        + D(line["rental"]["amount"])
+    )
 
     await _pay(db_session, uuid.UUID(booking_id), clock, notifier)
     body = (await client.get(f"{API}/{booking_id}", headers=parties.renter)).json()
@@ -865,9 +880,20 @@ async def test_money_line_after_renter_cancel_with_fee(client, db_session, clock
     line = response.json()["money_line"]
     assert line == {
         "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+        "contribution": {"amount": "7500.00", "status": "refunded"},
         "rental": {"amount": "150000.00", "status": "refunded"},
+        "cancellation_fee": {
+            "amount": "15000.00",
+            "vendor_part": "7500.00",
+            "platform_part": "7500.00",
+        },
+        "refund": {"amount": "292500.00"},
         "next": {"label": "Closed", "amount_due": "0.00"},
     }
+    # (b) paid renter cancel: refund + fee == D + C + R + F.
+    paid_in = sum(D(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert paid_in == TOTAL
+    assert D(line["refund"]["amount"]) + D(line["cancellation_fee"]["amount"]) == paid_in
 
 
 # ---------------------------------------------------------------------------
@@ -912,8 +938,14 @@ async def test_money_line_after_vendor_cancel_of_paid_booking(
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "cancelled_by_vendor"
-    assert body["money_line"] == {
+    line = body["money_line"]
+    assert line == {
         "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+        "contribution": {"amount": "7500.00", "status": "refunded"},
         "rental": {"amount": "150000.00", "status": "refunded"},
+        "refund": {"amount": "307500.00"},
         "next": {"label": "Closed", "amount_due": "0.00"},
     }
+    # (c) vendor cancel: refund == D + C + R + F.
+    paid_in = sum(D(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert D(line["refund"]["amount"]) == paid_in == TOTAL

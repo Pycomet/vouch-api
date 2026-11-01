@@ -22,7 +22,9 @@ from pydantic import (
     Field,
     HttpUrl,
     PlainSerializer,
+    SerializerFunctionWrapHandler,
     WithJsonSchema,
+    model_serializer,
 )
 
 from app.services.pricing import money
@@ -170,20 +172,60 @@ class RentalLine(BaseModel):
     status: Literal["due", "received", "refunded", "paid_out"]
 
 
+class ContributionLine(BaseModel):
+    amount: str = Field(description="The damage contribution, C.", examples=["7500.00"])
+    status: Literal["due", "received", "refunded"]
+
+
+class CancellationFeeLine(BaseModel):
+    amount: str = Field(description="The renter's cancellation fee.", examples=["15000.00"])
+    vendor_part: str = Field(description="The vendor's share of the fee.", examples=["7500.00"])
+    platform_part: str = Field(description="Vouch's share of the fee.", examples=["7500.00"])
+
+
+class RefundLine(BaseModel):
+    amount: str = Field(
+        description="Everything paid (D + C + R + F) less any cancellation fee.",
+        examples=["292500.00"],
+    )
+
+
 class NextStep(BaseModel):
     label: str = Field(examples=["Handover Fri 10 Oct"])
     amount_due: str = Field(examples=["0.00"])
+
+
+# Parts present only when they apply; absent (not null) otherwise.
+_OPTIONAL_PARTS = ("contribution", "cancellation_fee", "refund")
 
 
 class MoneyLine(BaseModel):
     """Where the deposit and rental money stand, and what is due next (spec 3.4).
 
     Computed from the ledger and the booking status on every read; never stored.
+    It adds up: while ``accepted``, ``next.amount_due`` is deposit + contribution +
+    rental; after a paid cancellation, ``refund`` + ``cancellation_fee`` is
+    everything paid. ``contribution`` appears only when the booking carries one,
+    ``cancellation_fee`` only after a paid renter cancellation, and ``refund`` only
+    on a booking cancelled after payment.
     """
 
     deposit: DepositLine
+    contribution: ContributionLine | None = None
     rental: RentalLine
+    cancellation_fee: CancellationFeeLine | None = None
+    refund: RefundLine | None = None
     next: NextStep
+
+    # No return annotation on purpose: with one, pydantic would publish that type
+    # (a bare object) as the OpenAPI schema instead of this model's fields.
+    @model_serializer(mode="wrap")
+    def _drop_absent_parts(self, handler: SerializerFunctionWrapHandler):
+        data = handler(self)
+        for part in _OPTIONAL_PARTS:
+            if data.get(part) is None:
+                data.pop(part, None)
+        return data
 
 
 class PriceOut(BaseModel):

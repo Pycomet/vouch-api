@@ -359,3 +359,98 @@ async def test_rental_paid_out_once_payouts_cover_the_payable(db_session, clock,
 
     await _payout(db_session, booking, D("100.00"))
     assert (await _line(db_session, booking)).rental.status == "paid_out"
+
+
+# ---------------------------------------------------------------------------
+# Contribution, cancellation fee and refund: the line adds up
+# ---------------------------------------------------------------------------
+
+FEE = (RENTAL * D("0.10")).quantize(D("0.01"))
+FEE_VENDOR = (FEE * D("0.50")).quantize(D("0.01"))
+
+
+def _paid_in(line) -> Decimal:
+    """D + C + (R + F) as the line shows them."""
+    return D(line.deposit.amount) + D(line.contribution.amount) + D(line.rental.amount)
+
+
+async def test_contribution_is_due_then_received(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    booking.deposit_due_at = datetime(2027, 1, 5, 13, 0, tzinfo=UTC)
+
+    line = await _line(db_session, booking)
+    assert (line.contribution.amount, line.contribution.status) == ("7500.00", "due")
+    # (a) accepted: what is due is exactly D + C + (R + F).
+    assert D(line.next.amount_due) == _paid_in(line)
+    assert line.cancellation_fee is None
+    assert line.refund is None
+
+    await _pay(db_session, booking, clock, notifier)
+    line = await _line(db_session, booking)
+    assert line.contribution.status == "received"
+    assert line.refund is None
+
+
+async def test_no_contribution_line_when_contribution_is_zero(db_session) -> None:
+    renter_user = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    booking = await create_booking(
+        db_session,
+        asset=asset,
+        renter=renter_user,
+        status=BookingStatus.requested,
+        price_snapshot=money_snapshot(damage_contribution="0.00"),
+    )
+
+    line = await _line(db_session, booking)
+
+    assert line.contribution is None
+    assert "contribution" not in line.model_dump()
+
+
+async def test_paid_renter_cancel_adds_up(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    await _pay(db_session, booking, clock, notifier)
+    await _go(db_session, booking, renter(booking), BookingEvent.cancel, clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert line.contribution.status == "refunded"
+    assert line.cancellation_fee.amount == str(FEE)
+    assert line.cancellation_fee.vendor_part == str(FEE_VENDOR)
+    assert line.cancellation_fee.platform_part == str(FEE - FEE_VENDOR)
+    assert line.refund.amount == str(TOTAL - FEE)
+    # (b) refund + fee == D + C + R + F.
+    assert D(line.refund.amount) + D(line.cancellation_fee.amount) == _paid_in(line)
+
+
+async def test_paid_vendor_cancel_refunds_everything(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    await _pay(db_session, booking, clock, notifier)
+    await _go(
+        db_session,
+        booking,
+        vendor(booking),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        {"reason": "Kit unavailable"},
+    )
+
+    line = await _line(db_session, booking)
+
+    assert line.contribution.status == "refunded"
+    assert line.cancellation_fee is None
+    # (c) refund == D + C + R + F.
+    assert D(line.refund.amount) == TOTAL == _paid_in(line)
+
+
+async def test_unpaid_withdrawal_has_no_refund(db_session, clock, notifier) -> None:
+    booking = await _booking(db_session, BookingStatus.accepted)
+    await _go(db_session, booking, renter(booking), BookingEvent.cancel, clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert line.contribution.status == "due"
+    assert line.refund is None
+    assert line.cancellation_fee is None

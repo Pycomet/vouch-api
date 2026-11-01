@@ -168,12 +168,14 @@ SEARCH_EXAMPLE: dict[str, Any] = {**PAGE_EXAMPLE, "equivalents": False}
 
 MONEY_LINE_EXAMPLE: dict[str, Any] = {
     "deposit": {"amount": "150000.00", "status": "held", "held_by": "platform"},
+    "contribution": {"amount": "7500.00", "status": "received"},
     "rental": {"amount": "150000.00", "status": "received"},
     "next": {"label": "Handover Fri 13 Nov", "amount_due": "0.00"},
 }
 
 REQUESTED_MONEY_LINE: dict[str, Any] = {
     "deposit": {"amount": "150000.00", "status": "due", "held_by": "platform"},
+    "contribution": {"amount": "7500.00", "status": "due"},
     "rental": {"amount": "150000.00", "status": "due"},
     "next": {"label": "Awaiting vendor response", "amount_due": "0.00"},
 }
@@ -199,6 +201,26 @@ BOOKING_EXAMPLE: dict[str, Any] = {
         "currency": "NGN",
     },
     "money_line": MONEY_LINE_EXAMPLE,
+}
+
+# A paid renter cancellation: refund + cancellation fee == everything paid.
+CANCELLED_MONEY_LINE: dict[str, Any] = {
+    "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+    "contribution": {"amount": "7500.00", "status": "refunded"},
+    "rental": {"amount": "150000.00", "status": "refunded"},
+    "cancellation_fee": {
+        "amount": "15000.00",
+        "vendor_part": "7500.00",
+        "platform_part": "7500.00",
+    },
+    "refund": {"amount": "292500.00"},
+    "next": {"label": "Closed", "amount_due": "0.00"},
+}
+
+CANCELLED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "cancelled_by_renter",
+    "money_line": CANCELLED_MONEY_LINE,
 }
 
 REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
@@ -231,6 +253,7 @@ RENTER_HOME_EXAMPLE: dict[str, Any] = {
             "ends_on": "2026-10-04",
             "money_line": {
                 "deposit": {"amount": "150000.00", "status": "released", "held_by": "platform"},
+                "contribution": {"amount": "7500.00", "status": "received"},
                 "rental": {"amount": "150000.00", "status": "paid_out"},
                 "next": {"label": "Closed", "amount_due": "0.00"},
             },
