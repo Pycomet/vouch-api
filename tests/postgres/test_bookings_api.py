@@ -675,6 +675,12 @@ async def test_handover_needs_a_confirmed_booking(client, db_session) -> None:
         {"checklist": {}, "evidence_urls": [], "sign": True},
         {"checklist": {}, "evidence_urls": ["not a url"], "sign": True},
         {"checklist": {}, "evidence_urls": EVIDENCE},
+        # Checklist bounds: at most 50 keys of at most 100 characters, flat values.
+        {"checklist": {f"k{i}": True for i in range(51)}, "evidence_urls": EVIDENCE, "sign": True},
+        {"checklist": {"k" * 101: True}, "evidence_urls": EVIDENCE, "sign": True},
+        {"checklist": {"body": "x" * 501}, "evidence_urls": EVIDENCE, "sign": True},
+        {"checklist": {"body": {"front": "ok"}}, "evidence_urls": EVIDENCE, "sign": True},
+        {"checklist": {"body": ["ok"]}, "evidence_urls": EVIDENCE, "sign": True},
     ],
 )
 async def test_handover_validation_422(client, db_session, clock, notifier, body) -> None:
@@ -683,6 +689,52 @@ async def test_handover_validation_422(client, db_session, clock, notifier, body
     response = await client.post(f"{API}/{booking_id}/handover", json=body, headers=parties.vendor)
 
     assert response.status_code == 422
+
+
+async def test_handover_checklist_at_its_bounds_ok(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    checklist: dict = {f"k{i}": True for i in range(46)}
+    checklist.update({"k" * 100: "x" * 500, "batteries": 2, "charge": 0.8, "note": None})
+
+    response = await client.post(
+        f"{API}/{booking_id}/handover",
+        json={"checklist": checklist, "evidence_urls": EVIDENCE, "sign": False},
+        headers=parties.vendor,
+    )
+
+    assert response.status_code == 200
+    record = await _record(db_session, booking_id, HandoverDirection.pickup)
+    assert record.condition_checklist["vendor"] == checklist
+
+
+async def test_handover_evidence_capped_per_record(client, db_session, clock, notifier) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+
+    def urls(side: str) -> list[str]:
+        return [f"https://cdn.example/{side}/{i}.jpg" for i in range(20)]
+
+    def body(evidence: list[str]) -> dict:
+        return {"checklist": {"body": "ok"}, "evidence_urls": evidence, "sign": False}
+
+    first = await client.post(
+        f"{API}/{booking_id}/handover", json=body(urls("vendor")), headers=parties.vendor
+    )
+    second = await client.post(
+        f"{API}/{booking_id}/handover", json=body(urls("renter")), headers=parties.renter
+    )
+    assert (first.status_code, second.status_code) == (200, 200)  # 40 in all: at the cap
+
+    response = await client.post(
+        f"{API}/{booking_id}/handover",
+        json=body(["https://cdn.example/vendor/extra.jpg"]),
+        headers=parties.vendor,
+    )
+
+    assert response.status_code == 400
+    assert _error(response)["code"] == "invalid_request"
+    assert _error(response)["details"] == {"max_evidence_urls": 40}
+    record = await _record(db_session, booking_id, HandoverDirection.pickup)
+    assert len(record.evidence_urls) == 40
 
 
 async def test_return_both_sign_opens_claim_window(client, db_session, clock, notifier) -> None:

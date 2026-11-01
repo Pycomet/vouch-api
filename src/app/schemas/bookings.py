@@ -13,7 +13,7 @@ import datetime
 import re
 import uuid
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -23,6 +23,7 @@ from pydantic import (
     HttpUrl,
     PlainSerializer,
     SerializerFunctionWrapHandler,
+    StringConstraints,
     WithJsonSchema,
     model_serializer,
 )
@@ -55,6 +56,13 @@ MoneyStr = Annotated[
 ]
 
 EvidenceUrls = Annotated[list[HttpUrl], Field(min_length=1, max_length=20)]
+
+# A handover checklist is flat: at most 50 entries, keys of at most 100 characters,
+# each value a short string, a boolean, a number or null (no nested objects/lists).
+CHECKLIST_MAX_KEYS = 50
+ChecklistKey = Annotated[str, StringConstraints(max_length=100)]
+ChecklistValue = Annotated[str, StringConstraints(max_length=500)] | bool | int | float | None
+Checklist = Annotated[dict[ChecklistKey, ChecklistValue], Field(max_length=CHECKLIST_MAX_KEYS)]
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +121,7 @@ class HandoverSubmit(BaseModel):
         },
     )
 
-    checklist: dict[str, Any]
+    checklist: Checklist
     evidence_urls: EvidenceUrls
     sign: bool
 

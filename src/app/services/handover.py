@@ -7,7 +7,8 @@ caller's side of it:
 * the caller's checklist is stored under its role
   (``condition_checklist = {"vendor": {...}, "renter": {...}}``), so neither party
   can overwrite what the other recorded;
-* the evidence URLs are added to the row's list (duplicates dropped, order kept);
+* the evidence URLs are added to the row's list (duplicates dropped, order kept),
+  at most :data:`MAX_EVIDENCE_PER_RECORD` in all (more is a 400);
 * with ``sign``, the caller's signer id and signing time are set. A side that has
   signed is final: submitting it again is refused (``handover_already_signed``).
 
@@ -36,12 +37,19 @@ from app.db.models import Booking, HandoverRecord
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
-from app.schemas.errors import BookingGuardFailed, InvalidTransition, ResourceNotFoundError
+from app.schemas.errors import (
+    BookingGuardFailed,
+    InvalidRequestError,
+    InvalidTransition,
+    ResourceNotFoundError,
+)
 from app.services.audit import Actor, record_audit
 from app.services.booking import BookingEvent, transition
 from app.services.notify import Notifier
 
 AUDIT_ENTITY = "handover_record"
+# The most evidence URLs one handover record keeps (both sides together).
+MAX_EVIDENCE_PER_RECORD = 40
 
 # direction -> (the booking status it needs, the event it fires once both signed)
 _STEPS = {
@@ -131,7 +139,13 @@ async def submit_handover(
 
     before = None if record.id is None else {"status": record.status}
     record.condition_checklist = {**(record.condition_checklist or {}), side: checklist}
-    record.evidence_urls = _merge(record.evidence_urls, evidence_urls)
+    evidence = _merge(record.evidence_urls, evidence_urls)
+    if len(evidence) > MAX_EVIDENCE_PER_RECORD:
+        raise InvalidRequestError(
+            "This handover record already holds the most evidence it can.",
+            {"max_evidence_urls": MAX_EVIDENCE_PER_RECORD},
+        )
+    record.evidence_urls = evidence
     if sign:
         setattr(record, f"{side}_signer_id", actor.user_id)
         setattr(record, f"{side}_signed_at", clock.now())
