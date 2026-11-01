@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -90,9 +91,99 @@ def test_documented_errors_include_auth_and_city(schema) -> None:
     assert {"city_not_launched", "invalid_request", "invalid_cursor"} <= set(named)
 
 
+def _named(responses: dict[str, Any], status: str) -> set[str]:
+    """The error codes a response documents (named examples, or the single one)."""
+    media = responses[status]["content"]["application/json"]
+    if "examples" in media:
+        return {example["value"]["error"]["code"] for example in media["examples"].values()}
+    return {media["example"]["error"]["code"]}
+
+
+def _details(responses: dict[str, Any], status: str) -> list[dict[str, Any]]:
+    media = responses[status]["content"]["application/json"]
+    values = [e["value"] for e in media["examples"].values()] if "examples" in media else []
+    values += [media["example"]] if "example" in media else []
+    return [value["error"]["details"] for value in values]
+
+
+BOOKINGS = f"{PREFIX}/bookings"
+ACTION = f"{BOOKINGS}/{{booking_id}}"
+
+
+@pytest.mark.parametrize(
+    ("path", "codes"),
+    [
+        (
+            BOOKINGS,
+            {
+                "dates_unavailable",
+                "dates_blocked",
+                "tier_insufficient",
+                "renter_restricted",
+                "self_booking",
+            },
+        ),
+        (
+            f"{ACTION}/accept",
+            {
+                "invalid_transition",
+                "hold_expired",
+                "vendor_approval_required",
+                "tier_insufficient",
+                "renter_restricted",
+            },
+        ),
+        (f"{ACTION}/approve", {"invalid_transition", "hold_expired", "approval_not_required"}),
+        (
+            f"{ACTION}/cancel",
+            {"invalid_transition", "cancel_window_closed", "handover_signed", "reason_required"},
+        ),
+        (f"{ACTION}/handover", {"invalid_transition", "handover_already_signed"}),
+        (f"{ACTION}/return", {"invalid_transition", "handover_already_signed"}),
+        (f"{ACTION}/claim", {"invalid_transition", "claim_window_closed"}),
+        (f"{ACTION}/resolve", {"invalid_transition", "reason_required"}),
+    ],
+)
+def test_booking_routes_name_their_guard_codes(schema, path, codes) -> None:
+    responses = schema["paths"][path]["post"]["responses"]
+
+    assert codes <= _named(responses, "409")
+
+
+@pytest.mark.parametrize(
+    ("path", "detail_keys"),
+    [
+        (BOOKINGS, {"max_rental_days", "booking_horizon_days"}),
+        (f"{ACTION}/handover", {"max_evidence_urls"}),
+        (f"{ACTION}/return", {"max_evidence_urls"}),
+        (f"{ACTION}/claim", set()),
+        (f"{ACTION}/resolve", set()),
+    ],
+)
+def test_booking_routes_document_their_400s(schema, path, detail_keys) -> None:
+    responses = schema["paths"][path]["post"]["responses"]
+
+    assert _named(responses, "400") == {"invalid_request"}
+    documented_keys = {key for details in _details(responses, "400") for key in details}
+    assert detail_keys <= documented_keys
+
+
+def test_get_booking_documents_no_409(schema) -> None:
+    assert "409" not in schema["paths"][ACTION]["get"]["responses"]
+
+
+def test_cancelled_example_adds_up() -> None:
+    line = examples.CANCELLED_MONEY_LINE
+    paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert Decimal(line["refund"]["amount"]) + Decimal(line["cancellation_fee"]["amount"]) == paid
+    fee = line["cancellation_fee"]
+    assert Decimal(fee["vendor_part"]) + Decimal(fee["platform_part"]) == Decimal(fee["amount"])
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
+        (BookingOut, examples.CANCELLED_BOOKING_EXAMPLE),
         (PublicAsset, examples.PUBLIC_ASSET_EXAMPLE),
         (Page[PublicAsset], examples.PAGE_EXAMPLE),
         (CatalogueSearchPage, examples.SEARCH_EXAMPLE),

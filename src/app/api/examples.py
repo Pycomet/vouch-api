@@ -4,12 +4,14 @@
 the success status with ``example``, and each error status with an example of the
 error envelope (``ErrorEnvelope``) the API really returns. An error is either a
 bare status (its usual code, see :data:`_DEFAULT_ERRORS`) or an :class:`Err` with
-a specific code; several errors on one status become named ``examples``. 422 is
-FastAPI's request-validation body (:class:`ValidationErrorResponse`).
+a specific code; several errors on one status become named ``examples`` (keyed by
+the error's ``name``, or its code). :func:`guard` builds the 409 for a booking
+guard code with the message the API really sends. 422 is FastAPI's
+request-validation body (:class:`ValidationErrorResponse`).
 
-The example payloads are sample data only (an Abuja listing priced in NGN); the
-code never reads them. Request bodies carry their own examples in the request
-models' ``json_schema_extra``.
+The example payloads are sample data only (a listing priced in NGN, in a
+placeholder city slug); the code never reads them. Request bodies carry their own
+examples in the request models' ``json_schema_extra``.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
+from app.schemas.errors import BookingGuardFailed, ErrorEnvelope, ValidationErrorResponse
 
 REQUEST_ID = "4b9f7c1e-2d3a-4e5f-8a6b-7c8d9e0f1a2b"
 
@@ -31,6 +33,18 @@ class Err:
     message: str
     details: dict[str, Any] = field(default_factory=dict)
     description: str | None = None
+    # The key among several examples on one status (defaults to the code).
+    name: str | None = None
+
+    @property
+    def key(self) -> str:
+        return self.name or self.code
+
+
+def guard(code: str, details: dict[str, Any] | None = None, description: str = "") -> Err:
+    """The 409 a booking guard ``code`` returns, with the API's own message."""
+    error = BookingGuardFailed(code, details)
+    return Err(409, code, error.detail_message, error.error_details, description or None)
 
 
 _DEFAULT_ERRORS: dict[int, Err] = {
@@ -105,8 +119,8 @@ def _error_entries(errors: tuple[int | Err, ...]) -> dict[int | str, dict[str, A
         else:
             content = {
                 "examples": {
-                    err.code: {
-                        "summary": err.code,
+                    err.key: {
+                        "summary": err.key,
                         "value": error_body(err.code, err.message, err.details),
                     }
                     for err in errs
@@ -152,7 +166,7 @@ PUBLIC_ASSET_EXAMPLE: dict[str, Any] = {
     "weekly_rate": "250000.00",
     "deposit_amount": "150000.00",
     "currency": "NGN",
-    "city": "abuja",
+    "city": "city-slug",
     "is_available": True,
     "minimum_trust_tier": 2,
     "created_at": "2026-10-20T09:15:00Z",
@@ -290,7 +304,7 @@ CITY_NOT_LAUNCHED = Err(
     400,
     "city_not_launched",
     "This city is not available yet.",
-    {"city": "kano"},
+    {"city": "other-city-slug"},
     description="The city is not launched.",
 )
 INVALID_DATES = Err(

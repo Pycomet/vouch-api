@@ -281,8 +281,9 @@ def test_no_city_literals_in_inventory_code() -> None:
         ROOT / "src" / "app" / "api" / "routes" / "home.py",
         ROOT / "src" / "app" / "services" / "home.py",
         ROOT / "src" / "app" / "schemas" / "home.py",
+        ROOT / "src" / "app" / "api" / "examples.py",
     )
-    pattern = re.compile("abuja|lagos", re.IGNORECASE)
+    pattern = re.compile("abuja|lagos|kano", re.IGNORECASE)
     hits = [
         f"{path.name}:{lineno}"
         for path in files

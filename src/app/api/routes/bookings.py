@@ -25,7 +25,14 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, get_current_actor, get_notifier, require_role
-from app.api.examples import BOOKING_EXAMPLE, REQUESTED_BOOKING_EXAMPLE, Err, documented
+from app.api.examples import (
+    BOOKING_EXAMPLE,
+    CANCELLED_BOOKING_EXAMPLE,
+    REQUESTED_BOOKING_EXAMPLE,
+    Err,
+    documented,
+    guard,
+)
 from app.core.clock import Clock
 from app.core.config import Settings
 from app.db.models import ActorRole, Booking
@@ -51,17 +58,56 @@ from app.services.pricing import money
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
-# Every route on an existing booking: 401, 404 (R19), 403, 409 and 422 (bad id/body).
-_ERRORS = documented(200, BOOKING_EXAMPLE, 401, 403, 404, 409, 422)
+_HOLD_EXPIRED = guard("hold_expired", {"hold_expires_at": "2026-11-02T13:00:00+00:00"})
+_TIER_INSUFFICIENT = guard("tier_insufficient", {"required": 2, "effective": 1})
+_RENTER_RESTRICTED = guard("renter_restricted")
+_REASON_REQUIRED = guard("reason_required")
+_ALREADY_SIGNED = guard("handover_already_signed", {"direction": "pickup", "side": "vendor"})
+_EVIDENCE_FULL = Err(
+    400,
+    "invalid_request",
+    "This handover record already holds the most evidence it can.",
+    {"max_evidence_urls": 40},
+    description="Too much evidence on the record.",
+)
+
+
+def _action(*errors: int | Err, example: dict[str, Any] = BOOKING_EXAMPLE) -> dict:
+    """``responses=`` for a route on an existing booking.
+
+    Always 401, 404 (R19), 403, the 409 ``invalid_transition`` and 422 (bad id or
+    body); ``errors`` adds the route's own 400s and named 409 guard codes.
+    """
+    return documented(200, example, 401, 403, 404, 409, *errors, 422)
+
+
+_GET_ERRORS = documented(200, BOOKING_EXAMPLE, 401, 403, 404, 422)
 _CREATE_ERRORS = documented(
     201,
     REQUESTED_BOOKING_EXAMPLE,
     Err(
         400,
         "invalid_request",
-        "The request is invalid.",
-        {"starts_on": "2026-11-15"},
+        "The start date must not be in the past.",
+        {},
         description="Invalid dates.",
+        name="invalid_dates",
+    ),
+    Err(
+        400,
+        "invalid_request",
+        "The rental is longer than the maximum allowed.",
+        {"max_rental_days": 90},
+        description="Rental longer than the maximum.",
+        name="max_rental_days",
+    ),
+    Err(
+        400,
+        "invalid_request",
+        "The start date is too far ahead.",
+        {"booking_horizon_days": 365},
+        description="Start too far ahead.",
+        name="booking_horizon_days",
     ),
     401,
     403,
@@ -71,13 +117,41 @@ _CREATE_ERRORS = documented(
         "The requested resource was not found.",
         description="No such asset.",
     ),
-    Err(
-        409,
-        "dates_unavailable",
-        "These dates are no longer available.",
-        description="A guard failed (dates, tier, restriction...).",
-    ),
+    guard("dates_unavailable", description="Dates held by another booking."),
+    guard("dates_blocked", description="Dates blocked by the vendor."),
+    _TIER_INSUFFICIENT,
+    _RENTER_RESTRICTED,
+    guard("self_booking", description="The renter owns the item."),
     422,
+)
+_ACCEPT_ERRORS = _action(
+    _HOLD_EXPIRED, guard("vendor_approval_required"), _TIER_INSUFFICIENT, _RENTER_RESTRICTED
+)
+_APPROVE_ERRORS = _action(_HOLD_EXPIRED, guard("approval_not_required", {"minimum_trust_tier": 2}))
+_CANCEL_ERRORS = _action(
+    guard("cancel_window_closed", {"cancel_before": "2026-11-12T23:00:00+00:00"}),
+    guard("handover_signed"),
+    _REASON_REQUIRED,
+    example=CANCELLED_BOOKING_EXAMPLE,
+)
+_HANDOVER_ERRORS = _action(_EVIDENCE_FULL, _ALREADY_SIGNED)
+_CLAIM_ERRORS = _action(
+    Err(
+        400,
+        "invalid_request",
+        "The claim amount must be a positive sum of money.",
+        description="Invalid claim amount.",
+    ),
+    guard("claim_window_closed", {"claim_window_ends_at": "2026-11-16T09:00:00+00:00"}),
+)
+_RESOLVE_ERRORS = _action(
+    Err(
+        400,
+        "invalid_request",
+        "A deduction needs a positive amount.",
+        description="Invalid deduction amount.",
+    ),
+    _REASON_REQUIRED,
 )
 
 _PARTIES = (ActorRole.renter, ActorRole.vendor)
@@ -232,7 +306,7 @@ async def create_booking(
     "/{booking_id}",
     response_model=BookingOut,
     summary="Get a booking with its money line",
-    responses=_ERRORS,
+    responses=_GET_ERRORS,
 )
 async def get_booking(
     request: Request,
@@ -247,7 +321,7 @@ async def get_booking(
     "/{booking_id}/accept",
     response_model=BookingOut,
     summary="Accept a request (vendor)",
-    responses=_ERRORS,
+    responses=_ACCEPT_ERRORS,
 )
 async def accept_booking(
     request: Request,
@@ -267,7 +341,7 @@ async def accept_booking(
     "/{booking_id}/decline",
     response_model=BookingOut,
     summary="Decline a request (vendor)",
-    responses=_ERRORS,
+    responses=_action(),
 )
 async def decline_booking(
     request: Request,
@@ -287,7 +361,7 @@ async def decline_booking(
     "/{booking_id}/approve",
     response_model=BookingOut,
     summary="Approve the renter of a tier-3 item (vendor)",
-    responses=_ERRORS,
+    responses=_APPROVE_ERRORS,
 )
 async def approve_booking(
     request: Request,
@@ -307,7 +381,7 @@ async def approve_booking(
     "/{booking_id}/cancel",
     response_model=BookingOut,
     summary="Cancel or withdraw (renter or vendor)",
-    responses=_ERRORS,
+    responses=_CANCEL_ERRORS,
 )
 async def cancel_booking(
     request: Request,
@@ -358,7 +432,7 @@ async def _handover(
     "/{booking_id}/handover",
     response_model=BookingOut,
     summary="Fill in and sign the pickup handover (renter or vendor)",
-    responses=_ERRORS,
+    responses=_HANDOVER_ERRORS,
 )
 async def handover_booking(
     body: HandoverSubmit,
@@ -379,7 +453,7 @@ async def handover_booking(
     "/{booking_id}/return",
     response_model=BookingOut,
     summary="Fill in and sign the return (renter or vendor)",
-    responses=_ERRORS,
+    responses=_HANDOVER_ERRORS,
 )
 async def return_booking(
     body: HandoverSubmit,
@@ -400,7 +474,7 @@ async def return_booking(
     "/{booking_id}/claim",
     response_model=BookingOut,
     summary="Claim against the deposit (vendor)",
-    responses=_ERRORS,
+    responses=_CLAIM_ERRORS,
 )
 async def claim_booking(
     body: ClaimCreate,
@@ -426,7 +500,7 @@ async def claim_booking(
     "/{booking_id}/resolve",
     response_model=BookingOut,
     summary="Settle a disputed booking (admin)",
-    responses=_ERRORS,
+    responses=_RESOLVE_ERRORS,
 )
 async def resolve_booking(
     body: Resolve,
