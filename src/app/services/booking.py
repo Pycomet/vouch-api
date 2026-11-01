@@ -436,26 +436,35 @@ def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
     return amount if amount == amount.quantize(CENT) else None
 
 
-async def _booking_payment_id(ctx: _Context) -> uuid.UUID:
-    """The payload's ``payment_id``: this booking's captured upfront payment (A14)."""
+async def _booking_payment_id(ctx: _Context, amount: Decimal) -> uuid.UUID:
+    """The payload's ``payment_id``: this booking's captured upfront payment (A14).
+
+    The payment row must also be for ``amount`` (the payload's, already checked
+    against D + C + R + F); otherwise ``amount_mismatch``.
+    """
     raw = ctx.payload.get("payment_id")
     try:
         payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
     except ValueError:
         payment_id = None
-    found = payment_id is not None and await ctx.session.scalar(
-        select(
-            exists().where(
+    captured = None
+    if payment_id is not None:
+        captured = await ctx.session.scalar(
+            select(Payment.amount).where(
                 Payment.id == payment_id,
                 Payment.booking_id == ctx.booking.id,
                 Payment.type == PaymentType.booking,
                 Payment.status == PaymentStatus.captured,
             )
         )
-    )
-    if not found:
+    if captured is None:
         raise InvalidRequestError(
             "The payment is not this booking's captured payment.", {"payment_id": _plain(raw)}
+        )
+    if captured != amount:
+        raise BookingGuardFailed(
+            "amount_mismatch",
+            {"expected": str(amount), "amount": str(amount), "payment_amount": str(captured)},
         )
     return payment_id
 
@@ -533,7 +542,7 @@ async def _payment_captured(ctx: _Context) -> _Outcome:
             "amount_mismatch",
             {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
         )
-    payment_id = await _booking_payment_id(ctx)
+    payment_id = await _booking_payment_id(ctx, amount)
 
     booking.status = BookingStatus.deposit_paid
     await record_audit(

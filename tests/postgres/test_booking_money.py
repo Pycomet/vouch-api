@@ -327,6 +327,35 @@ async def test_payment_captured_needs_this_bookings_captured_payment(
     assert await _ledger(db_session, booking.id) == []
 
 
+@pytest.mark.parametrize("captured", [TOTAL - D("0.01"), TOTAL + D("0.01"), D("1.00")])
+async def test_payment_captured_needs_the_payment_row_to_match_the_amount(
+    db_session, clock, notifier, captured
+) -> None:
+    booking, _ = await _accepted(db_session)
+    short = await create_payment(db_session, booking, type=PaymentType.booking, amount=captured)
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            Actor.system(),
+            BookingEvent.payment_captured,
+            clock,
+            notifier,
+            {"amount": TOTAL, "payment_id": short.id},
+        )
+
+    assert caught.value.code == "amount_mismatch"
+    assert caught.value.error_details == {
+        "expected": str(TOTAL),
+        "amount": str(TOTAL),
+        "payment_amount": str(captured),
+    }
+    await db_session.refresh(booking)
+    assert booking.status == BookingStatus.accepted
+    assert await _ledger(db_session, booking.id) == []
+
+
 @pytest.mark.parametrize("role", ["renter", "vendor"])
 async def test_only_system_captures_payment(db_session, clock, notifier, role) -> None:
     booking, payment_id = await _accepted(db_session)
