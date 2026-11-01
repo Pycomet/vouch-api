@@ -252,6 +252,22 @@ NO_SHOW_BOOKING_EXAMPLE: dict[str, Any] = {
     "money_line": NO_SHOW_MONEY_LINE,
 }
 
+# Closed before any payment (A18): every part is "cancelled" and nothing is owed.
+CLOSED_UNPAID_MONEY_LINE: dict[str, Any] = {
+    "deposit": {"amount": "150000.00", "status": "cancelled", "held_by": "platform"},
+    "contribution": {"amount": "7500.00", "status": "cancelled"},
+    "rental": {"amount": "150000.00", "status": "cancelled"},
+    "next": {"label": "Closed", "amount_due": "0.00"},
+}
+
+DECLINED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "declined",
+    "hold_expires_at": "2026-11-02T13:00:00Z",
+    "deposit_due_at": None,
+    "money_line": CLOSED_UNPAID_MONEY_LINE,
+}
+
 REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
     **BOOKING_EXAMPLE,
     "status": "requested",

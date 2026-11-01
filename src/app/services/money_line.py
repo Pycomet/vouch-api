@@ -12,17 +12,20 @@ Amounts come from the booking's ``price_snapshot``: D (deposit), C (damage
 contribution), R (rental) and F (delivery fee).
 
 Deposit status: ``held`` while the booking's ``renter_deposit_liability`` is
-positive; ``due`` before payment; once paid and no longer held, the suffix of the
+positive; ``due`` before payment; ``cancelled`` when the booking closed before
+any payment (A18); once paid and no longer held, the suffix of the
 last ``deposit.*`` audit action (``released``, ``deducted``, ``forfeited``), and
 ``released`` after a paid cancellation (full refund). A paid booking whose deposit
 is 0.00 still counts as ``held``.
 
-Rental status (R + F): ``due`` before payment; ``received`` once the one upfront
+Rental status (R + F): ``due`` before payment; ``cancelled`` when the booking
+closed before any payment; ``received`` once the one upfront
 payment is captured (A14); ``refunded`` after a paid cancellation; ``paid_out``
 when payout postings cover the booking's whole vendor payable.
 
-Contribution (C, shown only when C > 0): ``due`` before payment, ``received``
-once paid, ``refunded`` after a paid cancellation.
+Contribution (C, shown only when C > 0): ``due`` before payment, ``cancelled``
+when the booking closed before any payment, ``received`` once paid,
+``refunded`` after a paid cancellation.
 
 Cancellation fee (shown only after a paid renter cancellation): the amount and
 its vendor and platform parts, read from that cancellation's audit row (the
@@ -31,9 +34,11 @@ its vendor and platform parts, read from that cancellation's audit row (the
 Refund (shown only on a booking cancelled after payment): D + C + R + F less the
 cancellation fee, so refund + fee always equals everything paid.
 
-A booking that closed before any payment (declined, expired, withdrawn) keeps
-``due`` for both parts (nothing was ever received) and its next step is
-``Closed`` with nothing to pay.
+A booking that closed before any payment (declined, expired, or cancelled by
+either party) shows ``cancelled`` for every part (A18: nothing was ever received,
+and nothing is still due) and its next step is ``Closed`` with nothing to pay.
+A renter-reported vendor no-show (A17) is a paid vendor cancellation: deposit
+``released``, rental and contribution ``refunded``, refund D + C + R + F.
 """
 
 from __future__ import annotations
@@ -78,6 +83,8 @@ _PAID_LIVE = frozenset(
     }
 )
 _CANCELLED = frozenset({BookingStatus.cancelled_by_renter, BookingStatus.cancelled_by_vendor})
+# Statuses that can close a booking before any payment is captured (A18).
+_CLOSED = frozenset({BookingStatus.declined, BookingStatus.expired, *_CANCELLED})
 _DEPOSIT_ACTIONS = {
     "deposit.released": "released",
     "deposit.deducted": "deducted",
@@ -156,11 +163,16 @@ async def _last_deposit_action(session: AsyncSession, booking: Booking) -> str |
     )
 
 
+def _unpaid_status(booking: Booking) -> str:
+    """Before any payment: ``cancelled`` once the booking has closed, else ``due``."""
+    return "cancelled" if booking.status in _CLOSED else "due"
+
+
 async def _deposit_status(session: AsyncSession, booking: Booking, ledger: _Ledger) -> str:
     if ledger.balance(LedgerAccount.renter_deposit_liability) > 0:
         return "held"
     if booking.status in _UNPAID or not ledger.paid:
-        return "due"
+        return _unpaid_status(booking)
     action = await _last_deposit_action(session, booking)
     if action is not None:
         return _DEPOSIT_ACTIONS[action]
@@ -174,7 +186,7 @@ def _rental_status(booking: Booking, ledger: _Ledger) -> str:
     if ledger.payouts > 0 and ledger.payouts >= payable:
         return "paid_out"
     if not ledger.paid:
-        return "due"
+        return _unpaid_status(booking)
     if booking.status in _CANCELLED:
         return "refunded"
     return "received"
@@ -203,7 +215,7 @@ def _next_step(booking: Booking, zone: ZoneInfo, total: Decimal) -> NextStep:
 
 def _contribution_status(booking: Booking, ledger: _Ledger) -> str:
     if not ledger.paid:
-        return "due"
+        return _unpaid_status(booking)
     if booking.status in _CANCELLED:
         return "refunded"
     return "received"

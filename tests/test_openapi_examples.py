@@ -189,6 +189,17 @@ def test_cancelled_example_adds_up() -> None:
     assert Decimal(fee["vendor_part"]) + Decimal(fee["platform_part"]) == Decimal(fee["amount"])
 
 
+def test_money_line_statuses_include_cancelled(schema) -> None:
+    # A18: a booking that closed before any payment shows "cancelled", not "due".
+    components = schema["components"]["schemas"]
+    for name in ("DepositLine", "RentalLine", "ContributionLine"):
+        assert "cancelled" in components[name]["properties"]["status"]["enum"], name
+    decline = schema["paths"][f"{ACTION}/decline"]["post"]["responses"]["200"]
+    line = decline["content"]["application/json"]["example"]["money_line"]
+    assert {line[part]["status"] for part in ("deposit", "contribution", "rental")} == {"cancelled"}
+    assert line["next"] == {"label": "Closed", "amount_due": "0.00"}
+
+
 def test_no_show_example_refunds_everything(schema) -> None:
     line = examples.NO_SHOW_BOOKING_EXAMPLE["money_line"]
     paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
@@ -205,6 +216,7 @@ def test_no_show_example_refunds_everything(schema) -> None:
     [
         (BookingOut, examples.CANCELLED_BOOKING_EXAMPLE),
         (BookingOut, examples.NO_SHOW_BOOKING_EXAMPLE),
+        (BookingOut, examples.DECLINED_BOOKING_EXAMPLE),
         (PublicAsset, examples.PUBLIC_ASSET_EXAMPLE),
         (Page[PublicAsset], examples.PAGE_EXAMPLE),
         (CatalogueSearchPage, examples.SEARCH_EXAMPLE),

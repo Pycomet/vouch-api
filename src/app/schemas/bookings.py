@@ -195,18 +195,24 @@ class Resolve(BaseModel):
 
 class DepositLine(BaseModel):
     amount: str = Field(description="The deposit hold, D.", examples=["150000.00"])
-    status: Literal["due", "held", "released", "deducted", "forfeited"]
+    status: Literal["due", "held", "released", "deducted", "forfeited", "cancelled"] = Field(
+        description="``cancelled`` when the booking closed before any payment."
+    )
     held_by: Literal["platform"] = "platform"
 
 
 class RentalLine(BaseModel):
     amount: str = Field(description="Rental plus delivery fee, R + F.", examples=["45000.00"])
-    status: Literal["due", "received", "refunded", "paid_out"]
+    status: Literal["due", "received", "refunded", "paid_out", "cancelled"] = Field(
+        description="``cancelled`` when the booking closed before any payment."
+    )
 
 
 class ContributionLine(BaseModel):
     amount: str = Field(description="The damage contribution, C.", examples=["7500.00"])
-    status: Literal["due", "received", "refunded"]
+    status: Literal["due", "received", "refunded", "cancelled"] = Field(
+        description="``cancelled`` when the booking closed before any payment."
+    )
 
 
 class CancellationFeeLine(BaseModel):
@@ -237,9 +243,11 @@ class MoneyLine(BaseModel):
     Computed from the ledger and the booking status on every read; never stored.
     It adds up: while ``accepted``, ``next.amount_due`` is deposit + contribution +
     rental; after a paid cancellation, ``refund`` + ``cancellation_fee`` is
-    everything paid. ``contribution`` appears only when the booking carries one,
-    ``cancellation_fee`` only after a paid renter cancellation, and ``refund`` only
-    on a booking cancelled after payment.
+    everything paid. A booking that closed before any payment (declined, expired
+    or cancelled) shows ``cancelled`` for each part and owes nothing.
+    ``contribution`` appears only when the booking carries one, ``cancellation_fee``
+    only after a paid renter cancellation, and ``refund`` only on a booking
+    cancelled after payment.
     """
 
     deposit: DepositLine

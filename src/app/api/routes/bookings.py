@@ -28,6 +28,7 @@ from app.api.deps import get_clock, get_current_actor, get_notifier, require_rol
 from app.api.examples import (
     BOOKING_EXAMPLE,
     CANCELLED_BOOKING_EXAMPLE,
+    DECLINED_BOOKING_EXAMPLE,
     NO_SHOW_BOOKING_EXAMPLE,
     REQUESTED_BOOKING_EXAMPLE,
     Err,
@@ -349,7 +350,7 @@ async def accept_booking(
     "/{booking_id}/decline",
     response_model=BookingOut,
     summary="Decline a request (vendor)",
-    responses=_action(),
+    responses=_action(example=DECLINED_BOOKING_EXAMPLE),
 )
 async def decline_booking(
     request: Request,

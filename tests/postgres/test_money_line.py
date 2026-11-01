@@ -188,15 +188,23 @@ async def test_accepted_asks_for_the_whole_payment(db_session) -> None:
 
 @pytest.mark.parametrize(
     "status",
-    [BookingStatus.declined, BookingStatus.expired, BookingStatus.cancelled_by_renter],
+    [
+        BookingStatus.declined,
+        BookingStatus.expired,
+        BookingStatus.cancelled_by_renter,
+        BookingStatus.cancelled_by_vendor,
+    ],
 )
 async def test_closed_before_payment_owes_nothing(db_session, status) -> None:
     booking = await _booking(db_session, status)
 
     line = await _line(db_session, booking)
 
-    # Nothing was ever paid: both parts stay "due" (never received), and nothing is owed.
-    assert (line.deposit.status, line.rental.status) == ("due", "due")
+    # A18: nothing was ever paid, so every part is "cancelled" and nothing is owed.
+    assert (line.deposit.status, line.rental.status) == ("cancelled", "cancelled")
+    assert line.contribution.status == "cancelled"
+    assert line.refund is None
+    assert line.cancellation_fee is None
     assert (line.next.label, line.next.amount_due) == ("Closed", "0.00")
 
 
@@ -451,6 +459,7 @@ async def test_unpaid_withdrawal_has_no_refund(db_session, clock, notifier) -> N
 
     line = await _line(db_session, booking)
 
-    assert line.contribution.status == "due"
+    assert (line.deposit.status, line.rental.status) == ("cancelled", "cancelled")
+    assert line.contribution.status == "cancelled"
     assert line.refund is None
     assert line.cancellation_fee is None

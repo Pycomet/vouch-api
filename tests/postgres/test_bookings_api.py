@@ -387,7 +387,12 @@ async def test_decline_with_reason(client, db_session, notifier) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "declined"
-    assert response.json()["money_line"]["next"] == {"label": "Closed", "amount_due": "0.00"}
+    assert response.json()["money_line"] == {
+        "deposit": {"amount": "150000.00", "status": "cancelled", "held_by": "platform"},
+        "contribution": {"amount": "7500.00", "status": "cancelled"},
+        "rental": {"amount": "150000.00", "status": "cancelled"},
+        "next": {"label": "Closed", "amount_due": "0.00"},
+    }
     audit = await db_session.scalar(
         select(AuditEvent).where(
             AuditEvent.entity_id == booking_id, AuditEvent.action == "booking.declined"
@@ -522,6 +527,8 @@ async def test_withdraw_requested_via_api(client, db_session, notifier) -> None:
     body = response.json()
     assert body["status"] == "cancelled_by_renter"
     assert body["money_line"]["next"] == {"label": "Closed", "amount_due": "0.00"}
+    statuses = {part: body["money_line"][part]["status"] for part in ("deposit", "rental")}
+    assert statuses == {"deposit": "cancelled", "rental": "cancelled"}
     rows = await db_session.scalars(select(LedgerEntry).where(LedgerEntry.booking_id == booking_id))
     assert rows.all() == []
     assert [(c.user_id, c.template) for c in notifier.calls] == [
@@ -545,6 +552,25 @@ async def test_vendor_cancel_needs_a_reason(client, db_session) -> None:
 
     assert response.status_code == 409
     assert _error(response)["code"] == "reason_required"
+
+
+async def test_vendor_cancel_of_unpaid_booking_shows_cancelled(client, db_session) -> None:
+    booking_id, parties = await _booking(db_session, BookingStatus.accepted)
+
+    response = await client.post(
+        f"{API}/{booking_id}/cancel", json={"reason": "Kit sold"}, headers=parties.vendor
+    )
+
+    assert response.status_code == 200
+    line = response.json()["money_line"]
+    assert response.json()["status"] == "cancelled_by_vendor"
+    assert [line[part]["status"] for part in ("deposit", "contribution", "rental")] == [
+        "cancelled",
+        "cancelled",
+        "cancelled",
+    ]
+    assert "refund" not in line
+    assert line["next"] == {"label": "Closed", "amount_due": "0.00"}
 
 
 async def test_cancel_confirmed_fee_via_api(client, db_session, clock, notifier) -> None:
