@@ -172,6 +172,12 @@ MONEY_LINE_EXAMPLE: dict[str, Any] = {
     "next": {"label": "Handover Fri 13 Nov", "amount_due": "0.00"},
 }
 
+REQUESTED_MONEY_LINE: dict[str, Any] = {
+    "deposit": {"amount": "150000.00", "status": "due", "held_by": "platform"},
+    "rental": {"amount": "150000.00", "status": "due"},
+    "next": {"label": "Awaiting vendor response", "amount_due": "0.00"},
+}
+
 BOOKING_EXAMPLE: dict[str, Any] = {
     "id": BOOKING_ID,
     "status": "confirmed",
@@ -193,6 +199,14 @@ BOOKING_EXAMPLE: dict[str, Any] = {
         "currency": "NGN",
     },
     "money_line": MONEY_LINE_EXAMPLE,
+}
+
+REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "requested",
+    "hold_expires_at": "2026-11-02T13:00:00Z",
+    "deposit_due_at": None,
+    "money_line": REQUESTED_MONEY_LINE,
 }
 
 _CARD: dict[str, Any] = {
@@ -233,11 +247,7 @@ VENDOR_HOME_EXAMPLE: dict[str, Any] = {
             "starts_on": "2026-11-20",
             "ends_on": "2026-11-22",
             "hold_expires_at": "2026-11-02T13:00:00Z",
-            "money_line": {
-                "deposit": {"amount": "150000.00", "status": "due", "held_by": "platform"},
-                "rental": {"amount": "150000.00", "status": "due"},
-                "next": {"label": "Awaiting vendor response", "amount_due": "0.00"},
-            },
+            "money_line": REQUESTED_MONEY_LINE,
         }
     ],
     "today": {"handovers": [_CARD], "returns": []},

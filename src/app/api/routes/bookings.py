@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, get_current_actor, get_notifier, require_role
+from app.api.examples import BOOKING_EXAMPLE, REQUESTED_BOOKING_EXAMPLE, Err, documented
 from app.core.clock import Clock
 from app.core.config import Settings
 from app.db.models import ActorRole, Booking
@@ -40,7 +41,7 @@ from app.schemas.bookings import (
     Resolve,
     format_money,
 )
-from app.schemas.errors import ErrorEnvelope, ForbiddenError, ResourceNotFoundError
+from app.schemas.errors import ForbiddenError, ResourceNotFoundError
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, request_booking, transition
 from app.services.handover import submit_handover
@@ -50,12 +51,34 @@ from app.services.pricing import money
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
-_ERRORS: dict[int | str, dict[str, Any]] = {
-    401: {"model": ErrorEnvelope, "description": "Missing or invalid bearer token."},
-    403: {"model": ErrorEnvelope, "description": "Your role may not take this action."},
-    404: {"model": ErrorEnvelope, "description": "No such booking, or not yours to see."},
-    409: {"model": ErrorEnvelope, "description": "Not allowed in the booking's current state."},
-}
+# Every route on an existing booking: 401, 404 (R19), 403, 409 and 422 (bad id/body).
+_ERRORS = documented(200, BOOKING_EXAMPLE, 401, 403, 404, 409, 422)
+_CREATE_ERRORS = documented(
+    201,
+    REQUESTED_BOOKING_EXAMPLE,
+    Err(
+        400,
+        "invalid_request",
+        "The request is invalid.",
+        {"starts_on": "2026-11-15"},
+        description="Invalid dates.",
+    ),
+    401,
+    403,
+    Err(
+        404,
+        "resource_not_found",
+        "The requested resource was not found.",
+        description="No such asset.",
+    ),
+    Err(
+        409,
+        "dates_unavailable",
+        "These dates are no longer available.",
+        description="A guard failed (dates, tier, restriction...).",
+    ),
+    422,
+)
 
 _PARTIES = (ActorRole.renter, ActorRole.vendor)
 _PRICE_KEYS = ("rental_total", "delivery_fee", "deposit", "damage_contribution")
@@ -176,7 +199,7 @@ def _reason(body: ReasonBody | None) -> dict[str, Any]:
     response_model=BookingOut,
     status_code=status.HTTP_201_CREATED,
     summary="Request a booking",
-    responses={**_ERRORS, 400: {"model": ErrorEnvelope, "description": "Invalid dates."}},
+    responses=_CREATE_ERRORS,
 )
 async def create_booking(
     body: BookingCreate,
