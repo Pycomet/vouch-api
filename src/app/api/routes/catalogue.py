@@ -60,16 +60,15 @@ async def search_catalogue(
     launched_cities: list[str] = Depends(get_launched_cities),
 ) -> CatalogueSearchPage:
     """Units matching ``q`` that are free on the dates, or free equivalents."""
+    # Details name only the dates that were given (no "None" strings).
+    given = {key: day.isoformat() for key, day in (("from", from_), ("to", to)) if day}
     if (from_ is None) != (to is None):
         raise InvalidRequestError(
             message="Both 'from' and 'to' are required together for date filtering.",
-            details={"from": str(from_), "to": str(to)},
+            details=given,
         )
     if from_ is not None and to is not None and from_ > to:
-        raise InvalidRequestError(
-            message="'from' must not be after 'to'.",
-            details={"from": str(from_), "to": str(to)},
-        )
+        raise InvalidRequestError(message="'from' must not be after 'to'.", details=given)
     if cursor is not None:
         decode_cursor(cursor)  # CursorDecodeError (400) before any query
 

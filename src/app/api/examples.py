@@ -274,7 +274,7 @@ INVALID_DATES = Err(
     400,
     "invalid_request",
     "Both dates are required together for date filtering.",
-    {"from": "2026-11-13", "to": "None"},
+    {"from": "2026-11-13"},
     description="Dates missing or reversed.",
 )
 INVALID_CURSOR = Err(

@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncIterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,14 +23,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_clock, get_notifier
 from app.core.clock import FrozenClock
 from app.core.config import get_settings
-from app.db.models import LedgerAccount
+from app.db.models import Booking, LedgerAccount
 from app.db.models.asset import ListingStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
+from app.db.models.handover import HandoverDirection
 from app.db.models.ledger import Direction
+from app.db.models.payment import PaymentType
 from app.db.models.user import RenterRole
 from app.db.session import get_session
 from app.main import create_app
+from app.services.audit import Actor
+from app.services.booking import BookingEvent, transition
 from app.services.ledger import Posting, post_txn
 from app.services.notify import RecordingNotifier
 from tests.helpers.auth import bearer
@@ -38,6 +42,8 @@ from tests.postgres.factories import (
     DEFAULT_NOW,
     create_asset,
     create_booking,
+    create_handover,
+    create_payment,
     create_user,
     money_snapshot,
 )
@@ -96,7 +102,7 @@ async def _book(session, asset, renter, status, start, end=None, **kwargs):
         renter=renter,
         status=status,
         starts_on=start,
-        ends_on=end or start + timedelta(days=2),
+        ends_on=end or (start + timedelta(days=2) if start else None),
         price_snapshot=money_snapshot(),
         **kwargs,
     )
@@ -133,6 +139,28 @@ async def test_vendor_home_requests_ordered_by_hold_expiry(client, db_session) -
     assert requests[0]["hold_expires_at"].startswith("2026-11-02T10:00:00")
     assert requests[0]["status"] == "requested"
     assert requests[0]["money_line"]["next"]["label"] == "Awaiting vendor response"
+
+
+async def test_vendor_home_requests_skip_lapsed_holds(client, db_session) -> None:
+    """A request whose hold has already lapsed (not yet swept by the timer) is gone."""
+    vendor = await _vendor(db_session)
+    renter = await _renter(db_session)
+    lapsed = await _book(
+        db_session, await create_asset(db_session, vendor=vendor), renter,
+        BookingStatus.requested, TODAY + timedelta(10),
+    )  # fmt: skip
+    lapsed.hold_expires_at = DEFAULT_NOW  # lapses exactly now
+    still_open = await _book(
+        db_session, await create_asset(db_session, vendor=vendor), renter,
+        BookingStatus.requested, TODAY + timedelta(11),
+    )  # fmt: skip
+    still_open.hold_expires_at = DEFAULT_NOW + timedelta(minutes=1)
+    await db_session.flush()
+    open_id = str(still_open.id)
+
+    response = await client.get("/api/v1/vendor/home", headers=auth(vendor.id, ActorRole.vendor))
+
+    assert [card["id"] for card in response.json()["requests"]] == [open_id]
 
 
 async def test_vendor_home_today_lists(client, db_session) -> None:
@@ -253,6 +281,73 @@ async def test_vendor_home_next_payout(client, db_session) -> None:
     assert response.json()["next_payout"] == "100000.00"
 
 
+async def _move(session, booking_id, actor, event, at, payload=None) -> None:
+    await transition(
+        session, booking_id, actor, event, payload,
+        clock=FrozenClock(at), notifier=RecordingNotifier(), settings=get_settings(),
+    )  # fmt: skip
+
+
+async def _paid(session, asset, renter) -> uuid.UUID:
+    """A booking paid in full through the booking service (R 150000, K 22500, D 150000)."""
+    booking = await _book(session, asset, renter, BookingStatus.accepted, None)
+    total = D("300000.00")  # D 150000 + C 0 + R 150000 + F 0
+    payment = await create_payment(session, booking, type=PaymentType.booking, amount=total)
+    await _move(
+        session, booking.id, Actor.system(), BookingEvent.payment_captured, DEFAULT_NOW,
+        {"amount": total, "payment_id": payment.id},
+    )  # fmt: skip
+    return booking.id
+
+
+async def _handed_over(session, asset, renter) -> Booking:
+    booking_id = await _paid(session, asset, renter)
+    booking = await session.get(Booking, booking_id)
+    await create_handover(session, booking, direction=HandoverDirection.pickup)
+    await _move(session, booking_id, Actor.system(), BookingEvent.handover_completed, DEFAULT_NOW)
+    return booking
+
+
+async def test_vendor_home_next_payout_counts_cancellation_fee_share(client, db_session) -> None:
+    vendor = await _vendor(db_session)
+    renter = await _renter(db_session)
+    done = await _handed_over(db_session, await create_asset(db_session, vendor=vendor), renter)
+    await create_handover(db_session, done, direction=HandoverDirection.return_)
+    await _move(db_session, done.id, Actor.system(), BookingEvent.return_completed, DEFAULT_NOW)
+    after_window = done.claim_window_ends_at + timedelta(minutes=1)
+    await _move(db_session, done.id, Actor.system(), BookingEvent.complete, after_window)
+    cancelled = await _paid(db_session, await create_asset(db_session, vendor=vendor), renter)
+    await _move(
+        db_session, cancelled, Actor(renter.id, ActorRole.renter), BookingEvent.cancel,
+        DEFAULT_NOW,
+    )  # fmt: skip
+    # A paid booking that is still live is not owed yet.
+    await _paid(db_session, await create_asset(db_session, vendor=vendor), renter)
+
+    response = await client.get("/api/v1/vendor/home", headers=auth(vendor.id, ActorRole.vendor))
+
+    # Completed: R + F - K = 150000 - 22500 = 127500. Cancelled: the vendor's half
+    # of the 10% cancellation fee, 7500.
+    assert response.json()["next_payout"] == "135000.00"
+
+
+async def test_vendor_home_next_payout_counts_lost_forfeit(client, db_session) -> None:
+    vendor = await _vendor(db_session)
+    renter = await _renter(db_session)
+    admin = await create_user(db_session, role=RenterRole.admin)
+    booking = await _handed_over(db_session, await create_asset(db_session, vendor=vendor), renter)
+    lost_at = datetime.combine(booking.ends_on + timedelta(days=8), time(12), tzinfo=UTC)
+    await _move(
+        db_session, booking.id, Actor(admin.id, ActorRole.admin), BookingEvent.mark_lost,
+        lost_at, {"reason": "No contact since the return date"},
+    )  # fmt: skip
+
+    response = await client.get("/api/v1/vendor/home", headers=auth(vendor.id, ActorRole.vendor))
+
+    # R + F - K (127500) plus the forfeited deposit (150000).
+    assert response.json()["next_payout"] == "277500.00"
+
+
 async def test_vendor_home_refuses_a_renter(client, db_session) -> None:
     renter = await _renter(db_session)
 
@@ -290,17 +385,21 @@ async def test_me_home_active_and_past(client, db_session) -> None:
     newer = await _book(
         db_session, await asset(), renter, BookingStatus.declined, date(2026, 10, 1)
     )
-    # Not the caller's, and neither live nor terminal: none of them is listed.
+    # Not the caller's: never listed. A disputed booking starting after the soonest
+    # live one is not the active card, and it is never in ``past``.
     await _book(
         db_session, await asset(), await _renter(db_session), BookingStatus.confirmed, TODAY
     )
-    await _book(
-        db_session, await asset(), renter, BookingStatus.disputed, date(2026, 10, 10),
-    )  # fmt: skip
+    disputed = await _book(
+        db_session, await asset(), renter, BookingStatus.disputed, TODAY + timedelta(20)
+    )
     ids = {
         name: str(b.id)
-        for name, b in (("later", later), ("soonest", soonest), ("old", old), ("newer", newer))
-    }
+        for name, b in (
+            ("later", later), ("soonest", soonest), ("old", old), ("newer", newer),
+            ("disputed", disputed),
+        )
+    }  # fmt: skip
 
     response = await client.get("/api/v1/me/home", headers=auth(renter.id, ActorRole.renter))
 
@@ -315,6 +414,29 @@ async def test_me_home_active_and_past(client, db_session) -> None:
     }
     assert [card["id"] for card in body["past"]] == [ids["newer"], ids["old"]]
     assert ids["later"] not in {card["id"] for card in body["past"]}
+    assert ids["disputed"] not in {card["id"] for card in body["past"]}
+
+
+async def test_me_home_disputed_booking_is_the_active_card(client, db_session) -> None:
+    """A disputed booking stays on the renter's home while it is under review."""
+    renter = await _renter(db_session)
+    disputed = await _book(
+        db_session, await create_asset(db_session), renter, BookingStatus.disputed,
+        date(2026, 10, 10),
+    )  # fmt: skip
+    await _book(
+        db_session, await create_asset(db_session), renter, BookingStatus.confirmed,
+        TODAY + timedelta(5),
+    )  # fmt: skip
+    disputed_id = str(disputed.id)
+
+    response = await client.get("/api/v1/me/home", headers=auth(renter.id, ActorRole.renter))
+
+    body = response.json()
+    assert body["active"]["id"] == disputed_id
+    assert body["active"]["status"] == "disputed"
+    assert body["active"]["money_line"]["next"]["label"] == "Under review"
+    assert body["past"] == []
 
 
 async def test_me_home_past_is_capped_at_twenty(client, db_session) -> None:

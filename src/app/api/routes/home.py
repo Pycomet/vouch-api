@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, require_role
 from app.api.examples import RENTER_HOME_EXAMPLE, VENDOR_HOME_EXAMPLE, documented
-from app.core.clock import Clock, business_date
+from app.core.clock import Clock
 from app.core.config import Settings
 from app.db.models import ActorRole
 from app.db.session import get_session
@@ -56,10 +56,4 @@ async def get_vendor_home(
 ) -> VendorHome:
     """Open requests (the hold that lapses first on top), today's handovers and
     returns, the next payout and the 7-day utilisation."""
-    settings = _settings(request)
-    return await vendor_home(
-        session,
-        actor.user_id,
-        today=business_date(clock.now(), settings.business_zone),
-        settings=settings,
-    )
+    return await vendor_home(session, actor.user_id, now=clock.now(), settings=_settings(request))

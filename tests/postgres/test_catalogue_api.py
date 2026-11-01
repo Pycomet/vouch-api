@@ -153,7 +153,10 @@ async def test_catalogue_search_bad_dates_400(client, params) -> None:
     response = await client.get(API, params=params)
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    # Details echo only the dates given, never a "None" string.
+    assert error["details"] == params
 
 
 async def test_catalogue_search_bad_cursor_400(client) -> None:

@@ -1,18 +1,23 @@
 """The renter's and the vendor's home screens (spec 3.3).
 
 Renter (``renter_home``)
-    ``active`` is the renter's live booking (``LIVE_BOOKING_STATUSES``) that starts
-    soonest; ``past`` holds terminal bookings (``TERMINAL_BOOKING_STATUSES``),
-    newest start first, at most :data:`PAST_LIMIT`. A ``disputed`` booking is
-    neither live nor terminal and appears in neither list.
+    ``active`` is the renter's booking that starts soonest among the live
+    statuses (``LIVE_BOOKING_STATUSES``) and ``disputed`` (under review, so still
+    the renter's concern); ``past`` holds terminal bookings
+    (``TERMINAL_BOOKING_STATUSES``), newest start first, at most :data:`PAST_LIMIT`.
 
-Vendor (``vendor_home``), with ``today`` the business date of the caller's clock
-    * ``requests``: ``requested`` bookings, ``hold_expires_at`` ascending (spec 5).
+Vendor (``vendor_home``), with ``today`` the business date of ``now``
+    * ``requests``: ``requested`` bookings whose hold has not lapsed
+      (``hold_expires_at > now``; a lapsed one is only waiting for the timer),
+      ``hold_expires_at`` ascending (spec 5).
     * ``today.handovers``: ``confirmed`` bookings starting today;
       ``today.returns``: ``in_progress`` bookings ending today.
-    * ``next_payout``: the credit-normal ``vendor_payable`` balance over the
-      vendor's ``completed`` bookings. Payout postings debit ``vendor_payable``,
-      so the balance is already net of what has been paid out (none in M2).
+    * ``next_payout``: the credit-normal, booking-scoped ``vendor_payable``
+      balance over the vendor's terminal bookings: completed rentals, the
+      vendor's share of a paid renter cancellation's fee, a lost item's forfeited
+      deposit (fully reversed bookings add 0). Payout postings debit
+      ``vendor_payable``, so the balance is already net of what has been paid out
+      (none in M2).
     * ``utilisation_7d``: booked asset-days in live and ``completed`` bookings over
       ``[today, today + 6]``, divided by (active listings x 7), rounded half up to
       two places; ``"0.00"`` without active listings. Only bookings of the
@@ -30,6 +35,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from sqlalchemy import Select, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import business_date
 from app.core.config import Settings
 from app.db.models import Asset, Booking, CatalogueItem, LedgerAccount, LedgerEntry
 from app.db.models.asset import ListingStatus
@@ -44,6 +50,8 @@ from app.schemas.home import BookingCard, RenterHome, VendorHome, VendorToday
 from app.services.money_line import compute_money_line
 
 PAST_LIMIT = 20
+# Statuses the renter's active card may show: live, or under review.
+ACTIVE_CARD_STATUSES = LIVE_BOOKING_STATUSES | {BookingStatus.disputed}
 UTILISATION_DAYS = 7
 _RATIO = Decimal("0.01")
 
@@ -81,7 +89,7 @@ async def renter_home(
     mine = _cards_query().where(Booking.renter_id == renter_id)
     active = await _cards(
         session,
-        mine.where(Booking.status.in_(LIVE_BOOKING_STATUSES))
+        mine.where(Booking.status.in_(ACTIVE_CARD_STATUSES))
         .order_by(Booking.starts_on.asc(), Booking.created_at.asc(), Booking.id.asc())
         .limit(1),
         settings,
@@ -106,7 +114,7 @@ async def _next_payout(session: AsyncSession, vendor_id: uuid.UUID) -> Decimal:
         .join(Booking, Booking.id == LedgerEntry.booking_id)
         .where(
             Booking.vendor_id == vendor_id,
-            Booking.status == BookingStatus.completed,
+            Booking.status.in_(TERMINAL_BOOKING_STATUSES),
             LedgerEntry.account == LedgerAccount.vendor_payable.value,
         )
     )
@@ -150,16 +158,17 @@ async def vendor_home(
     session: AsyncSession,
     vendor_id: uuid.UUID,
     *,
-    today: datetime.date,
+    now: datetime.datetime,
     settings: Settings,
 ) -> VendorHome:
     """The vendor's open requests, today's handovers and returns, payout and use."""
+    today = business_date(now, settings.business_zone)
     mine = _cards_query().where(Booking.vendor_id == vendor_id)
     requests = await _cards(
         session,
-        mine.where(Booking.status == BookingStatus.requested).order_by(
-            Booking.hold_expires_at.asc(), Booking.id.asc()
-        ),
+        mine.where(
+            Booking.status == BookingStatus.requested, Booking.hold_expires_at > now
+        ).order_by(Booking.hold_expires_at.asc(), Booking.id.asc()),
         settings,
     )
     handovers = await _cards(
