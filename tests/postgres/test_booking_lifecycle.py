@@ -28,7 +28,7 @@ from app.db.models import Asset, AuditEvent, Booking, LedgerAccount, LedgerEntry
 from app.db.models.asset import ListingStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
-from app.db.models.handover import HandoverDirection
+from app.db.models.handover import HandoverDirection, HandoverStatus
 from app.db.models.payment import PaymentType
 from app.db.models.user import RenterRole
 from app.schemas.errors import BookingGuardFailed, InvalidRequestError, InvalidTransition
@@ -345,6 +345,197 @@ async def test_cancel_with_only_a_draft_pickup_is_allowed(db_session, clock, not
     )
 
     assert result.status == BookingStatus.cancelled_by_renter
+
+
+# ---------------------------------------------------------------------------
+# confirmed + report_no_show -> cancelled_by_vendor (A17): full refund, penalty
+# ---------------------------------------------------------------------------
+
+
+def _no_show_from(booking: Booking) -> datetime:
+    """00:00 (business zone) on ``starts_on``: the first instant a no-show counts."""
+    return start_of_business_day(booking.starts_on, get_settings().business_zone)
+
+
+async def _report_no_show(session, booking, clock, notifier, payload=None) -> Booking:
+    return await _transition(
+        session,
+        booking,
+        renter_actor(booking),
+        BookingEvent.report_no_show,
+        clock,
+        notifier,
+        payload,
+    )
+
+
+async def _assert_no_show_refused(session, booking, clock, notifier, code: str) -> None:
+    counts = await _counts(session)
+    penalties = len(await _audits(session, booking.vendor_id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _report_no_show(session, booking, clock, notifier)
+
+    assert caught.value.code == code
+    assert await _counts(session) == counts
+    assert len(await _audits(session, booking.vendor_id)) == penalties
+    await session.refresh(booking)
+    assert booking.status == BookingStatus.confirmed
+    assert booking.cancelled_at is None
+    assert booking.cancellation_reason is None
+    assert notifier.calls == []
+
+
+async def test_no_show_before_the_start_is_too_early(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    just_before = FrozenClock(_no_show_from(booking) - timedelta(microseconds=1))
+
+    await _assert_no_show_refused(db_session, booking, just_before, notifier, "no_show_too_early")
+
+
+async def test_no_show_at_local_midnight_on_the_start_day_is_allowed(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    opens = _no_show_from(booking)
+    # 00:00 Africa/Lagos on 4 Jan is 23:00 UTC on 3 Jan.
+    assert opens == datetime(2027, 1, 3, 23, 0, tzinfo=UTC)
+
+    result = await _report_no_show(db_session, booking, FrozenClock(opens), notifier)
+
+    assert result.status == BookingStatus.cancelled_by_vendor
+    assert result.cancelled_at == opens
+
+
+async def test_no_show_after_a_completed_pickup_is_refused(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    await create_handover(db_session, booking)
+
+    await _assert_no_show_refused(
+        db_session, booking, FrozenClock(_no_show_from(booking)), notifier, "handover_signed"
+    )
+
+
+async def test_no_show_after_the_vendor_signed_the_pickup_is_refused(db_session, notifier) -> None:
+    # The vendor signed its side; the renter has not (and may refuse to).
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    record = await create_handover(db_session, booking, completed=False)
+    record.status = HandoverStatus.vendor_signed
+    record.vendor_signer_id = booking.vendor_id
+    record.vendor_signed_at = DEFAULT_NOW
+    await db_session.flush()
+
+    await _assert_no_show_refused(
+        db_session,
+        booking,
+        FrozenClock(_no_show_from(booking)),
+        notifier,
+        "vendor_signed_handover",
+    )
+
+
+async def test_no_show_with_only_a_draft_pickup_is_allowed(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    await create_handover(db_session, booking, completed=False)
+
+    result = await _report_no_show(
+        db_session, booking, FrozenClock(_no_show_from(booking)), notifier
+    )
+
+    assert result.status == BookingStatus.cancelled_by_vendor
+
+
+async def test_no_show_refunds_everything_and_penalises_the_vendor(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    clock = FrozenClock(_no_show_from(booking) + timedelta(hours=10))
+    last_id = await _last_audit_id(db_session)
+
+    result = await transition(
+        db_session,
+        booking.id,
+        renter_actor(booking),
+        BookingEvent.report_no_show,
+        {"reason": "Nobody at the address"},
+        clock=clock,
+        notifier=notifier,
+        settings=get_settings(),
+        request_id="req_no_show",
+    )
+
+    assert result.status == BookingStatus.cancelled_by_vendor
+    assert result.cancelled_at == clock.now()
+    assert result.cancellation_reason == "vendor_no_show: Nobody at the address"
+    for account in (
+        LedgerAccount.vendor_payable,
+        LedgerAccount.platform_revenue,
+        LedgerAccount.renter_deposit_liability,
+        LedgerAccount.protection_pool,
+        LedgerAccount.platform_cash,
+    ):
+        assert await _balance(db_session, account, booking.id) == ZERO, account
+    assert await _whole_ledger_balanced(db_session)
+    # No fee: no cancellation_fee group.
+    assert "cancellation_fee" not in {row.memo for row in await _ledger(db_session, booking.id)}
+
+    rows = await _audits_after(db_session, last_id)
+    assert [(row.entity, row.action) for row in rows] == [
+        ("user", "vendor.reliability_penalty"),
+        ("booking", "booking.cancelled_by_vendor"),
+    ]
+    assert {row.request_id for row in rows} == {"req_no_show"}
+    penalty, cancelled = rows
+    assert penalty.entity_id == booking.vendor_id
+    assert penalty.reason == "vendor_no_show"
+    assert penalty.after["booking_id"] == str(booking.id)
+    assert cancelled.reason == "vendor_no_show: Nobody at the address"
+    assert cancelled.after["refund"] == {
+        "deposit": str(DEPOSIT),
+        "damage_contribution": str(CONTRIBUTION),
+        "rental": str(RENTAL),
+        "delivery_fee": str(DELIVERY),
+        "commission": str(COMMISSION),
+    }
+    assert "cancellation_fee" not in cancelled.after
+
+    assert [(c.user_id, c.template) for c in notifier.calls] == [
+        (booking.renter_id, "booking.no_show_refunded"),
+        (booking.vendor_id, "booking.no_show_reported"),
+        (None, "ops.vendor_no_show"),
+    ]
+    assert notifier.calls[2].data["vendor_id"] == str(booking.vendor_id)
+
+
+@pytest.mark.parametrize("role", [ActorRole.vendor, ActorRole.system, ActorRole.admin])
+async def test_only_the_renter_reports_a_no_show(db_session, notifier, role) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    actors = {
+        ActorRole.vendor: vendor_actor(booking),
+        ActorRole.system: Actor.system(),
+        ActorRole.admin: await admin_actor(db_session),
+    }
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session,
+            booking,
+            actors[role],
+            BookingEvent.report_no_show,
+            FrozenClock(_no_show_from(booking)),
+            notifier,
+        )
+
+
+async def test_another_renter_cannot_report_a_no_show(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    stranger = await create_user(db_session, kyc_verified=True)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session,
+            booking,
+            Actor(user_id=stranger.id, role=ActorRole.renter),
+            BookingEvent.report_no_show,
+            FrozenClock(_no_show_from(booking)),
+            notifier,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1375,6 +1566,25 @@ async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
     assert asset.listing_status == ListingStatus.paused
 
 
+async def test_row_confirmed_report_no_show(db_session, notifier) -> None:
+    booking = await _paid(db_session, BookingStatus.confirmed)
+
+    result = await _transition(
+        db_session,
+        booking,
+        renter_actor(booking),
+        BookingEvent.report_no_show,
+        FrozenClock(_no_show_from(booking)),
+        notifier,
+    )
+
+    assert result.status == BookingStatus.cancelled_by_vendor
+    assert result.cancellation_reason == "vendor_no_show"
+    assert (await _audits(db_session, booking.id))[-1].action == "booking.cancelled_by_vendor"
+    penalty = (await _audits(db_session, booking.vendor_id))[-1]
+    assert (penalty.action, penalty.reason) == ("vendor.reliability_penalty", "vendor_no_show")
+
+
 # ---------------------------------------------------------------------------
 # Spec 3.1 coverage: every pair the table does not allow is refused
 # ---------------------------------------------------------------------------
@@ -1382,7 +1592,7 @@ async def test_row_in_progress_mark_lost(db_session, clock, notifier) -> None:
 S, E = BookingStatus, BookingEvent
 
 # Written out by hand from spec 3.1 as amended (A3 vendor approval; A13/R14 free
-# withdrawal; A14 one upfront payment, so no balance step), so a registry bug
+# withdrawal; A14 one upfront payment, so no balance step; A17 vendor no-show), so a registry bug
 # cannot silently shrink the forbidden list below.
 EXPECTED_ALLOWED = frozenset(
     {
@@ -1396,6 +1606,7 @@ EXPECTED_ALLOWED = frozenset(
         (S.accepted, E.cancel),
         (S.confirmed, E.cancel),
         (S.confirmed, E.handover_completed),
+        (S.confirmed, E.report_no_show),
         (S.in_progress, E.return_completed),
         (S.in_progress, E.flag_at_risk),
         (S.in_progress, E.mark_lost),
@@ -1428,13 +1639,14 @@ EVENT_ROLE = {
     E.resolve: ActorRole.admin,
     E.flag_at_risk: ActorRole.system,
     E.mark_lost: ActorRole.admin,
+    E.report_no_show: ActorRole.renter,
 }
 
 
 def test_registry_is_exactly_the_spec_table() -> None:
     assert set(booking_service._TRANSITIONS) == EXPECTED_ALLOWED
     assert len(FORBIDDEN) == len(BookingStatus) * len(BookingEvent) - len(EXPECTED_ALLOWED)
-    assert len(FORBIDDEN) == 166
+    assert len(FORBIDDEN) == 178  # 13 statuses x 15 events - 17 rows
     for (_status, event), rule in booking_service._TRANSITIONS.items():
         assert EVENT_ROLE[event] in rule.roles
 

@@ -186,6 +186,10 @@ _GUARD_MESSAGES = {
     "handover_signed": "The item has been handed over; the booking can no longer be cancelled.",
     "approval_not_required": "This item does not need the vendor's approval of the renter.",
     "handover_already_signed": "You have already signed this handover record.",
+    "no_show_too_early": "A no-show can only be reported from the start day of the rental.",
+    "vendor_signed_handover": (
+        "The vendor has signed the pickup handover; a no-show cannot be reported."
+    ),
 }
 
 

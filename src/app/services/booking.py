@@ -120,6 +120,7 @@ class BookingEvent(StrEnum):
     resolve = "resolve"
     flag_at_risk = "flag_at_risk"
     mark_lost = "mark_lost"
+    report_no_show = "report_no_show"
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +605,17 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
     return _Outcome(notices=_both(booking, "booking.expired"))
 
 
-async def _close_cancelled(ctx: _Context, status: BookingStatus, reason: str | None) -> None:
-    """Set the cancelled columns; a vendor cancel also writes the penalty audit row."""
+async def _close_cancelled(
+    ctx: _Context,
+    status: BookingStatus,
+    reason: str | None,
+    *,
+    penalty_reason: str | None = None,
+) -> None:
+    """Set the cancelled columns; a vendor cancel also writes the penalty audit row.
+
+    The penalty row's reason is ``penalty_reason`` when given, else ``reason``.
+    """
     booking = ctx.booking
     booking.status = status
     booking.cancelled_at = ctx.now
@@ -619,7 +629,7 @@ async def _close_cancelled(ctx: _Context, status: BookingStatus, reason: str | N
             action="vendor.reliability_penalty",
             before=None,
             after={"booking_id": booking.id, "status": status},
-            reason=reason,
+            reason=penalty_reason or reason,
             request_id=ctx.request_id,
         )
 
@@ -653,6 +663,30 @@ async def _cancel_unpaid(ctx: _Context) -> _Outcome:
     return _Outcome(reason=reason, notices=notices)
 
 
+async def _reverse_capture(ctx: _Context, amounts: _Money) -> dict[str, Any]:
+    """Reverse the whole upfront payment, so every booking account returns to 0.
+
+    Each part goes back in its own txn_group (deposit, contribution, rental with
+    the delivery fee and commission). Returns the refund breakdown for the audit row.
+    """
+    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund")
+    await _post(
+        ctx, refund_contribution_postings(amounts.contribution), "cancel_contribution_refund"
+    )
+    await _post(
+        ctx,
+        rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
+        "cancel_rental_refund",
+    )
+    return {
+        "deposit": amounts.deposit,
+        "damage_contribution": amounts.contribution,
+        "rental": amounts.rental,
+        "delivery_fee": amounts.delivery_fee,
+        "commission": amounts.commission,
+    }
+
+
 @_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
 async def _cancel_paid(ctx: _Context) -> _Outcome:
     """Cancel a paid booking: everything goes back, less the renter's fee (A13, R15).
@@ -682,23 +716,7 @@ async def _cancel_paid(ctx: _Context) -> _Outcome:
         status = BookingStatus.cancelled_by_vendor
 
     amounts = _money(booking)
-    refund: dict[str, Any] = {
-        "deposit": amounts.deposit,
-        "damage_contribution": amounts.contribution,
-        "rental": amounts.rental,
-        "delivery_fee": amounts.delivery_fee,
-        "commission": amounts.commission,
-    }
-    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund")
-    await _post(
-        ctx, refund_contribution_postings(amounts.contribution), "cancel_contribution_refund"
-    )
-    await _post(
-        ctx,
-        rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
-        "cancel_rental_refund",
-    )
-    after: dict[str, Any] = {"refund": refund}
+    after: dict[str, Any] = {"refund": await _reverse_capture(ctx, amounts)}
     if status == BookingStatus.cancelled_by_renter:
         fee = cancellation_fee_amount(
             amounts.rental, Decimal(booking.price_snapshot["cancellation_fee_rate"])
@@ -774,6 +792,61 @@ async def _return_completed(ctx: _Context) -> _Outcome:
         notices=_both(
             booking, "booking.returned", claim_window_ends_at=booking.claim_window_ends_at
         )
+    )
+
+
+NO_SHOW_REASON = "vendor_no_show"
+
+
+async def _vendor_signed(ctx: _Context, direction: HandoverDirection) -> bool:
+    """Whether the vendor has signed its side of this booking's ``direction`` record."""
+    return bool(
+        await ctx.session.scalar(
+            select(
+                exists().where(
+                    HandoverRecord.booking_id == ctx.booking.id,
+                    HandoverRecord.direction == direction,
+                    HandoverRecord.vendor_signed_at.is_not(None),
+                )
+            )
+        )
+    )
+
+
+@_register(BookingStatus.confirmed, BookingEvent.report_no_show, ActorRole.renter)
+async def _report_no_show(ctx: _Context) -> _Outcome:
+    """The renter reports that the vendor did not hand the item over (A17).
+
+    From 00:00 (business zone) on ``starts_on``, and only while the vendor has not
+    signed the pickup handover (a completed pickup is ``handover_signed``; the
+    vendor's side alone is ``vendor_signed_handover``, so a renter cannot refuse to
+    sign a real pickup and then claim a no-show). The booking closes as
+    ``cancelled_by_vendor`` with a full refund and no fee, the same postings as a
+    vendor cancellation of a paid booking, and the vendor's reliability penalty.
+    """
+    booking = ctx.booking
+    opens = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
+    if not ctx.now >= opens:
+        raise BookingGuardFailed("no_show_too_early", {"report_from": _plain(opens)})
+    if await _handover_done(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("handover_signed")
+    if await _vendor_signed(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("vendor_signed_handover")
+
+    note = _reason(ctx.payload)
+    reason = NO_SHOW_REASON if note is None else f"{NO_SHOW_REASON}: {note}"
+    after = {"refund": await _reverse_capture(ctx, _money(booking))}
+    await _close_cancelled(
+        ctx, BookingStatus.cancelled_by_vendor, reason, penalty_reason=NO_SHOW_REASON
+    )
+    return _Outcome(
+        after=after,
+        reason=reason,
+        notices=(
+            _notice(booking, booking.renter_id, "booking.no_show_refunded"),
+            _notice(booking, booking.vendor_id, "booking.no_show_reported"),
+            _ops(booking, "vendor_no_show", vendor_id=booking.vendor_id),
+        ),
     )
 
 

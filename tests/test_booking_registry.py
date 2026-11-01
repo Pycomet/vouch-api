@@ -114,3 +114,18 @@ def test_invalid_transition_details() -> None:
     assert error.status_code == 409
     assert error.code == "invalid_transition"
     assert error.error_details == {"from": "requested", "event": "cancel"}
+
+
+def test_no_show_row_registered_for_the_renter() -> None:
+    # A17: the renter reports a vendor no-show on a paid, confirmed booking.
+    rule = booking_service._TRANSITIONS[(BookingStatus.confirmed, BookingEvent.report_no_show)]
+
+    assert rule.roles == {ActorRole.renter}
+    assert rule.party_only is True
+
+
+@pytest.mark.parametrize("code", ["no_show_too_early", "vendor_signed_handover"])
+def test_no_show_guard_codes(code: str) -> None:
+    error = BookingGuardFailed(code)
+
+    assert (error.status_code, error.code) == (409, code)
