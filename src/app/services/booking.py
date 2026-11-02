@@ -92,9 +92,11 @@ from app.services.money import (
 from app.services.notify import Notifier
 from app.services.payments import (
     captured_booking_payment,
+    fail_pending_booking_payment,
     open_booking_account,
     payment_instructions,
     record_refund,
+    refund_to_renter,
 )
 from app.services.pricing import money, price_snapshot
 from app.services.trust import required_tier_met, tier_effective
@@ -644,6 +646,7 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
     booking = ctx.booking
     if not ctx.now > booking.deposit_due_at:
         raise InvalidTransition(booking.status.value, ctx.event.value)
+    await fail_pending_booking_payment(ctx.session, booking.id, ctx.now)
     booking.status = BookingStatus.expired
     return _Outcome(notices=_both(booking, "booking.expired"))
 
@@ -703,6 +706,9 @@ async def _cancel_unpaid(ctx: _Context) -> _Outcome:
         reason = _vendor_reason(ctx)
         await _close_cancelled(ctx, BookingStatus.cancelled_by_vendor, reason)
         notices = _both(booking, "booking.cancelled")
+    # An accepted booking's virtual account is no longer expected to be paid (N1);
+    # a request has no payment row, so this is a no-op there.
+    await fail_pending_booking_payment(ctx.session, booking.id, ctx.now)
     return _Outcome(reason=reason, notices=notices)
 
 
@@ -715,23 +721,26 @@ async def _reverse_capture(
     to the renter: everything paid, less any fee kept), with the provider of the
     captured payment (R22). Then each part goes back in its own txn_group
     (deposit, contribution, rental with the delivery fee and commission), each
-    pointing at the refund row. Returns the audit after-data: ``refund`` (the
-    breakdown) and ``refund_payment`` (the row's id and amount).
+    pointing at the refund row. A refund of 0.00 (a fee that keeps everything)
+    writes no row, and the groups point at nothing. Returns the audit after-data:
+    ``refund`` (the breakdown) and ``refund_payment`` (the row's id and amount, or
+    None).
     """
     paid = await captured_booking_payment(ctx.session, ctx.booking.id)
     refund = await record_refund(ctx.session, paid, refund_amount, reason=reason)
-    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund", refund.id)
+    refund_id = None if refund is None else refund.id
+    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund", refund_id)
     await _post(
         ctx,
         refund_contribution_postings(amounts.contribution),
         "cancel_contribution_refund",
-        refund.id,
+        refund_id,
     )
     await _post(
         ctx,
         rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
         "cancel_rental_refund",
-        refund.id,
+        refund_id,
     )
     return {
         "refund": {
@@ -741,7 +750,7 @@ async def _reverse_capture(
             "delivery_fee": amounts.delivery_fee,
             "commission": amounts.commission,
         },
-        "refund_payment": {"id": refund.id, "amount": refund_amount},
+        "refund_payment": None if refund is None else {"id": refund.id, "amount": refund_amount},
     }
 
 
@@ -984,16 +993,26 @@ async def _deposit_audit(ctx: _Context, action: str, **after: Any) -> None:
 
 @_register(BookingStatus.returned, BookingEvent.complete, ActorRole.system)
 async def _complete(ctx: _Context) -> _Outcome:
-    """After the claim window with no claim: release the deposit."""
+    """After the claim window with no claim: release the deposit.
+
+    D goes back to the renter: a pending ``deposit_released`` refund row.
+    """
     booking = ctx.booking
     if not ctx.now > booking.claim_window_ends_at or booking.claimed_at is not None:
         raise InvalidTransition(booking.status.value, ctx.event.value)
     deposit = _snapshot_amount(booking, "deposit")
-    await _post(ctx, deposit_release_postings(deposit), "deposit_released")
+    refund_id = await _refund_id(ctx, deposit, "deposit_released")
+    await _post(ctx, deposit_release_postings(deposit), "deposit_released", refund_id)
     await _deposit_audit(ctx, "deposit.released", deposit=deposit)
     # "Payout eligible": the vendor_payable balance is now final (payouts are Step 5).
     booking.status = BookingStatus.completed
     return _Outcome(notices=_both(booking, "booking.completed"))
+
+
+async def _refund_id(ctx: _Context, amount: Decimal, reason: str) -> uuid.UUID | None:
+    """Record ``amount`` going back to the renter; the refund row's id, or None for 0.00."""
+    refund = await refund_to_renter(ctx.session, ctx.booking.id, amount, reason=reason)
+    return None if refund is None else refund.id
 
 
 _RESOLVE_DECISIONS = ("release", "deduct", "forfeit")
@@ -1022,16 +1041,22 @@ async def _resolve(ctx: _Context) -> _Outcome:
         after.update(amount=deduction, requested_amount=requested)
         postings = deposit_deduct_postings(deposit, deduction)
         action = "deposit.deducted"
+        returned = deposit - deduction
     elif decision == "forfeit":
         after["amount"] = deposit
         postings = deposit_forfeit_postings(deposit)
         action = "deposit.forfeited"
+        returned = ZERO
     else:
         after["amount"] = ZERO
         postings = deposit_release_postings(deposit)
         action = "deposit.released"
+        returned = deposit
 
-    await _post(ctx, postings, f"resolve_{decision}")
+    # What goes back to the renter (D, D - X, or nothing on a forfeit) gets a
+    # pending refund row, and the ledger group points at it.
+    memo = f"resolve_{decision}"
+    await _post(ctx, postings, memo, await _refund_id(ctx, returned, memo))
     await _deposit_audit(ctx, action, deposit=deposit, **after)
     booking.status = BookingStatus.completed
     return _Outcome(

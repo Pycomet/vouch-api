@@ -26,6 +26,7 @@ from app.core.config import get_settings
 from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry, User
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
+from app.db.models.payment import PaymentType
 from app.jobs import timers as timers_cli
 from app.providers.payment import FakePaymentProvider
 from app.schemas.errors import BookingGuardFailed, InvalidTransition
@@ -40,6 +41,7 @@ from tests.postgres.factories import (
     DEFAULT_NOW,
     create_asset,
     create_booking,
+    create_payment,
     create_user,
     money_snapshot,
 )
@@ -89,10 +91,16 @@ async def _booking(
         claimed=claimed,
     )
     if with_deposit:
+        # The captured payment row too: the deposit released on completion is
+        # recorded as a refund against it (R22).
+        payment = await create_payment(
+            session, booking, type=PaymentType.booking, amount=DEPOSIT + RENTAL
+        )
         await post_txn(
             session,
             postings=payment_captured_postings(DEPOSIT, ZERO, RENTAL, ZERO, COMMISSION),
             booking_id=booking.id,
+            payment_id=payment.id,
             memo="payment_captured",
         )
     return booking

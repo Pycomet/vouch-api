@@ -5,8 +5,12 @@
   ``booking`` row is recorded ``pending`` with the provider's reference and
   account number (the bank goes in ``metadata``). The payment webhook (Task 5.4)
   marks it ``captured``.
-* :func:`record_refund`: every refund of money received records a ``refund`` row,
-  ``pending``, for the refunded amount, with the provider that took the money.
+* :func:`fail_pending_booking_payment`: a booking that leaves ``accepted`` unpaid
+  (deposit expiry, renter withdraw, vendor cancel) marks that row ``failed``.
+* :func:`record_refund` / :func:`refund_to_renter`: every return of money to the
+  renter (paid cancels, no-show, the deposit released on completion or by an
+  admin, the rest of a deducted deposit) records a ``refund`` row, ``pending``,
+  for that amount, with the provider that took the money. 0.00 writes no row.
   Executing the refund through the provider is a later adapter's job (spec 4 has
   no refund call); ops sees the pending rows.
 * :func:`payment_instructions`: what the renter needs to pay an accepted booking.
@@ -17,6 +21,7 @@ Services flush and never commit: the caller owns the transaction.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -85,8 +90,13 @@ async def captured_booking_payment(session: AsyncSession, booking_id: uuid.UUID)
 
 async def record_refund(
     session: AsyncSession, refund_of: Payment, amount: Decimal, *, reason: str
-) -> Payment:
-    """A ``pending`` ``refund`` row for ``amount`` of ``refund_of``, same provider."""
+) -> Payment | None:
+    """A ``pending`` ``refund`` row for ``amount`` of ``refund_of``, same provider.
+
+    Nothing goes back when ``amount`` is 0.00, so no row is written (``None``).
+    """
+    if amount <= 0:
+        return None
     refund = Payment(
         booking_id=refund_of.booking_id,
         type=PaymentType.refund,
@@ -99,6 +109,36 @@ async def record_refund(
     session.add(refund)
     await session.flush()
     return refund
+
+
+async def refund_to_renter(
+    session: AsyncSession, booking_id: uuid.UUID, amount: Decimal, *, reason: str
+) -> Payment | None:
+    """Record ``amount`` going back to the renter of a paid booking (R22, fix round 1).
+
+    The refund row takes the provider of the booking's captured payment. 0.00
+    writes nothing and needs no captured payment.
+    """
+    if amount <= 0:
+        return None
+    paid = await captured_booking_payment(session, booking_id)
+    return await record_refund(session, paid, amount, reason=reason)
+
+
+async def fail_pending_booking_payment(
+    session: AsyncSession, booking_id: uuid.UUID, now: datetime
+) -> Payment | None:
+    """Mark the booking's pending upfront payment ``failed`` (N1), if it has one.
+
+    For a booking that leaves ``accepted`` unpaid; its virtual account is no
+    longer expected to receive money. Money that still arrives is a late payment.
+    """
+    payment = await pending_booking_payment(session, booking_id)
+    if payment is not None:
+        payment.status = PaymentStatus.failed
+        payment.failed_at = now
+        await session.flush()
+    return payment
 
 
 async def pending_booking_payment(session: AsyncSession, booking_id: uuid.UUID) -> Payment | None:
