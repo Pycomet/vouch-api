@@ -41,10 +41,19 @@
   ``payment.refunded_late``. The booking state does not change;
 * **otherwise** the row is marked ``captured`` and the booking moves through
   :func:`app.services.booking.transition` (``payment_captured``), which posts
-  the split of the money and confirms it.
+  the split of the money and confirms it. That runs in its own savepoint: if
+  the booking refuses the capture for any guard reason, the refusal is rolled
+  back and the money takes the wrong-amount path instead (audit
+  ``payment.refunded_mismatch`` for ``amount_mismatch``, else
+  ``payment.refunded_unapplied``), with the guard's code as
+  ``processing_error``.
 
-A ``booking`` row already ``captured`` is not paid again: ``processing_error``
-is ``payment_already_captured`` and nothing is posted (ops reconciles it).
+Money never moves without a ledger entry: a payment into an account whose row
+is already ``captured`` (a second transfer) is held and returned the same way
+(``unapplied_payment`` / ``unapplied_payment_refund``, a pending refund row with
+reason ``duplicate_payment``, audit ``payment.refunded_duplicate``). The
+captured row is left untouched, and ``processing_error`` is
+``payment_already_captured``.
 
 ``payout_completed`` (the vendor's transfer landed) posts ``payout`` (dr
 vendor_payable / cr platform_cash) for the booking and records the ``payout``
@@ -311,27 +320,46 @@ async def _payment_captured(ctx: _Context, event: PaymentEvent) -> str | None:
     if payment is None or payment.booking_id != booking.id or payment.type != PaymentType.booking:
         raise WebhookProcessingError("payment_not_found")
     if payment.status not in (PaymentStatus.pending, PaymentStatus.failed):
-        raise WebhookProcessingError("payment_already_captured")
+        await _refund_duplicate(ctx, booking, payment, event)
+        return "payment_already_captured"
     if event.amount != payment.amount:
-        await _refund_mismatch(ctx, booking, payment, event.amount)
+        await _refund_mismatch(ctx, booking, payment, event.amount, expected=payment.amount)
         return "amount_mismatch"
     if booking.status != BookingStatus.accepted:
         await _refund_late(ctx, booking, payment)
         return None
 
-    _capture(ctx, payment)
-    await ctx.session.flush()
-    await transition(
-        ctx.session,
-        booking.id,
-        Actor.system(),
-        BookingEvent.payment_captured,
-        {"amount": event.amount, "payment_id": payment.id},
-        clock=ctx.clock,
-        notifier=ctx.notifier,
-        settings=ctx.settings,
-        request_id=ctx.request_id,
-    )
+    try:
+        # Its own savepoint: if the booking refuses the capture, the money still
+        # arrived, so it is held and returned rather than rolled away.
+        async with ctx.session.begin_nested():
+            _capture(ctx, payment)
+            await ctx.session.flush()
+            await transition(
+                ctx.session,
+                booking.id,
+                Actor.system(),
+                BookingEvent.payment_captured,
+                {"amount": event.amount, "payment_id": payment.id},
+                clock=ctx.clock,
+                notifier=ctx.notifier,
+                settings=ctx.settings,
+                request_id=ctx.request_id,
+            )
+    except VouchAPIError as refused:  # BookingGuardFailed, InvalidTransition, ...
+        # The rollback expired both rows: read them again (still locked).
+        booking = await _locked_booking(ctx, event.booking_id)
+        payment = await _locked_payment(ctx, event.payment_reference)
+        assert payment is not None  # locked above, in this transaction
+        await _refund_mismatch(
+            ctx,
+            booking,
+            payment,
+            event.amount,
+            expected=booking_amounts(booking).total,
+            reason=refused.code,
+        )
+        return refused.code
     return None
 
 
@@ -366,24 +394,48 @@ async def _refund_late(ctx: _Context, booking: Booking, payment: Payment) -> Non
     )
 
 
+async def _hold_and_return(
+    ctx: _Context, booking: Booking, received_on: Payment, amount: Decimal, reason: str
+) -> Payment:
+    """Ledger money that pays for nothing, then give it back (the controller ruling:
+    money never moves without a ledger entry).
+
+    ``unapplied_payment`` (linked to the payment it arrived on), a pending refund
+    row for ``amount``, then ``unapplied_payment_refund`` (linked to the refund).
+    Every booking account nets to 0. Returns the refund row.
+    """
+    held = unapplied_payment_postings(amount)
+    await _post(ctx, booking, held, "unapplied_payment", received_on.id)
+    refund = await record_refund(ctx.session, received_on, amount, reason=reason)
+    assert refund is not None  # the event amount is > 0 (parse_event)
+    await _post(ctx, booking, reversal_postings(held), "unapplied_payment_refund", refund.id)
+    return refund
+
+
 async def _refund_mismatch(
-    ctx: _Context, booking: Booking, payment: Payment, received: Decimal
+    ctx: _Context,
+    booking: Booking,
+    payment: Payment,
+    received: Decimal,
+    *,
+    expected: Decimal,
+    reason: str = "amount_mismatch",
 ) -> None:
-    """Money that is not the booking's price: hold it for the renter, then return it."""
+    """Money the booking will not take (a wrong amount, or a capture the booking
+    refused with ``reason``): the row records what arrived, which is held for the
+    renter and returned. The booking is not touched."""
     before = {"status": payment.status, "amount": payment.amount}
-    expected = payment.amount
     _capture(ctx, payment)
     payment.amount = received
     payment.metadata_ = {**(payment.metadata_ or {}), "expected_amount": str(expected)}
-    held = unapplied_payment_postings(received)
-    await _post(ctx, booking, held, "unapplied_payment", payment.id)
-    refund = await record_refund(ctx.session, payment, received, reason="amount_mismatch")
-    assert refund is not None  # the event amount is > 0 (parse_event)
-    await _post(ctx, booking, reversal_postings(held), "unapplied_payment_refund", refund.id)
+    refund = await _hold_and_return(ctx, booking, payment, received, reason)
+    action = (
+        "payment.refunded_mismatch" if reason == "amount_mismatch" else "payment.refunded_unapplied"
+    )
     await _audit_payment(
         ctx,
         payment,
-        "payment.refunded_mismatch",
+        action,
         before,
         {
             "status": payment.status,
@@ -391,6 +443,33 @@ async def _refund_mismatch(
             "booking_status": booking.status,
             "amount": received,
             "expected_amount": expected,
+            "reason": reason,
+            "refund_payment": {"id": refund.id, "amount": refund.amount},
+        },
+    )
+
+
+async def _refund_duplicate(
+    ctx: _Context, booking: Booking, payment: Payment, event: PaymentEvent
+) -> None:
+    """A second payment into an account already captured: held and returned.
+
+    The captured row is left as it is; the refund row records the money received
+    (``refund_of`` the captured row, the event id in ``metadata``).
+    """
+    refund = await _hold_and_return(ctx, booking, payment, event.amount, "duplicate_payment")
+    refund.metadata_ = {**(refund.metadata_ or {}), "provider_event_id": event.provider_event_id}
+    await ctx.session.flush()
+    await _audit_payment(
+        ctx,
+        payment,
+        "payment.refunded_duplicate",
+        {"status": payment.status},
+        {
+            "booking_id": booking.id,
+            "booking_status": booking.status,
+            "amount": event.amount,
+            "provider_event_id": event.provider_event_id,
             "refund_payment": {"id": refund.id, "amount": refund.amount},
         },
     )

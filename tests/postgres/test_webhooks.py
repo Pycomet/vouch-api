@@ -36,6 +36,8 @@ from app.db.models.payment import PaymentStatus, PaymentType, PayoutStatus
 from app.db.session import get_session
 from app.main import create_app
 from app.providers.payment import FakePaymentProvider
+from app.schemas.errors import InvalidTransition
+from app.services import webhooks
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, transition
 from app.services.ledger import account_balance
@@ -418,11 +420,9 @@ async def test_unknown_booking_or_payment_is_a_processing_error(
         assert await _memos(db_session, booking) == []
 
 
-async def test_domain_error_rolls_back_but_keeps_the_event(
-    client, db_session, clock, notifier, provider
-) -> None:
-    """The transition refuses (the payment row disagrees with the booking's price):
-    the payment stays pending and nothing is posted, but the event row is kept."""
+async def _odd_payment_booking(db_session) -> uuid.UUID:
+    """An accepted booking whose pending payment (1000.00, ``fake-booking-odd``)
+    disagrees with its price (D + R = 300000.00)."""
     renter = await create_user(db_session, kyc_verified=True)
     asset = await create_asset(db_session, deposit_amount=DEPOSIT)
     booking = await create_booking(
@@ -443,6 +443,15 @@ async def test_domain_error_rolls_back_but_keeps_the_event(
     payment.provider_reference = "fake-booking-odd"
     booking_id = booking.id
     await db_session.commit()
+    return booking_id
+
+
+async def test_capture_refused_by_the_booking_is_ledgered_and_refunded(
+    client, db_session, provider
+) -> None:
+    """The payment row's amount matches, but the transition refuses it against the
+    booking's price: the money still arrived, so it is held and returned."""
+    booking_id = await _odd_payment_booking(db_session)
 
     response = await _send(
         client, provider, _event(provider, booking_id, "fake-booking-odd", amount=D("1000.00"))
@@ -453,11 +462,44 @@ async def test_domain_error_rolls_back_but_keeps_the_event(
     [row] = await _webhook_rows(db_session)
     assert row.processing_error == "amount_mismatch"
     assert row.processed_at is not None
+    paid, refund = await _paid_and_refund(db_session, booking_id)
+    assert paid.status == PaymentStatus.captured
+    assert paid.amount == D("1000.00")
+    assert (refund.status, refund.amount) == (PaymentStatus.pending, D("1000.00"))
+    assert refund.metadata_["reason"] == "amount_mismatch"
+    assert await _memos(db_session, booking_id) == ["unapplied_payment", "unapplied_payment_refund"]
+    assert await _balances(db_session, booking_id) == ZEROS
+    assert len(await _audits(db_session, paid.id, "payment.refunded_mismatch")) == 1
+    assert (await _booking(db_session, booking_id)).status == BookingStatus.accepted
+    # The refused transition wrote nothing of its own.
+    assert await _audits(db_session, booking_id, "booking.deposit_paid") == []
+
+
+async def test_domain_error_rolls_back_but_keeps_the_event(
+    client, db_session, provider, monkeypatch
+) -> None:
+    """A handler that fails with a domain error after writing: its writes are
+    rolled back with the savepoint, and the event row is kept with the code."""
+    booking_id = await _odd_payment_booking(db_session)
+
+    async def failing(ctx, event):
+        payment = await webhooks._locked_payment(ctx, event.payment_reference)
+        payment.status = PaymentStatus.captured
+        await ctx.session.flush()
+        raise InvalidTransition("accepted", "payment_captured")
+
+    monkeypatch.setitem(webhooks._HANDLERS, "payment_captured", failing)
+
+    response = await _send(
+        client, provider, _event(provider, booking_id, "fake-booking-odd", amount=D("1000.00"))
+    )
+
+    assert response.json() == {"status": "processed", "processing_error": "invalid_transition"}
+    [row] = await _webhook_rows(db_session)
+    assert row.processing_error == "invalid_transition"
     [stored] = await _payments(db_session, booking_id)
     assert stored.status == PaymentStatus.pending
-    assert stored.captured_at is None
     assert await _memos(db_session, booking_id) == []
-    assert (await _booking(db_session, booking_id)).status == BookingStatus.accepted
 
 
 # ---------------------------------------------------------------------------
@@ -563,15 +605,21 @@ async def test_wrong_amount_is_ledgered_and_refunded(
     [row] = await _webhook_rows(db_session)
     assert row.processing_error == "amount_mismatch"
 
-    # The account has been used: another payment into it is not applied, and the
-    # booking is left to expire at its deadline (the renter requests again).
+    # The account has been used: another payment into it is not applied but held
+    # and returned, and the booking is left to expire at its deadline.
     again = await _send(
         client,
         provider,
         _event(provider, booking_id, reference, provider_event_id="evt_second"),
     )
     assert again.json()["processing_error"] == "payment_already_captured"
-    assert await _memos(db_session, booking_id) == ["unapplied_payment", "unapplied_payment_refund"]
+    assert (
+        await _memos(db_session, booking_id)
+        == ["unapplied_payment", "unapplied_payment_refund"] * 2
+    )
+    refunds = await _payments(db_session, booking_id, PaymentType.refund)
+    assert sorted(r.amount for r in refunds) == sorted([short, TOTAL])
+    assert await _balances(db_session, booking_id) == ZEROS
     await _expire(db_session, booking_id, clock, notifier)
     assert (await _booking(db_session, booking_id)).status == BookingStatus.expired
     assert await _balances(db_session, booking_id) == ZEROS
@@ -590,6 +638,69 @@ async def test_wrong_amount_on_a_closed_booking_is_refunded_as_a_mismatch(
     assert await _memos(db_session, booking_id) == ["unapplied_payment", "unapplied_payment_refund"]
     assert await _balances(db_session, booking_id) == ZEROS
     assert (await _booking(db_session, booking_id)).status == BookingStatus.cancelled_by_renter
+
+
+async def test_second_payment_into_a_confirmed_booking_is_ledgered_and_refunded(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    assert (await _send(client, provider, _event(provider, booking_id, reference))).json()[
+        "processing_error"
+    ] is None
+    [original] = await _payments(db_session, booking_id, PaymentType.booking)
+    original_state = (original.status, original.amount, original.captured_at, original.metadata_)
+    before = await _balances(db_session, booking_id)
+    second = D("50000.00")
+
+    response = await _send(
+        client,
+        provider,
+        _event(provider, booking_id, reference, second, provider_event_id="evt_again"),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "processed",
+        "processing_error": "payment_already_captured",
+    }
+    assert (await _booking(db_session, booking_id)).status == BookingStatus.confirmed
+    assert await _balances(db_session, booking_id) == before  # net 0 after the reversal
+    assert await _memos(db_session, booking_id) == [
+        "payment_captured",
+        "unapplied_payment",
+        "unapplied_payment_refund",
+    ]
+    [refund] = await _payments(db_session, booking_id, PaymentType.refund)
+    assert (refund.status, refund.amount) == (PaymentStatus.pending, second)
+    assert refund.metadata_["reason"] == "duplicate_payment"
+    assert refund.metadata_["refund_of"] == str(original.id)
+    assert refund.metadata_["provider_event_id"] == "evt_again"
+    [same] = await _payments(db_session, booking_id, PaymentType.booking)
+    assert (same.status, same.amount, same.captured_at, same.metadata_) == original_state
+    [audit] = await _audits(db_session, original.id, "payment.refunded_duplicate")
+    assert audit.after["amount"] == str(second)
+    assert audit.after["refund_payment"] == {"id": str(refund.id), "amount": str(second)}
+    assert audit.request_id == "req_webhook"
+    assert await _whole_ledger_balanced(db_session)
+
+
+async def test_non_ascii_signature_is_401_and_recorded(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    body = _event(provider, booking_id, reference)
+
+    response = await client.post(
+        URL,
+        content=body,
+        headers=[(b"content-type", b"application/json"), (b"x-vouch-signature", b"\xe9" * 64)],
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_signature"
+    [row] = await _webhook_rows(db_session)
+    assert row.signature_ok is False
+    assert (await _booking(db_session, booking_id)).status == BookingStatus.accepted
 
 
 # ---------------------------------------------------------------------------
@@ -793,3 +904,38 @@ async def test_renter_withdraws_while_payment_in_flight(session_factory) -> None
         assert paid.status == PaymentStatus.captured
         assert (refund.type, refund.amount) == (PaymentType.refund, TOTAL)
         assert len(await _audits(check, paid.id, "payment.refunded_late")) == 1
+
+
+async def test_concurrent_duplicate_deliveries_post_once(session_factory) -> None:
+    """Two copies of one event at the same time: the second waits on the unique
+    index, then sees the first's row and answers duplicate."""
+    clock = FrozenClock(DEFAULT_NOW)
+    notifier = RecordingNotifier()
+    provider = FakePaymentProvider(SECRET)
+    async with session_factory() as setup:
+        booking_id, reference = await _accepted(setup, clock, notifier, provider)
+    body = _event(provider, booking_id, reference)
+
+    async def deliver() -> str:
+        async with session_factory() as session:
+            result = await handle_webhook(
+                session,
+                provider,
+                body,
+                provider.sign(body),
+                clock=clock,
+                notifier=notifier,
+                settings=get_settings(),
+            )
+            await session.commit()
+            return result.status
+
+    statuses = await asyncio.wait_for(asyncio.gather(deliver(), deliver()), timeout=20)
+
+    assert sorted(statuses) == ["duplicate", "processed"]
+    async with session_factory() as check:
+        assert (await check.get(Booking, booking_id)).status == BookingStatus.confirmed
+        assert await _memos(check, booking_id) == ["payment_captured"]
+        assert len(await _webhook_rows(check)) == 1
+        assert len(await _audits(check, booking_id, "booking.confirmed")) == 1
+        assert await _payments(check, booking_id, PaymentType.refund) == []

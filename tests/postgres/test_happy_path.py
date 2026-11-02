@@ -270,6 +270,8 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
         clock.advance(timedelta(days=2))
         await _sign(http, booking_id, "return", renter)
         assert (await _sign(http, booking_id, "return", vendor_headers))["status"] == "returned"
+        returned = await _balances(session_factory, booking_id)
+        assert returned[LedgerAccount.renter_deposit_liability] == d  # held until completion
         assert await _whole_ledger_balanced(session_factory)
 
         # No claim: past the window, the timer completes the booking.
@@ -282,6 +284,9 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
         assert status == "completed"
         balances = await _balances(session_factory, booking_id)
         assert balances[LedgerAccount.renter_deposit_liability] == D("0.00")
+        # Completing releases only the deposit: the pool and the commission stay.
+        assert balances[LedgerAccount.protection_pool] == returned[LedgerAccount.protection_pool]
+        assert balances[LedgerAccount.platform_revenue] == returned[LedgerAccount.platform_revenue]
         assert balances[LedgerAccount.protection_pool] == c
         assert balances[LedgerAccount.vendor_payable] == r + f - k
         assert balances[LedgerAccount.platform_revenue] == k
