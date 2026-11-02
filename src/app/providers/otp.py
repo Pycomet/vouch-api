@@ -2,9 +2,10 @@
 
 :class:`LoggingOtpSender` writes one INFO line per code sent, naming only the
 masked phone: it NEVER logs the code. :class:`FakeOtpSender` also remembers each
-``(phone, code)`` in memory so tests can read the code back. ``Settings.otp_sender``
-picks one through :func:`build_otp_sender`; only ``"fake"`` exists until a real
-SMS adapter is chosen.
+``(phone, code)`` in memory (the last :data:`FAKE_SENT_LIMIT`) so tests can read
+the code back. ``Settings.otp_sender`` picks one through :func:`build_otp_sender`;
+only ``"fake"`` exists until a real SMS adapter is chosen, and it is refused
+outside development and test, where :func:`build_otp_sender` returns ``None``.
 """
 
 from __future__ import annotations
@@ -40,8 +41,11 @@ class LoggingOtpSender:
         self._logger.info("otp sent phone=%s", mask_phone(phone))
 
 
+FAKE_SENT_LIMIT = 100
+
+
 class FakeOtpSender(LoggingOtpSender):
-    """Records every code it is asked to send, in order, in memory."""
+    """Records the codes it is asked to send, in order, in memory (the last 100)."""
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
         super().__init__(logger)
@@ -49,6 +53,7 @@ class FakeOtpSender(LoggingOtpSender):
 
     async def send(self, phone: str, code: str) -> None:
         self.sent.append((phone, code))
+        del self.sent[:-FAKE_SENT_LIMIT]
         await super().send(phone, code)
 
     def last_code(self, phone: str) -> str:
@@ -62,6 +67,7 @@ class FakeOtpSender(LoggingOtpSender):
 _SENDERS: dict[str, type[LoggingOtpSender]] = {"fake": FakeOtpSender}
 
 
-def build_otp_sender(settings: Settings) -> OtpSender:
-    """The sender ``settings.otp_sender`` names (one per app)."""
-    return _SENDERS[settings.otp_sender]()
+def build_otp_sender(settings: Settings) -> OtpSender | None:
+    """The sender the settings name (one per app), or ``None`` when there is none."""
+    name = settings.effective_otp_sender
+    return None if name is None else _SENDERS[name]()

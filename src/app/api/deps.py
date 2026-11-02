@@ -30,7 +30,7 @@ from app.core.security import decode_token
 from app.db.models import ActorRole, User
 from app.db.session import get_session
 from app.providers.otp import OtpSender
-from app.schemas.errors import ForbiddenError, UnauthenticatedError
+from app.schemas.errors import ForbiddenError, OtpUnavailableError, UnauthenticatedError
 from app.services.audit import Actor
 from app.services.notify import LoggingNotifier, Notifier
 
@@ -92,5 +92,11 @@ def get_notifier() -> Notifier:
 
 
 def get_otp_sender(request: Request) -> OtpSender:
-    """Where OTP codes go: the sender the running app was built with."""
-    return request.app.state.otp_sender
+    """Where OTP codes go: the sender the running app was built with.
+
+    503 ``otp_unavailable`` when it has none (no real sender exists yet).
+    """
+    sender = request.app.state.otp_sender
+    if sender is None:
+        raise OtpUnavailableError()
+    return sender

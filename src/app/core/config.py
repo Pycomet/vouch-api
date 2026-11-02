@@ -68,8 +68,10 @@ class Settings(BaseSettings):
     # HS256 signing key for access tokens; checked outside development and test.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
-    # Where phone OTP codes go. Only the in-memory fake exists in M2 (R26).
-    otp_sender: Literal["fake"] = "fake"
+    # Where phone OTP codes go. Only the in-memory fake exists in M2 (R26), and it
+    # is refused outside development and test; unset there means "no sender" (the
+    # OTP request route answers 503). Unset in development and test means the fake.
+    otp_sender: Literal["fake"] | None = None
 
     @field_validator("launched_cities", mode="before")
     @classmethod
@@ -124,7 +126,16 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}"
                 )
+            if self.otp_sender == "fake":
+                raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
         return self
+
+    @property
+    def effective_otp_sender(self) -> str | None:
+        """The OTP sender to build: the setting, or the fake in development and test."""
+        if self.otp_sender is not None:
+            return self.otp_sender
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
 
     @property
     def is_production(self) -> bool:

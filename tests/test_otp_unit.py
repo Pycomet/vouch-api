@@ -5,13 +5,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.api.deps import get_otp_sender
-from app.core.config import Settings
+from app.core.config import Environment, Settings
 from app.db.models import OtpChallenge
 from app.main import create_app
 from app.providers.otp import (
+    FAKE_SENT_LIMIT,
     FakeOtpSender,
     LoggingOtpSender,
     OtpSender,
@@ -36,6 +38,9 @@ def test_normalize_phone_accepts_the_three_nigerian_spellings(raw: str) -> None:
         "",
         "8031234567",
         "0803123456",
+        "+2340803123456",
+        "2340803123456",
+        "00803123456",
         "080312345678",
         "+234803123456",
         "23480312345678",
@@ -142,3 +147,59 @@ def test_rate_limited_error_carries_retry_after() -> None:
 
 def test_rate_limited_error_retry_after_is_at_least_one_second() -> None:
     assert RateLimitedError(retry_after=0).headers["Retry-After"] == "1"
+
+
+async def test_fake_sender_keeps_only_the_last_codes() -> None:
+    sender = FakeOtpSender()
+    for n in range(FAKE_SENT_LIMIT + 5):
+        await sender.send("+2348031234567", f"{n:06d}")
+
+    assert len(sender.sent) == FAKE_SENT_LIMIT
+    assert sender.sent[0] == ("+2348031234567", "000005")
+    assert sender.last_code("+2348031234567") == f"{FAKE_SENT_LIMIT + 4:06d}"
+
+
+GUARDED = pytest.mark.parametrize(
+    "environment", [Environment.STAGING, Environment.PRODUCTION], ids=["staging", "production"]
+)
+REAL_SECRET = "a-real-production-secret-of-decent-length"
+
+
+@GUARDED
+def test_fake_otp_sender_refused_outside_development_and_test(environment) -> None:
+    with pytest.raises(ValidationError, match="otp_sender 'fake' is not allowed"):
+        Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET, otp_sender="fake")
+
+
+@GUARDED
+def test_no_otp_sender_outside_development_and_test(environment) -> None:
+    settings = Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET)
+
+    assert settings.effective_otp_sender is None
+    assert build_otp_sender(settings) is None
+
+
+@pytest.mark.parametrize("environment", [Environment.DEVELOPMENT, Environment.TEST])
+def test_development_and_test_default_to_the_fake(environment) -> None:
+    settings = Settings(_env_file=None, environment=environment)
+
+    assert settings.effective_otp_sender == "fake"
+    assert isinstance(build_otp_sender(settings), FakeOtpSender)
+
+
+def test_an_explicit_fake_sender_is_allowed_in_development() -> None:
+    assert Settings(_env_file=None, otp_sender="fake").effective_otp_sender == "fake"
+
+
+def test_otp_request_is_503_without_a_sender() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment=Environment.PRODUCTION,
+        database_url="postgresql+asyncpg://postgres:postgres@localhost:5432/vouch",
+        jwt_secret=REAL_SECRET,
+    )
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/api/v1/auth/otp/request", json={"phone": "08031234567"})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "otp_unavailable"

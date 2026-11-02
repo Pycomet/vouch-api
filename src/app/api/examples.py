@@ -370,6 +370,12 @@ TOKEN_EXAMPLE: dict[str, Any] = {
     "token_type": "bearer",
     "expires_in": 604800,
 }
+OTP_UNAVAILABLE = Err(
+    503,
+    "otp_unavailable",
+    "Phone login is not available right now.",
+    description="No OTP sender is configured.",
+)
 OTP_REJECTED = Err(
     401,
     "unauthenticated",

@@ -232,6 +232,9 @@ async def test_phone_spellings_normalize_to_one_number(
         "+234803123456",
         "+23480312345678",
         "0803123456",
+        "+2340803123456",
+        "2340803123456",
+        "00803123456",
         "+448031234567",
         "0803 123 4567",
         "+234-803-123-4567",
@@ -349,6 +352,68 @@ async def test_rate_limit_holds_under_concurrency(
         assert len(await _challenges(session)) == 5
 
 
+async def _committed_code(factory: async_sessionmaker[AsyncSession], sender, clock) -> str:
+    async with factory() as session:
+        await auth_service.request_otp(
+            session, PHONE, sender=sender, clock=clock, settings=SETTINGS
+        )
+        await session.commit()
+    return sender.last_code(PHONE)
+
+
+async def _verify_in_own_session(factory, code: str, clock) -> uuid.UUID | None:
+    """One verify as the route runs it: its own transaction, committed either way."""
+    async with factory() as session:
+        user = await auth_service.verify_otp(
+            session, PHONE, code, full_name=None, clock=clock, settings=SETTINGS
+        )
+        user_id = None if user is None else user.id
+        await session.commit()
+        return user_id
+
+
+async def test_parallel_wrong_guesses_never_pass_the_attempt_limit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    clock, sender = FrozenClock(DEFAULT_NOW), FakeOtpSender()
+    code = await _committed_code(session_factory, sender, clock)
+
+    outcomes = await asyncio.gather(
+        *(_verify_in_own_session(session_factory, _wrong(code), clock) for _ in range(12))
+    )
+
+    assert outcomes == [None] * 12
+    async with session_factory() as session:
+        [challenge] = await _challenges(session)
+        assert challenge.attempts == 5
+    # Exhausted: even the right code is refused now.
+    assert await _verify_in_own_session(session_factory, code, clock) is None
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing-user", "new-phone"])
+async def test_parallel_correct_verifies_log_in_exactly_once(
+    session_factory: async_sessionmaker[AsyncSession], existing: bool
+) -> None:
+    clock, sender = FrozenClock(DEFAULT_NOW), FakeOtpSender()
+    if existing:
+        async with session_factory() as session:
+            await create_user(session, phone=PHONE)
+            await session.commit()
+    code = await _committed_code(session_factory, sender, clock)
+
+    outcomes = await asyncio.gather(
+        *(_verify_in_own_session(session_factory, code, clock) for _ in range(4)),
+        return_exceptions=True,
+    )
+
+    assert not [o for o in outcomes if isinstance(o, BaseException)], outcomes
+    winners = [o for o in outcomes if o is not None]
+    assert len(winners) == 1
+    async with session_factory() as session:
+        users = (await session.scalars(select(User).where(User.phone == PHONE))).all()
+        assert [user.id for user in users] == winners
+
+
 # ---------------------------------------------------------------------------
 # The code
 # ---------------------------------------------------------------------------
@@ -412,6 +477,46 @@ async def test_only_the_latest_code_counts(client, sender, clock, monkeypatch) -
 
     _assert_generic_401(await _verify(client, first))
     assert (await _verify(client, second)).status_code == 200
+
+
+async def test_a_new_request_supersedes_the_open_codes(
+    client, sender, db_session, clock, monkeypatch
+) -> None:
+    codes = iter([111111, 222222])
+    monkeypatch.setattr(auth_service.secrets, "randbelow", lambda _: next(codes))
+    first = await _code(client, sender)
+    clock.advance(timedelta(seconds=1))
+    await _code(client, sender)
+
+    older, newer = await _challenges(db_session)
+    assert (older.consumed_at, newer.consumed_at) == (clock.now(), None)
+    _assert_generic_401(await _verify(client, first))
+
+
+async def test_a_used_code_does_not_revive_an_older_one(client, sender, clock, monkeypatch) -> None:
+    codes = iter([111111, 222222])
+    monkeypatch.setattr(auth_service.secrets, "randbelow", lambda _: next(codes))
+    first = await _code(client, sender)
+    clock.advance(timedelta(seconds=1))
+    second = await _code(client, sender)
+
+    assert (await _verify(client, second)).status_code == 200
+    _assert_generic_401(await _verify(client, first))
+
+
+async def test_success_consumes_every_open_code(client, sender, db_session, clock) -> None:
+    # Even an older challenge left open (e.g. written before superseding existed)
+    # is closed by a successful login.
+    await _code(client, sender)
+    clock.advance(timedelta(seconds=1))
+    code = await _code(client, sender)
+    older, _ = await _challenges(db_session)
+    older.consumed_at = None
+    await db_session.flush()
+
+    assert (await _verify(client, code)).status_code == 200
+
+    assert all(c.consumed_at == clock.now() for c in await _challenges(db_session))
 
 
 async def test_code_is_six_digits_and_stored_only_as_its_hmac(client, sender, db_session) -> None:

@@ -251,7 +251,8 @@ def test_otp_routes_document_their_errors(schema) -> None:
     request = schema["paths"][f"{PREFIX}/auth/otp/request"]["post"]["responses"]
     verify = schema["paths"][f"{PREFIX}/auth/otp/verify"]["post"]["responses"]
 
-    assert {"202", "422", "429"} <= set(request)
+    assert {"202", "422", "429", "503"} <= set(request)
+    assert _named(request, "503") == {"otp_unavailable"}
     assert "401" not in request  # the request never reveals anything about the phone
     assert _named(request, "429") == {"rate_limited"}
     assert "Retry-After" in request["429"]["headers"]

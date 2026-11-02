@@ -18,7 +18,13 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, get_otp_sender
-from app.api.examples import OTP_REJECTED, OTP_SENT_EXAMPLE, TOKEN_EXAMPLE, documented
+from app.api.examples import (
+    OTP_REJECTED,
+    OTP_SENT_EXAMPLE,
+    OTP_UNAVAILABLE,
+    TOKEN_EXAMPLE,
+    documented,
+)
 from app.core.clock import Clock
 from app.core.config import Settings
 from app.core.security import issue_token
@@ -33,7 +39,7 @@ router = APIRouter(prefix="/auth/otp", tags=["auth"])
 
 
 def _request_responses() -> dict[int | str, dict[str, Any]]:
-    responses = documented(status.HTTP_202_ACCEPTED, OTP_SENT_EXAMPLE, 429, 422)
+    responses = documented(status.HTTP_202_ACCEPTED, OTP_SENT_EXAMPLE, 429, OTP_UNAVAILABLE, 422)
     responses[429]["headers"] = {
         "Retry-After": {
             "description": "Seconds until another request for this phone is allowed.",

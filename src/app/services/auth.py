@@ -2,19 +2,26 @@
 
 :func:`request_otp` makes a 6-digit code (``secrets.randbelow``), stores only its
 HMAC-SHA256 under the JWT secret with a 10-minute life, and hands the code to the
-:class:`~app.providers.otp.OtpSender`. More than :data:`REQUESTS_PER_HOUR`
+:class:`~app.providers.otp.OtpSender`. The new challenge supersedes the phone's
+open ones (their ``consumed_at`` is set), so only the newest code ever works.
+More than :data:`REQUESTS_PER_HOUR`
 requests for one phone in a rolling hour raise :class:`RateLimitedError`, counted
 from the stored challenges. It never reads ``users``, so its answer is the same
 for a known and an unknown phone.
 
 :func:`verify_otp` checks a code against the phone's latest unconsumed, unexpired
 challenge in constant time. A wrong code spends one of :data:`MAX_OTP_ATTEMPTS`
-attempts; at the last one the challenge is exhausted. A right code consumes the
-challenge (single use) and returns the phone's user, created on first login as a
-renter. It returns ``None`` for every failure (no challenge, wrong, expired,
-exhausted, or an inactive or deleted user) so the caller answers each one the same.
+attempts; at the last one the challenge is exhausted. A right code consumes every
+open challenge of the phone (single use; no older code can come back) and returns
+the phone's user, created on first login as a renter. It returns ``None`` for
+every failure (no challenge, wrong, expired, exhausted, or an inactive or deleted
+user) so the caller answers each one the same.
 
-Both take a per-phone transaction-scoped advisory lock first, so concurrent
+``consumed_at`` therefore means "can no longer be used": used, superseded or
+cleared by a successful login.
+
+Both take a per-phone transaction-scoped advisory lock first (and read the clock
+only after it), so concurrent
 requests cannot overrun the limit, and concurrent verifies cannot spend one
 attempt twice or create the same user twice. Neither commits: the route commits,
 including after a failed verify, so a wrong guess is always counted.
@@ -29,7 +36,7 @@ import re
 import secrets
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import Clock
@@ -46,14 +53,16 @@ REQUESTS_PER_HOUR = 5
 RATE_WINDOW = timedelta(hours=1)
 
 # ASCII digits only: ``\d`` would also match other scripts' digits.
-_NIGERIAN_PHONE = re.compile(r"(?:0|234|\+234)([0-9]{10})")
+# The national number is 10 digits and never starts with 0 (that is the trunk prefix).
+_NIGERIAN_PHONE = re.compile(r"(?:0|234|\+234)([1-9][0-9]{9})")
 
 
 def normalize_phone(raw: str) -> str:
     """A Nigerian number as E.164 ``+234`` + 10 digits; ``ValueError`` otherwise.
 
-    Accepts exactly ``0XXXXXXXXXX``, ``234XXXXXXXXXX`` and ``+234XXXXXXXXXX``: no
-    spaces, dashes or other characters.
+    Accepts exactly ``0XXXXXXXXXX``, ``234XXXXXXXXXX`` and ``+234XXXXXXXXXX``, where
+    the 10-digit national number starts with 1-9: no spaces, dashes or other
+    characters.
     """
     if not isinstance(raw, str):
         raise ValueError("phone must be a string")
@@ -80,6 +89,16 @@ async def _lock_phone(session: AsyncSession, phone: str) -> None:
     )
 
 
+async def _close_open_challenges(session: AsyncSession, phone: str, now) -> None:
+    """Make every open challenge of ``phone`` unusable from ``now``."""
+    await session.execute(
+        update(OtpChallenge)
+        .where(OtpChallenge.phone == phone, OtpChallenge.consumed_at.is_(None))
+        .values(consumed_at=now)
+        .execution_options(synchronize_session=False)
+    )
+
+
 async def request_otp(
     session: AsyncSession,
     phone: str,
@@ -94,8 +113,8 @@ async def request_otp(
     the window leaves it) when the phone already made :data:`REQUESTS_PER_HOUR`
     requests in the last hour; nothing is stored or sent then.
     """
-    now = clock.now()
     await _lock_phone(session, phone)
+    now = clock.now()
     recent = (
         await session.scalars(
             select(OtpChallenge.created_at)
@@ -108,6 +127,7 @@ async def request_otp(
         frees_at = recent[len(recent) - REQUESTS_PER_HOUR] + RATE_WINDOW
         raise RateLimitedError(retry_after=math.ceil((frees_at - now).total_seconds()))
 
+    await _close_open_challenges(session, phone, now)
     code = _new_code()
     session.add(
         OtpChallenge(
@@ -132,8 +152,8 @@ async def verify_otp(
     settings: Settings,
 ) -> User | None:
     """The user ``code`` logs in as, or ``None`` for any failure (see module doc)."""
-    now = clock.now()
     await _lock_phone(session, phone)
+    now = clock.now()
     # Hash before looking anything up, so every path does the same work.
     offered = hash_code(phone, code, settings)
     challenge = (
@@ -144,7 +164,7 @@ async def verify_otp(
                 OtpChallenge.consumed_at.is_(None),
                 OtpChallenge.expires_at > now,
             )
-            .order_by(OtpChallenge.created_at.desc())
+            .order_by(OtpChallenge.created_at.desc(), OtpChallenge.id.desc())
             .limit(1)
             .with_for_update()
             .execution_options(populate_existing=True)
@@ -158,6 +178,7 @@ async def verify_otp(
         return None
 
     challenge.consumed_at = now
+    await _close_open_challenges(session, phone, now)
     user = (
         await session.scalars(
             select(User).where(User.phone == phone).execution_options(populate_existing=True)

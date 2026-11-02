@@ -151,6 +151,17 @@ class RateLimitedError(VouchAPIError):
         self.headers = MappingProxyType({"Retry-After": str(self.retry_after)})
 
 
+class OtpUnavailableError(VouchAPIError):
+    """Raised when the app has no OTP sender configured (staging/production in M2).
+
+    Returns 503 ``otp_unavailable``.
+    """
+
+    status_code = 503
+    code = "otp_unavailable"
+    message = "Phone login is not available right now."
+
+
 class InvalidRequestError(VouchAPIError):
     """Raised for bad client input that does not fit schema validation.
 
