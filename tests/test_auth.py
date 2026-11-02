@@ -231,6 +231,7 @@ def test_guarded_environment_accepts_a_real_secret(environment: Environment) -> 
         _env_file=None,
         environment=environment,
         jwt_secret=SecretStr("a-real-production-secret-of-decent-length"),
+        fake_payment_webhook_secret=SecretStr("a-real-webhook-secret-of-decent-length"),
     )
 
     assert settings.environment == environment
@@ -249,7 +250,12 @@ def test_guarded_environment_refuses_a_weak_secret(environment: Environment, sec
 
 @GUARDED
 def test_guarded_environment_accepts_a_32_byte_secret(environment: Environment) -> None:
-    settings = Settings(_env_file=None, environment=environment, jwt_secret=SecretStr("k" * 32))
+    settings = Settings(
+        _env_file=None,
+        environment=environment,
+        jwt_secret=SecretStr("k" * 32),
+        fake_payment_webhook_secret=SecretStr("w" * 32),
+    )
 
     assert settings.jwt_secret.get_secret_value() == "k" * 32
 

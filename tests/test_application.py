@@ -84,6 +84,7 @@ def test_production_hides_interactive_api_documentation() -> None:
         database_url="postgresql+asyncpg://postgres:postgres@localhost:5432/vouch",
         # Production refuses the placeholder secret (Task 4.1).
         jwt_secret="a-real-production-secret-of-decent-length",
+        fake_payment_webhook_secret="a-real-webhook-secret-of-decent-length",
     )
 
     with TestClient(create_app(settings)) as client:

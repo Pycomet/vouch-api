@@ -24,7 +24,12 @@ def test_fake_kyc_provider_refused_outside_development_and_test(environment) -> 
 
 @GUARDED
 def test_no_kyc_provider_outside_development_and_test(environment) -> None:
-    settings = Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET)
+    settings = Settings(
+        _env_file=None,
+        environment=environment,
+        jwt_secret=REAL_SECRET,
+        fake_payment_webhook_secret=REAL_SECRET,
+    )
 
     assert build_kyc_provider(settings) is None
 

@@ -30,6 +30,15 @@ class Environment(StrEnum):
 _UNGUARDED_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
 
 
+def _check_secret(field: str, value: SecretStr, env: str) -> None:
+    """Refuse the placeholder or a key shorter than :data:`JWT_SECRET_MIN_BYTES`."""
+    secret = value.get_secret_value()
+    if secret == JWT_SECRET_PLACEHOLDER:
+        raise ValueError(f"{field} must be set in {env}")
+    if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
+        raise ValueError(f"{field} must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}")
+
+
 class Settings(BaseSettings):
     """Runtime settings shared by the API and background processes."""
 
@@ -76,6 +85,13 @@ class Settings(BaseSettings):
     otp_sender: Literal["fake"] | None = None
     # Which KYC provider verifies renters (R27); same rules as ``otp_sender``.
     kyc_provider: Literal["fake"] | None = None
+    # Which payment provider opens virtual accounts and sends webhooks (R21, R28);
+    # same rules as ``otp_sender``. Unset outside development and test means no
+    # provider: accepting a booking then answers 503 ``payment_unavailable``.
+    payment_provider: Literal["fake"] | None = None
+    # HMAC-SHA256 key the fake provider signs webhook bodies with (R24). Checked
+    # like ``jwt_secret`` outside development and test.
+    fake_payment_webhook_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
 
     @field_validator("launched_cities", mode="before")
     @classmethod
@@ -123,17 +139,14 @@ class Settings(BaseSettings):
         # so a staging deployment cannot run on the placeholder or a weak key either.
         if self.environment not in _UNGUARDED_ENVIRONMENTS:
             env = self.environment.value
-            secret = self.jwt_secret.get_secret_value()
-            if secret == JWT_SECRET_PLACEHOLDER:
-                raise ValueError(f"jwt_secret must be set in {env}")
-            if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
-                raise ValueError(
-                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}"
-                )
+            _check_secret("jwt_secret", self.jwt_secret, env)
             if self.otp_sender == "fake":
                 raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
             if self.kyc_provider == "fake":
                 raise ValueError(f"kyc_provider 'fake' is not allowed in {env}")
+            if self.payment_provider == "fake":
+                raise ValueError(f"payment_provider 'fake' is not allowed in {env}")
+            _check_secret("fake_payment_webhook_secret", self.fake_payment_webhook_secret, env)
         return self
 
     @property
@@ -148,6 +161,13 @@ class Settings(BaseSettings):
         """The KYC provider to build: the setting, or the fake in development and test."""
         if self.kyc_provider is not None:
             return self.kyc_provider
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+
+    @property
+    def effective_payment_provider(self) -> str | None:
+        """The payment provider to build: the setting, or the fake in development and test."""
+        if self.payment_provider is not None:
+            return self.payment_provider
         return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
 
     @property
