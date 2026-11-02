@@ -122,6 +122,17 @@ class OtpRejectedError(UnauthenticatedError):
     message = "The code is wrong or has expired."
 
 
+class PayloadTooLargeError(VouchAPIError):
+    """Raised (by the body-size middleware) when a request body exceeds the cap.
+
+    Returns 413 ``payload_too_large``.
+    """
+
+    status_code = 413
+    code = "payload_too_large"
+    message = "The request body is too large."
+
+
 class KycUnavailableError(VouchAPIError):
     """Raised when the app has no KYC provider configured (staging/production in M2).
 

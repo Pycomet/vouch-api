@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
+from app.core.body_limit import BodyLimitMiddleware
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, request_context_middleware
 from app.db.session import create_database_engine, create_database_sessionmaker
@@ -51,14 +52,16 @@ def _json_safe(value: object) -> object:
 
 
 def _validation_response(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """FastAPI's 422 body, but safe to encode when the rejected input was NaN/Infinity.
+    """FastAPI's 422 body without the rejected input.
 
-    The default handler echoes ``input`` back, and a non-finite float there makes the
-    JSON encoder raise, turning a 422 into a 500.
+    Each item keeps ``type``, ``loc``, ``msg`` and ``ctx``. ``input`` is dropped: on a
+    missing field it is the whole request body (ids, phones, documents), and echoing a
+    non-finite float made the JSON encoder raise (a 500).
     """
-    return JSONResponse(
-        status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))}
-    )
+    errors = [
+        {key: value for key, value in error.items() if key != "input"} for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(errors))})
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -90,6 +93,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = runtime_settings
     application.state.otp_sender = build_otp_sender(runtime_settings)
     application.state.kyc_provider = build_kyc_provider(runtime_settings)
+    application.add_middleware(BodyLimitMiddleware, max_bytes=runtime_settings.max_request_bytes)
     application.middleware("http")(request_context_middleware)
     application.add_middleware(
         CORSMiddleware,

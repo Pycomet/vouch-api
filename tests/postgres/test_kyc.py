@@ -289,3 +289,18 @@ async def test_no_document_bytes_or_full_id_number_are_stored(
     assert str(user_id) in dump  # the scan really saw this user's rows
     for secret in (ID_NUMBER, "SELFIE-BYTES", "ADDRESS-DOC", b64(SELFIE), b64(DOC)):
         assert secret not in dump
+
+
+async def test_missing_field_422_echoes_nothing_submitted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _renter(db_session)
+    payload = body()
+    del payload["address_doc_b64"]
+
+    response = await client.post(URL, json=payload, headers=headers)
+
+    assert response.status_code == 422
+    assert ID_NUMBER not in response.text
+    assert b64(SELFIE)[:16] not in response.text
+    assert "input" not in response.text

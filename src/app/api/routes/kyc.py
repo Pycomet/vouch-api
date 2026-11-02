@@ -43,8 +43,8 @@ async def submit_kyc(
         provider,
         id_type=body.id_type,
         id_number=body.id_number,
-        selfie=body.selfie,
-        address_doc=body.address_doc,
+        selfie=body.selfie_b64,
+        address_doc=body.address_doc_b64,
         request_id=getattr(request.state, "request_id", None),
     )
     await session.commit()

@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     # ahead (days after today in the business zone) a rental may start.
     max_rental_days: int = Field(default=90, ge=1)
     booking_horizon_days: int = Field(default=365, ge=1)
+    # Largest accepted request body (413 ``payload_too_large`` above it).
+    max_request_bytes: int = Field(default=8 * 1024 * 1024, ge=1024 * 1024)
     # HS256 signing key for access tokens; checked outside development and test.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
