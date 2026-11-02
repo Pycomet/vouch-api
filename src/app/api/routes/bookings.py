@@ -24,12 +24,22 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_clock, get_current_actor, get_notifier, require_role
+from app.api.deps import (
+    get_clock,
+    get_current_actor,
+    get_notifier,
+    get_payment_provider,
+    require_role,
+)
 from app.api.examples import (
+    ACCEPTED_BOOKING_EXAMPLE,
     BOOKING_EXAMPLE,
     CANCELLED_BOOKING_EXAMPLE,
     DECLINED_BOOKING_EXAMPLE,
     NO_SHOW_BOOKING_EXAMPLE,
+    PAYMENT_PROVIDER_FAILED,
+    PAYMENT_UNAVAILABLE,
+    RENTER_ACCEPTED_BOOKING_EXAMPLE,
     REQUESTED_BOOKING_EXAMPLE,
     Err,
     documented,
@@ -38,14 +48,17 @@ from app.api.examples import (
 from app.core.clock import Clock
 from app.core.config import Settings
 from app.db.models import ActorRole, Booking
+from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection
 from app.db.session import get_session
+from app.providers.payment import PaymentProvider
 from app.schemas.bookings import (
     BookingCreate,
     BookingOut,
     ClaimCreate,
     HandoverSubmit,
     NoShowReport,
+    PaymentInstructions,
     PriceOut,
     ReasonBody,
     Resolve,
@@ -57,6 +70,7 @@ from app.services.booking import BookingEvent, request_booking, transition
 from app.services.handover import submit_handover
 from app.services.money_line import compute_money_line
 from app.services.notify import Notifier
+from app.services.payments import payment_instructions, pending_booking_payment
 from app.services.pricing import money
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
@@ -84,7 +98,7 @@ def _action(*errors: int | Err, example: dict[str, Any] = BOOKING_EXAMPLE) -> di
     return documented(200, example, 401, 403, 404, 409, *errors, 422)
 
 
-_GET_ERRORS = documented(200, BOOKING_EXAMPLE, 401, 403, 404, 422)
+_GET_ERRORS = documented(200, RENTER_ACCEPTED_BOOKING_EXAMPLE, 401, 403, 404, 422)
 _CREATE_ERRORS = documented(
     201,
     REQUESTED_BOOKING_EXAMPLE,
@@ -128,7 +142,13 @@ _CREATE_ERRORS = documented(
     422,
 )
 _ACCEPT_ERRORS = _action(
-    _HOLD_EXPIRED, guard("vendor_approval_required"), _TIER_INSUFFICIENT, _RENTER_RESTRICTED
+    _HOLD_EXPIRED,
+    guard("vendor_approval_required"),
+    _TIER_INSUFFICIENT,
+    _RENTER_RESTRICTED,
+    PAYMENT_PROVIDER_FAILED,
+    PAYMENT_UNAVAILABLE,
+    example=ACCEPTED_BOOKING_EXAMPLE,
 )
 _APPROVE_ERRORS = _action(_HOLD_EXPIRED, guard("approval_not_required", {"minimum_trust_tier": 2}))
 _CANCEL_ERRORS = _action(
@@ -218,7 +238,26 @@ def _request_id(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
-async def _out(session: AsyncSession, booking: Booking, settings: Settings) -> BookingOut:
+async def _instructions(
+    session: AsyncSession, booking: Booking, viewer: Actor
+) -> PaymentInstructions | None:
+    """The virtual account, for the booking's own renter while it is accepted (R21)."""
+    if (
+        booking.status != BookingStatus.accepted
+        or viewer.role != ActorRole.renter
+        or viewer.user_id != booking.renter_id
+    ):
+        return None
+    payment = await pending_booking_payment(session, booking.id)
+    if payment is None:
+        return None
+    data = payment_instructions(booking, payment)
+    return PaymentInstructions(**{**data, "amount": format_money(data["amount"])})
+
+
+async def _out(
+    session: AsyncSession, booking: Booking, settings: Settings, viewer: Actor
+) -> BookingOut:
     snapshot = booking.price_snapshot or {}
     price = PriceOut(
         **{key: format_money(money(snapshot.get(key, "0"))) for key in _PRICE_KEYS},
@@ -239,6 +278,7 @@ async def _out(session: AsyncSession, booking: Booking, settings: Settings) -> B
         vendor_approved_at=booking.vendor_approved_at,
         price=price,
         money_line=await compute_money_line(session, booking, settings=settings),
+        payment_instructions=await _instructions(session, booking, viewer),
     )
 
 
@@ -251,6 +291,7 @@ async def _apply(
     payload: dict[str, Any] | None,
     clock: Clock,
     notifier: Notifier,
+    payment_provider: PaymentProvider | None = None,
 ) -> BookingOut:
     settings = _settings(request)
     updated = await transition(
@@ -263,9 +304,10 @@ async def _apply(
         notifier=notifier,
         settings=settings,
         request_id=_request_id(request),
+        payment_provider=payment_provider,
     )
     await session.commit()
-    return await _out(session, updated, settings)
+    return await _out(session, updated, settings, actor)
 
 
 def _reason(body: ReasonBody | None) -> dict[str, Any]:
@@ -308,7 +350,7 @@ async def create_booking(
         request_id=_request_id(request),
     )
     await session.commit()
-    return await _out(session, booking, settings)
+    return await _out(session, booking, settings, actor)
 
 
 @router.get(
@@ -320,10 +362,13 @@ async def create_booking(
 async def get_booking(
     request: Request,
     booking: Booking = Depends(booking_for(*_PARTIES, ActorRole.admin)),
+    actor: Actor = Depends(get_current_actor),
     session: AsyncSession = Depends(get_session),
 ) -> BookingOut:
-    """A party or an admin reads the booking; the money line is computed now."""
-    return await _out(session, booking, _settings(request))
+    """A party or an admin reads the booking; the money line is computed now.
+
+    While it is accepted, the renter also sees ``payment_instructions``."""
+    return await _out(session, booking, _settings(request), actor)
 
 
 @router.post(
@@ -339,10 +384,23 @@ async def accept_booking(
     session: AsyncSession = Depends(get_session),
     clock: Clock = Depends(get_clock),
     notifier: Notifier = Depends(get_notifier),
+    payment_provider: PaymentProvider = Depends(get_payment_provider),
 ) -> BookingOut:
-    """Accept before the hold expires; payment is then due within 12 hours."""
+    """Accept before the hold expires; payment is then due within 12 hours.
+
+    The renter's virtual account is opened with the payment provider first: 502
+    ``payment_provider_error`` if it fails, 503 ``payment_unavailable`` if the app
+    has no provider. Either way the booking stays ``requested``."""
     return await _apply(
-        request, session, booking, actor, BookingEvent.accept, None, clock, notifier
+        request,
+        session,
+        booking,
+        actor,
+        BookingEvent.accept,
+        None,
+        clock,
+        notifier,
+        payment_provider,
     )
 
 
@@ -458,7 +516,7 @@ async def _handover(
         request_id=_request_id(request),
     )
     await session.commit()
-    return await _out(session, updated, settings)
+    return await _out(session, updated, settings, actor)
 
 
 @router.post(

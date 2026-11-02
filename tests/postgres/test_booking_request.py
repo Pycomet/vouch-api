@@ -23,6 +23,7 @@ from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile, L
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.user import KYCStatus, RenterRole, TrustTier, User
+from app.providers.payment import FakePaymentProvider
 from app.schemas.errors import (
     BookingGuardFailed,
     InvalidRequestError,
@@ -93,6 +94,7 @@ async def _transition(session, booking, actor, event, clock, notifier, payload=N
         clock=clock,
         notifier=notifier,
         settings=get_settings(),
+        payment_provider=FakePaymentProvider("test-webhook-secret"),
     )
 
 

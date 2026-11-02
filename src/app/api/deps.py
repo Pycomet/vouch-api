@@ -11,9 +11,10 @@ booking. ``require_role(*roles)`` builds a dependency that also checks the
 caller's role.
 
 ``get_clock`` and ``get_notifier`` give routes the real :class:`SystemClock` and a
-:class:`LoggingNotifier`; ``get_otp_sender`` gives the app's OTP sender
-(``app.state.otp_sender``, chosen by ``Settings.otp_sender``). Tests swap in
-``FrozenClock`` / ``RecordingNotifier`` / a ``FakeOtpSender`` through
+:class:`LoggingNotifier`; ``get_otp_sender``, ``get_kyc_provider`` and
+``get_payment_provider`` give the app's OTP sender, KYC provider and payment
+provider (``app.state``, chosen by ``Settings``), each 503 when the app has none.
+Tests swap in ``FrozenClock`` / ``RecordingNotifier`` / the fakes through
 ``app.dependency_overrides``.
 """
 
@@ -31,10 +32,12 @@ from app.db.models import ActorRole, User
 from app.db.session import get_session
 from app.providers.kyc import KycProvider
 from app.providers.otp import OtpSender
+from app.providers.payment import PaymentProvider
 from app.schemas.errors import (
     ForbiddenError,
     KycUnavailableError,
     OtpUnavailableError,
+    PaymentUnavailableError,
     UnauthenticatedError,
 )
 from app.services.audit import Actor
@@ -116,4 +119,16 @@ def get_kyc_provider(request: Request) -> KycProvider:
     provider = request.app.state.kyc_provider
     if provider is None:
         raise KycUnavailableError()
+    return provider
+
+
+def get_payment_provider(request: Request) -> PaymentProvider:
+    """The payment provider the running app was built with.
+
+    503 ``payment_unavailable`` when it has none (no real provider exists yet), so a
+    booking is never accepted without the renter's payment account (R21).
+    """
+    provider = request.app.state.payment_provider
+    if provider is None:
+        raise PaymentUnavailableError()
     return provider

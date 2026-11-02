@@ -226,6 +226,7 @@ BOOKING_EXAMPLE: dict[str, Any] = {
         "currency": "NGN",
     },
     "money_line": MONEY_LINE_EXAMPLE,
+    "payment_instructions": None,
 }
 
 # A paid renter cancellation: refund + cancellation fee == everything paid.
@@ -285,6 +286,29 @@ REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
     "hold_expires_at": "2026-11-02T13:00:00Z",
     "deposit_due_at": None,
     "money_line": REQUESTED_MONEY_LINE,
+}
+
+# The renter's view of an accepted booking: the whole payment is due, and where
+# to pay it (R21). The vendor (who accepts) and admins get null instructions.
+PAYMENT_INSTRUCTIONS_EXAMPLE: dict[str, Any] = {
+    "bank": "Fake Bank",
+    "account_number": "0123456789",
+    "reference": "fake-booking-1c2d3e4f5a6b4c7d8e9f0a1b2c3d4e5f",
+    "amount": "307500.00",
+    "due_by": "2026-11-02T21:00:00Z",
+}
+_ACCEPTED_MONEY_LINE: dict[str, Any] = {
+    **REQUESTED_MONEY_LINE,
+    "next": {"label": "Payment due Mon 2 Nov 22:00", "amount_due": "307500.00"},
+}
+ACCEPTED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "accepted",
+    "money_line": _ACCEPTED_MONEY_LINE,
+}
+RENTER_ACCEPTED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **ACCEPTED_BOOKING_EXAMPLE,
+    "payment_instructions": PAYMENT_INSTRUCTIONS_EXAMPLE,
 }
 
 _CARD: dict[str, Any] = {
@@ -390,4 +414,18 @@ KYC_UNAVAILABLE = Err(
     "kyc_unavailable",
     "Identity verification is not available right now.",
     description="No KYC provider is configured.",
+)
+
+# Payments (R21).
+PAYMENT_UNAVAILABLE = Err(
+    503,
+    "payment_unavailable",
+    "Payments are not available right now.",
+    description="No payment provider is configured; the booking stays requested.",
+)
+PAYMENT_PROVIDER_FAILED = Err(
+    502,
+    "payment_provider_error",
+    "The payment provider could not open a payment account. Try again.",
+    description="The provider failed to open the virtual account; the booking stays requested.",
 )

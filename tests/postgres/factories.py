@@ -269,6 +269,7 @@ async def create_payment(
     amount: Decimal | None = None,
     status: PaymentStatus = PaymentStatus.captured,
     now: datetime = DEFAULT_NOW,
+    provider: str = "fake",
 ) -> Payment:
     """A payment row for ``booking`` that satisfies the payments CHECKs.
 
@@ -281,6 +282,7 @@ async def create_payment(
         booking_id=booking.id,
         type=type,
         status=status,
+        provider=provider,
         amount=booking.deposit_amount if amount is None else amount,
         captured_at=now if status == PaymentStatus.captured else None,
     )

@@ -223,6 +223,8 @@ def test_no_show_example_refunds_everything(schema) -> None:
         (CatalogueSearchPage, examples.SEARCH_EXAMPLE),
         (BookingOut, examples.BOOKING_EXAMPLE),
         (BookingOut, examples.REQUESTED_BOOKING_EXAMPLE),
+        (BookingOut, examples.ACCEPTED_BOOKING_EXAMPLE),
+        (BookingOut, examples.RENTER_ACCEPTED_BOOKING_EXAMPLE),
         (RenterHome, examples.RENTER_HOME_EXAMPLE),
         (VendorHome, examples.VENDOR_HOME_EXAMPLE),
         (ServiceStatus, examples.LIVE_EXAMPLE),
@@ -236,6 +238,27 @@ def test_no_show_example_refunds_everything(schema) -> None:
 )
 def test_examples_match_their_models(model: type[BaseModel], payload: dict) -> None:
     model.model_validate(payload)
+
+
+def test_accept_documents_the_payment_provider_errors(schema) -> None:
+    responses = schema["paths"][f"{ACTION}/accept"]["post"]["responses"]
+
+    assert _named(responses, "502") == {"payment_provider_error"}
+    assert _named(responses, "503") == {"payment_unavailable"}
+    example = responses["200"]["content"]["application/json"]["example"]
+    assert example["status"] == "accepted"
+    # The accepting vendor's view (OpenAPI examples drop null values).
+    assert example.get("payment_instructions") is None
+
+
+def test_get_booking_example_shows_the_renters_payment_instructions(schema) -> None:
+    responses = schema["paths"][ACTION]["get"]["responses"]
+    example = responses["200"]["content"]["application/json"]["example"]
+    instructions = example["payment_instructions"]
+
+    assert example["status"] == "accepted"
+    assert instructions["amount"] == example["money_line"]["next"]["amount_due"]
+    assert schema["components"]["schemas"]["PaymentInstructions"]["required"]
 
 
 def test_next_payout_description_names_every_closed_source(schema) -> None:

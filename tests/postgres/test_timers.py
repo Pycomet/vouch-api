@@ -27,6 +27,7 @@ from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry, User
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.jobs import timers as timers_cli
+from app.providers.payment import FakePaymentProvider
 from app.schemas.errors import BookingGuardFailed, InvalidTransition
 from app.services import timers as timers_module
 from app.services.audit import Actor
@@ -248,6 +249,7 @@ async def test_timer_and_accept_race_one_wins(session_factory) -> None:
                 clock=FrozenClock(HOLD_END - timedelta(seconds=1)),
                 notifier=RecordingNotifier(),
                 settings=settings,
+                payment_provider=FakePaymentProvider("test-webhook-secret"),
             )
     after = await _run(session_factory, HOLD_END + timedelta(seconds=2))
     assert after.expired_holds == 0
@@ -275,6 +277,7 @@ async def test_timer_and_accept_race_one_wins(session_factory) -> None:
                 clock=FrozenClock(HOLD_END - timedelta(seconds=1)),
                 notifier=RecordingNotifier(),
                 settings=settings,
+                payment_provider=FakePaymentProvider("test-webhook-secret"),
             )
     assert (await _fetch(session_factory, expired.id)).status == BookingStatus.expired
     actions = await _actions(session_factory, expired.id)

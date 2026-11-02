@@ -284,6 +284,20 @@ class PriceOut(BaseModel):
     currency: str = "NGN"
 
 
+class PaymentInstructions(BaseModel):
+    """Where the renter pays the one upfront payment (R21)."""
+
+    bank: str = Field(examples=["Fake Bank"])
+    account_number: str = Field(
+        description="The booking's virtual account.", examples=["0123456789"]
+    )
+    reference: str = Field(description="The provider's reference for this payment.")
+    amount: str = Field(description="D + C + R + F, the whole payment.", examples=["307500.00"])
+    due_by: datetime.datetime | None = Field(
+        description="Pay before this time or the booking expires (``deposit_due_at``)."
+    )
+
+
 class BookingOut(BaseModel):
     id: uuid.UUID
     status: str
@@ -299,3 +313,7 @@ class BookingOut(BaseModel):
     vendor_approved_at: datetime.datetime | None
     price: PriceOut
     money_line: MoneyLine
+    payment_instructions: PaymentInstructions | None = Field(
+        default=None,
+        description="Shown to the booking's renter only, while it is accepted and unpaid.",
+    )

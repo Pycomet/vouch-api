@@ -202,6 +202,14 @@ def test_parse_event_refuses_a_malformed_body(body: bytes) -> None:
         FakePaymentProvider(SECRET).parse_event(body)
 
 
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_parse_event_refuses_json_constants(constant: bytes) -> None:
+    body = _body().replace(b'"1.00"', constant)
+
+    with pytest.raises(PaymentEventError):
+        FakePaymentProvider(SECRET).parse_event(body)
+
+
 def test_parse_event_reads_a_json_number_amount_exactly() -> None:
     body = (
         b'{"id":"evt_1","type":"payment_captured","data":{"booking_id":"'

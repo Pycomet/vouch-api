@@ -144,6 +144,29 @@ class KycUnavailableError(VouchAPIError):
     message = "Identity verification is not available right now."
 
 
+class PaymentUnavailableError(VouchAPIError):
+    """Raised when the app has no payment provider configured (staging/production in M2).
+
+    Returns 503 ``payment_unavailable``: a booking cannot be accepted without the
+    renter's payment account (R21).
+    """
+
+    status_code = 503
+    code = "payment_unavailable"
+    message = "Payments are not available right now."
+
+
+class PaymentAccountFailedError(VouchAPIError):
+    """Raised when the payment provider fails to open the renter's payment account.
+
+    Returns 502 ``payment_provider_error``; nothing about the booking changes (R21).
+    """
+
+    status_code = 502
+    code = "payment_provider_error"
+    message = "The payment provider could not open a payment account. Try again."
+
+
 class ForbiddenError(VouchAPIError):
     """Raised when an authenticated caller's role may not use this route.
 
