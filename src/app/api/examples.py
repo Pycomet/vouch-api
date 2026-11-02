@@ -382,3 +382,12 @@ OTP_REJECTED = Err(
     OtpRejectedError.message,
     description="Wrong, expired, exhausted or used code, or no code was requested.",
 )
+
+# KYC (R27).
+KYC_EXAMPLE: dict[str, Any] = {"tier": 1, "status": "verified"}
+KYC_UNAVAILABLE = Err(
+    503,
+    "kyc_unavailable",
+    "Identity verification is not available right now.",
+    description="No KYC provider is configured.",
+)
