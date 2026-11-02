@@ -62,7 +62,13 @@ EvidenceUrls = Annotated[list[HttpUrl], Field(min_length=1, max_length=20)]
 # each value a short string, a boolean, a number or null (no nested objects/lists).
 CHECKLIST_MAX_KEYS = 50
 ChecklistKey = Annotated[str, StringConstraints(max_length=100)]
-ChecklistValue = Annotated[str, StringConstraints(max_length=500)] | bool | int | float | None
+ChecklistValue = (
+    Annotated[str, StringConstraints(max_length=500)]
+    | bool
+    | int
+    | Annotated[float, Field(allow_inf_nan=False)]
+    | None
+)
 Checklist = Annotated[dict[ChecklistKey, ChecklistValue], Field(max_length=CHECKLIST_MAX_KEYS)]
 
 

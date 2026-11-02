@@ -645,6 +645,24 @@ async def test_handover_both_sign_starts_rental(client, db_session, clock, notif
     assert record.evidence_urls == [EVIDENCE[0], "https://cdn.example/handover/2.jpg"]
 
 
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_handover_checklist_refuses_nan_and_infinity(
+    client, db_session, clock, notifier, bad
+) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    # Raw content: json.dumps would not write NaN/Infinity by default.
+    raw = '{"checklist": {"fuel": %s}, "evidence_urls": ["%s"], "sign": true}' % (bad, EVIDENCE[0])
+
+    response = await client.post(
+        f"{API}/{booking_id}/handover",
+        content=raw,
+        headers={**parties.vendor, "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert {issue["type"] for issue in response.json()["detail"]} >= {"finite_number"}
+
+
 async def test_handover_without_signing_stays_draft(client, db_session, clock, notifier) -> None:
     booking_id, parties = await _confirmed(db_session, clock, notifier)
 

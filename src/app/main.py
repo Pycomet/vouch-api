@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -31,6 +34,28 @@ def _error_response(request: Request, exc: VouchAPIError) -> JSONResponse:
         status_code=exc.status_code,
         content=body.model_dump(),
         headers={**exc.headers, "X-Request-ID": request_id},
+    )
+
+
+def _json_safe(value: object) -> object:
+    """Replace NaN/Infinity (not valid JSON) with their text, recursively."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _validation_response(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's 422 body, but safe to encode when the rejected input was NaN/Infinity.
+
+    The default handler echoes ``input`` back, and a non-finite float there makes the
+    JSON encoder raise, turning a 422 into a 500.
+    """
+    return JSONResponse(
+        status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))}
     )
 
 
@@ -71,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expose_headers=["X-Request-ID"],
     )
     application.add_exception_handler(VouchAPIError, _error_response)  # type: ignore[arg-type]
+    application.add_exception_handler(RequestValidationError, _validation_response)  # type: ignore[arg-type]
     application.include_router(api_router, prefix=runtime_settings.api_v1_prefix)
     return application
 
