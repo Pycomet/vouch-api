@@ -6,7 +6,7 @@ import re
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     # HS256 signing key for access tokens; checked outside development and test.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
+    # Where phone OTP codes go. Only the in-memory fake exists in M2 (R26).
+    otp_sender: Literal["fake"] = "fake"
 
     @field_validator("launched_cities", mode="before")
     @classmethod

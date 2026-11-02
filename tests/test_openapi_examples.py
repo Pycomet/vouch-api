@@ -19,6 +19,7 @@ from app.api import examples
 from app.core.config import get_settings
 from app.main import create_app
 from app.schemas.assets import CatalogueSearchPage, PublicAsset
+from app.schemas.auth import OtpSent, TokenOut
 from app.schemas.bookings import BookingOut
 from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
@@ -228,6 +229,8 @@ def test_no_show_example_refunds_everything(schema) -> None:
         (ReadinessStatus, examples.READY_EXAMPLE),
         (ReadinessStatus, examples.NOT_READY_EXAMPLE),
         (ErrorEnvelope, examples.error_body("forbidden", "No.")),
+        (OtpSent, examples.OTP_SENT_EXAMPLE),
+        (TokenOut, examples.TOKEN_EXAMPLE),
         (ValidationErrorResponse, examples._VALIDATION_EXAMPLE),
     ],
 )
@@ -242,3 +245,16 @@ def test_next_payout_description_names_every_closed_source(schema) -> None:
 
     for source in ("completed", "cancellation fee", "lost", "closed"):
         assert source in description
+
+
+def test_otp_routes_document_their_errors(schema) -> None:
+    request = schema["paths"][f"{PREFIX}/auth/otp/request"]["post"]["responses"]
+    verify = schema["paths"][f"{PREFIX}/auth/otp/verify"]["post"]["responses"]
+
+    assert {"202", "422", "429"} <= set(request)
+    assert "401" not in request  # the request never reveals anything about the phone
+    assert _named(request, "429") == {"rate_limited"}
+    assert "Retry-After" in request["429"]["headers"]
+    assert {"200", "401", "422"} <= set(verify)
+    media = verify["401"]["content"]["application/json"]["example"]
+    assert media["error"]["message"] == "The code is wrong or has expired."

@@ -19,7 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.schemas.errors import BookingGuardFailed, ErrorEnvelope, ValidationErrorResponse
+from app.schemas.errors import (
+    BookingGuardFailed,
+    ErrorEnvelope,
+    OtpRejectedError,
+    ValidationErrorResponse,
+)
 
 REQUEST_ID = "4b9f7c1e-2d3a-4e5f-8a6b-7c8d9e0f1a2b"
 
@@ -66,6 +71,12 @@ _DEFAULT_ERRORS: dict[int, Err] = {
         "resource_not_found",
         "The requested resource was not found.",
         description="Not found, or not yours to see.",
+    ),
+    429: Err(
+        429,
+        "rate_limited",
+        "Too many requests. Try again later.",
+        description="Too many requests; retry after the seconds in Retry-After.",
     ),
     409: Err(
         409,
@@ -350,4 +361,18 @@ INVALID_CURSOR = Err(
     "invalid_cursor",
     "The pagination cursor is invalid or has expired.",
     description="Bad cursor.",
+)
+
+# Phone OTP (R26).
+OTP_SENT_EXAMPLE: dict[str, Any] = {"status": "sent"}
+TOKEN_EXAMPLE: dict[str, Any] = {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYzJkIn0.c2lnbmF0dXJl",
+    "token_type": "bearer",
+    "expires_in": 604800,
+}
+OTP_REJECTED = Err(
+    401,
+    "unauthenticated",
+    OtpRejectedError.message,
+    description="Wrong, expired, exhausted or used code, or no code was requested.",
 )

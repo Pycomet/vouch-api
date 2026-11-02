@@ -111,6 +111,17 @@ class UnauthenticatedError(VouchAPIError):
     headers: ClassVar[Mapping[str, str]] = MappingProxyType({"WWW-Authenticate": "Bearer"})
 
 
+class OtpRejectedError(UnauthenticatedError):
+    """Raised when an OTP verify fails, for any reason (R26).
+
+    No challenge, a wrong, expired, used or exhausted code, and an inactive or
+    deleted account all get this one 401 and message, so the answer reveals
+    nothing about the phone.
+    """
+
+    message = "The code is wrong or has expired."
+
+
 class ForbiddenError(VouchAPIError):
     """Raised when an authenticated caller's role may not use this route.
 
@@ -120,6 +131,24 @@ class ForbiddenError(VouchAPIError):
     status_code = 403
     code = "forbidden"
     message = "You do not have permission to do this."
+
+
+class RateLimitedError(VouchAPIError):
+    """Raised when a caller has made too many requests of one kind.
+
+    Returns 429 ``rate_limited`` with ``Retry-After`` (whole seconds, at least 1).
+    The message never says which limit was hit.
+    """
+
+    status_code = 429
+    code = "rate_limited"
+    message = "Too many requests. Try again later."
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__()
+        self.retry_after = max(1, int(retry_after))
+        # Per instance (the wait differs per caller); read-only like the class default.
+        self.headers = MappingProxyType({"Retry-After": str(self.retry_after)})
 
 
 class InvalidRequestError(VouchAPIError):

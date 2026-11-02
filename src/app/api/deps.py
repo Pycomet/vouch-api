@@ -11,8 +11,10 @@ booking. ``require_role(*roles)`` builds a dependency that also checks the
 caller's role.
 
 ``get_clock`` and ``get_notifier`` give routes the real :class:`SystemClock` and a
-:class:`LoggingNotifier`; tests swap in ``FrozenClock`` / ``RecordingNotifier``
-through ``app.dependency_overrides``.
+:class:`LoggingNotifier`; ``get_otp_sender`` gives the app's OTP sender
+(``app.state.otp_sender``, chosen by ``Settings.otp_sender``). Tests swap in
+``FrozenClock`` / ``RecordingNotifier`` / a ``FakeOtpSender`` through
+``app.dependency_overrides``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from app.core.clock import Clock, SystemClock
 from app.core.security import decode_token
 from app.db.models import ActorRole, User
 from app.db.session import get_session
+from app.providers.otp import OtpSender
 from app.schemas.errors import ForbiddenError, UnauthenticatedError
 from app.services.audit import Actor
 from app.services.notify import LoggingNotifier, Notifier
@@ -86,3 +89,8 @@ def get_clock() -> Clock:
 def get_notifier() -> Notifier:
     """Where booking notifications go (logged until a real channel exists)."""
     return LoggingNotifier()
+
+
+def get_otp_sender(request: Request) -> OtpSender:
+    """Where OTP codes go: the sender the running app was built with."""
+    return request.app.state.otp_sender
