@@ -103,6 +103,9 @@ def test_signature_is_hmac_sha256_hex_of_the_body() -> None:
     assert not provider.verify_webhook("", body)
     assert not provider.verify_webhook(None, body)
     assert not FakePaymentProvider("another-secret").verify_webhook(expected, body)
+    # A header decoded from latin-1 bytes is refused, never a TypeError.
+    assert not provider.verify_webhook("\xe9" * 64, body)
+    assert not provider.verify_webhook(expected[:-1] + "\xe9", body)
 
 
 def test_make_event_round_trips_through_parse_event() -> None:

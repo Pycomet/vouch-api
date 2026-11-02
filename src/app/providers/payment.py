@@ -164,7 +164,14 @@ class FakePaymentProvider:
     def verify_webhook(self, signature: str | None, body: bytes) -> bool:
         if not signature:
             return False
-        return hmac.compare_digest(self.sign(body), signature)
+        try:
+            # Compare bytes: compare_digest refuses non-ASCII str (a header byte
+            # such as 0xE9 decodes from latin-1 to one), and such a header is
+            # simply not our signature.
+            given = signature.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        return hmac.compare_digest(self.sign(body).encode("ascii"), given)
 
     def make_event(
         self,
