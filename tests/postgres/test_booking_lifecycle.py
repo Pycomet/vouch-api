@@ -432,6 +432,19 @@ async def test_no_show_after_the_vendor_signed_the_pickup_is_refused(db_session,
     )
 
 
+async def test_no_show_too_early_wins_over_a_vendor_signed_pickup(db_session, notifier) -> None:
+    # Two guards would refuse; the first one (too early) is the one reported.
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    record = await create_handover(db_session, booking, completed=False)
+    record.status = HandoverStatus.vendor_signed
+    record.vendor_signer_id = booking.vendor_id
+    record.vendor_signed_at = DEFAULT_NOW
+    await db_session.flush()
+    just_before = FrozenClock(_no_show_from(booking) - timedelta(microseconds=1))
+
+    await _assert_no_show_refused(db_session, booking, just_before, notifier, "no_show_too_early")
+
+
 async def test_no_show_with_only_a_draft_pickup_is_allowed(db_session, notifier) -> None:
     booking = await _paid(db_session, BookingStatus.confirmed)
     await create_handover(db_session, booking, completed=False)
