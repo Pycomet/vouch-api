@@ -102,12 +102,25 @@ async def _exercise_constraints() -> None:
         await connection.close()
 
 
+async def _empty_schema() -> None:
+    """Start from nothing: earlier live tests may have committed rows (paid bookings,
+    append-only ledger rows) that the downgrades rightly refuse to drop."""
+    connection = await asyncpg.connect(_asyncpg_url())
+    try:
+        await connection.execute("SET lock_timeout = '10s'")
+        await connection.execute("DROP SCHEMA public CASCADE")
+        await connection.execute("CREATE SCHEMA public")
+    finally:
+        await connection.close()
+
+
 def test_initial_migration_round_trip_and_database_constraints(monkeypatch) -> None:
     assert DATABASE_URL is not None
     monkeypatch.setenv("VOUCH_DATABASE_URL", DATABASE_URL)
     get_settings.cache_clear()
     config = _alembic_config()
 
+    asyncio.run(_empty_schema())
     command.downgrade(config, "base")
     command.upgrade(config, "head")
     asyncio.run(_exercise_constraints())
