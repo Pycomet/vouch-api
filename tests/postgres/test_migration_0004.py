@@ -77,7 +77,8 @@ def test_migration_0004_roundtrip(migrated_db: str, alembic_cfg: Config) -> None
     command.upgrade(alembic_cfg, "head")
     assert "booking" in _payment_types()
 
-    command.downgrade(alembic_cfg, "-1")
+    # Back to 0003 (head is past 0004 since Step 5's 0005).
+    command.downgrade(alembic_cfg, REVISION_0003)
     types = _payment_types()
     assert "booking" not in types
     assert types == ["deposit", "rental_balance", "payout", "refund", "damage_contribution"]

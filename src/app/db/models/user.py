@@ -101,7 +101,8 @@ class User(TimestampMixin, SoftDeleteMixin, Base):
         server_default=text("gen_random_uuid()"),
     )
     phone: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    full_name: Mapped[str] = mapped_column(String, nullable=False)
+    # Nullable (0005): a user created at first OTP verify may not have given a name.
+    full_name: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
     role: Mapped[RenterRole] = mapped_column(
         Enum(RenterRole, name="renterrole"),
@@ -109,6 +110,10 @@ class User(TimestampMixin, SoftDeleteMixin, Base):
         default=RenterRole.renter,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # When the user last proved the phone with an OTP (0005).
+    phone_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Set when the renter is frozen (e.g. no contact after the rental started).
     restricted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     restricted_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

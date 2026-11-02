@@ -4,6 +4,7 @@ from app.db.models.booking import Booking
 from app.db.models.catalogue import CatalogueItem
 from app.db.models.handover import HandoverRecord
 from app.db.models.ledger import Direction, LedgerAccount, LedgerEntry
+from app.db.models.otp import OtpChallenge
 from app.db.models.payment import Payment
 from app.db.models.reference import Category, City
 from app.db.models.trust import VendorReference
@@ -25,6 +26,7 @@ __all__ = [
     "City",
     "HandoverRecord",
     "KYCProfile",
+    "OtpChallenge",
     "Payment",
     "User",
     "VendorReference",
