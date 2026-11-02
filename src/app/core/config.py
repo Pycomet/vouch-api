@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # is refused outside development and test; unset there means "no sender" (the
     # OTP request route answers 503). Unset in development and test means the fake.
     otp_sender: Literal["fake"] | None = None
+    # Which KYC provider verifies renters (R27); same rules as ``otp_sender``.
+    kyc_provider: Literal["fake"] | None = None
 
     @field_validator("launched_cities", mode="before")
     @classmethod
@@ -128,6 +130,8 @@ class Settings(BaseSettings):
                 )
             if self.otp_sender == "fake":
                 raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
+            if self.kyc_provider == "fake":
+                raise ValueError(f"kyc_provider 'fake' is not allowed in {env}")
         return self
 
     @property
@@ -135,6 +139,13 @@ class Settings(BaseSettings):
         """The OTP sender to build: the setting, or the fake in development and test."""
         if self.otp_sender is not None:
             return self.otp_sender
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+
+    @property
+    def effective_kyc_provider(self) -> str | None:
+        """The KYC provider to build: the setting, or the fake in development and test."""
+        if self.kyc_provider is not None:
+            return self.kyc_provider
         return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
 
     @property

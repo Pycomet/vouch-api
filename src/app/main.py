@@ -16,6 +16,7 @@ from app.api.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, request_context_middleware
 from app.db.session import create_database_engine, create_database_sessionmaker
+from app.providers.kyc import build_kyc_provider
 from app.providers.otp import build_otp_sender
 from app.schemas.errors import ErrorDetail, ErrorEnvelope, VouchAPIError
 
@@ -88,6 +89,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.settings = runtime_settings
     application.state.otp_sender = build_otp_sender(runtime_settings)
+    application.state.kyc_provider = build_kyc_provider(runtime_settings)
     application.middleware("http")(request_context_middleware)
     application.add_middleware(
         CORSMiddleware,

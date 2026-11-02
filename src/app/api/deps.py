@@ -29,8 +29,14 @@ from app.core.clock import Clock, SystemClock
 from app.core.security import decode_token
 from app.db.models import ActorRole, User
 from app.db.session import get_session
+from app.providers.kyc import KycProvider
 from app.providers.otp import OtpSender
-from app.schemas.errors import ForbiddenError, OtpUnavailableError, UnauthenticatedError
+from app.schemas.errors import (
+    ForbiddenError,
+    KycUnavailableError,
+    OtpUnavailableError,
+    UnauthenticatedError,
+)
 from app.services.audit import Actor
 from app.services.notify import LoggingNotifier, Notifier
 
@@ -100,3 +106,14 @@ def get_otp_sender(request: Request) -> OtpSender:
     if sender is None:
         raise OtpUnavailableError()
     return sender
+
+
+def get_kyc_provider(request: Request) -> KycProvider:
+    """The KYC provider the running app was built with.
+
+    503 ``kyc_unavailable`` when it has none (no real provider exists yet).
+    """
+    provider = request.app.state.kyc_provider
+    if provider is None:
+        raise KycUnavailableError()
+    return provider

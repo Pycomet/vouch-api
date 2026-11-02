@@ -122,6 +122,17 @@ class OtpRejectedError(UnauthenticatedError):
     message = "The code is wrong or has expired."
 
 
+class KycUnavailableError(VouchAPIError):
+    """Raised when the app has no KYC provider configured (staging/production in M2).
+
+    Returns 503 ``kyc_unavailable``.
+    """
+
+    status_code = 503
+    code = "kyc_unavailable"
+    message = "Identity verification is not available right now."
+
+
 class ForbiddenError(VouchAPIError):
     """Raised when an authenticated caller's role may not use this route.
 
