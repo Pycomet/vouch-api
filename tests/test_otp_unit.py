@@ -173,12 +173,7 @@ def test_fake_otp_sender_refused_outside_development_and_test(environment) -> No
 
 @GUARDED
 def test_no_otp_sender_outside_development_and_test(environment) -> None:
-    settings = Settings(
-        _env_file=None,
-        environment=environment,
-        jwt_secret=REAL_SECRET,
-        fake_payment_webhook_secret=REAL_SECRET,
-    )
+    settings = Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET)
 
     assert settings.effective_otp_sender is None
     assert build_otp_sender(settings) is None
@@ -202,7 +197,6 @@ def test_otp_request_is_503_without_a_sender() -> None:
         environment=Environment.PRODUCTION,
         database_url="postgresql+asyncpg://postgres:postgres@localhost:5432/vouch",
         jwt_secret=REAL_SECRET,
-        fake_payment_webhook_secret=REAL_SECRET,
     )
     with TestClient(create_app(settings)) as client:
         response = client.post("/api/v1/auth/otp/request", json={"phone": "08031234567"})

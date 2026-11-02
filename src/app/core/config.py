@@ -89,8 +89,9 @@ class Settings(BaseSettings):
     # same rules as ``otp_sender``. Unset outside development and test means no
     # provider: accepting a booking then answers 503 ``payment_unavailable``.
     payment_provider: Literal["fake"] | None = None
-    # HMAC-SHA256 key the fake provider signs webhook bodies with (R24). Checked
-    # like ``jwt_secret`` outside development and test.
+    # HMAC-SHA256 key the fake provider signs webhook bodies with (R24). Outside
+    # development and test it is checked like ``jwt_secret``, but only when
+    # ``payment_provider`` is "fake" (the only provider that uses it).
     fake_payment_webhook_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
 
     @field_validator("launched_cities", mode="before")
@@ -145,8 +146,10 @@ class Settings(BaseSettings):
             if self.kyc_provider == "fake":
                 raise ValueError(f"kyc_provider 'fake' is not allowed in {env}")
             if self.payment_provider == "fake":
+                # The secret is the fake's own, so it is checked only when the fake
+                # is selected (and the fake itself is then refused here anyway).
+                _check_secret("fake_payment_webhook_secret", self.fake_payment_webhook_secret, env)
                 raise ValueError(f"payment_provider 'fake' is not allowed in {env}")
-            _check_secret("fake_payment_webhook_secret", self.fake_payment_webhook_secret, env)
         return self
 
     @property

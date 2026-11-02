@@ -34,8 +34,7 @@ GUARDED = pytest.mark.parametrize(
 
 
 def _guarded(environment: Environment, **kwargs) -> Settings:
-    values = {"jwt_secret": REAL_SECRET, "fake_payment_webhook_secret": REAL_SECRET, **kwargs}
-    return Settings(_env_file=None, environment=environment, **values)
+    return Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +243,7 @@ def test_the_fake_signs_with_the_configured_secret() -> None:
 @GUARDED
 def test_fake_payment_provider_refused_outside_development_and_test(environment) -> None:
     with pytest.raises(ValidationError, match="payment_provider 'fake' is not allowed"):
-        _guarded(environment, payment_provider="fake")
+        _guarded(environment, payment_provider="fake", fake_payment_webhook_secret=REAL_SECRET)
 
 
 @GUARDED
@@ -256,16 +255,27 @@ def test_no_payment_provider_outside_development_and_test(environment) -> None:
 
 
 @GUARDED
-def test_guarded_environment_refuses_the_placeholder_webhook_secret(environment) -> None:
+def test_fake_provider_with_the_placeholder_webhook_secret_is_refused(environment) -> None:
     with pytest.raises(ValidationError, match="fake_payment_webhook_secret must be set"):
-        Settings(_env_file=None, environment=environment, jwt_secret=REAL_SECRET)
+        _guarded(environment, payment_provider="fake")
 
 
 @GUARDED
 @pytest.mark.parametrize("secret", ["", "short", "x" * 31])
-def test_guarded_environment_refuses_a_weak_webhook_secret(environment, secret) -> None:
+def test_fake_provider_with_a_weak_webhook_secret_is_refused(environment, secret) -> None:
     with pytest.raises(ValidationError, match="fake_payment_webhook_secret must be at least"):
-        _guarded(environment, fake_payment_webhook_secret=SecretStr(secret))
+        _guarded(
+            environment, payment_provider="fake", fake_payment_webhook_secret=SecretStr(secret)
+        )
+
+
+@GUARDED
+def test_no_payment_provider_does_not_check_the_webhook_secret(environment) -> None:
+    """The secret belongs to the fake; without it the placeholder is harmless (N2)."""
+    settings = _guarded(environment)
+
+    assert settings.payment_provider is None
+    assert settings.fake_payment_webhook_secret.get_secret_value() == "change-me"
 
 
 def test_payment_provider_setting_only_allows_fake() -> None:
