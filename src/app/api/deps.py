@@ -3,8 +3,12 @@ clock and notifier the booking services run with.
 
 ``get_current_actor`` reads the ``Authorization: Bearer <token>`` header and
 verifies the token with the settings the running app was built with
-(``app.state.settings``), never the process-wide cache. ``require_role(*roles)``
-builds a dependency that also checks the caller's role.
+(``app.state.settings``), never the process-wide cache. It then loads the token's
+user on the request's own session (R25): a missing, inactive or soft-deleted user,
+or one whose stored role is not the token's role, gets the same 401 as a bad
+token. A restricted user still authenticates; the booking guards stop them
+booking. ``require_role(*roles)`` builds a dependency that also checks the
+caller's role.
 
 ``get_clock`` and ``get_notifier`` give routes the real :class:`SystemClock` and a
 :class:`LoggingNotifier`; tests swap in ``FrozenClock`` / ``RecordingNotifier``
@@ -17,10 +21,12 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import Clock, SystemClock
 from app.core.security import decode_token
-from app.db.models import ActorRole
+from app.db.models import ActorRole, User
+from app.db.session import get_session
 from app.schemas.errors import ForbiddenError, UnauthenticatedError
 from app.services.audit import Actor
 from app.services.notify import LoggingNotifier, Notifier
@@ -33,11 +39,25 @@ _bearer = HTTPBearer(auto_error=False)
 async def get_current_actor(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),  # noqa: B008
+    session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Actor:
-    """The caller named by the bearer token; 401 ``unauthenticated`` otherwise."""
+    """The caller named by the bearer token; 401 ``unauthenticated`` otherwise.
+
+    The token must verify, and its user must exist, be active, not be
+    soft-deleted and hold the token's role (one query, on the request's session).
+    """
     if credentials is None or not credentials.credentials:
         raise UnauthenticatedError()
-    return decode_token(credentials.credentials, request.app.state.settings)
+    actor = decode_token(credentials.credentials, request.app.state.settings)
+    user = await session.get(User, actor.user_id, populate_existing=True)
+    if (
+        user is None
+        or not user.is_active
+        or user.deleted_at is not None
+        or user.role.value != actor.role.value
+    ):
+        raise UnauthenticatedError()
+    return actor
 
 
 def require_role(*roles: ActorRole) -> Callable[..., Awaitable[Actor]]:

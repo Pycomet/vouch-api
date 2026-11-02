@@ -474,10 +474,13 @@ async def test_party_isolation(client, db_session) -> None:
     same_as_unknown(
         await client.post(f"{API}/{booking_id}/handover", json=_handover(), headers=stranger_renter)
     )
-    # The renter's own id under the vendor role is not this booking's vendor.
-    same_as_unknown(
-        await client.get(f"{API}/{booking_id}", headers=auth(parties.renter_id, ActorRole.vendor))
+    # The renter's own id under the vendor role is not a vendor at all: the token's
+    # role must match users.role (R25), so it is refused before visibility.
+    wrong_role = await client.get(
+        f"{API}/{booking_id}", headers=auth(parties.renter_id, ActorRole.vendor)
     )
+    assert wrong_role.status_code == 401
+    assert _error(wrong_role)["code"] == "unauthenticated"
 
     # A party with the wrong role for the action: 403.
     for path in ("accept", "decline", "approve", "claim", "resolve"):
