@@ -651,7 +651,7 @@ async def test_handover_checklist_refuses_nan_and_infinity(
 ) -> None:
     booking_id, parties = await _confirmed(db_session, clock, notifier)
     # Raw content: json.dumps would not write NaN/Infinity by default.
-    raw = '{"checklist": {"fuel": %s}, "evidence_urls": ["%s"], "sign": true}' % (bad, EVIDENCE[0])
+    raw = f'{{"checklist": {{"fuel": {bad}}}, "evidence_urls": ["{EVIDENCE[0]}"], "sign": true}}'
 
     response = await client.post(
         f"{API}/{booking_id}/handover",
