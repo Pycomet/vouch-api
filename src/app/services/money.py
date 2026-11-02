@@ -168,6 +168,25 @@ def refund_contribution_postings(contribution: Decimal) -> list[Posting]:
     )
 
 
+def unapplied_payment_postings(amount: Decimal) -> list[Posting]:
+    """Money received that pays for nothing (a wrong amount): held for the renter.
+
+    dr platform_cash X / cr renter_deposit_liability X. The webhook posts
+    :func:`reversal_postings` of it at once, as the money goes back.
+    """
+    x = _amount(amount, "amount")
+    return _group(
+        (LedgerAccount.platform_cash, Direction.dr, x),
+        (LedgerAccount.renter_deposit_liability, Direction.cr, x),
+    )
+
+
+def reversal_postings(postings: list[Posting]) -> list[Posting]:
+    """The exact reverse of a group: every line with its direction swapped."""
+    flipped = {Direction.dr: Direction.cr, Direction.cr: Direction.dr}
+    return [Posting(p.account, flipped[p.direction], p.amount) for p in postings]
+
+
 def payout_postings(payout: Decimal) -> list[Posting]:
     """dr vendor_payable P / cr platform_cash P."""
     p = _amount(payout, "payout")

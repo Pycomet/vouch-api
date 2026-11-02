@@ -571,6 +571,12 @@ def _money(booking: Booking) -> _Money:
     )
 
 
+def booking_amounts(booking: Booking) -> _Money:
+    """D, C, R, F and K frozen in the booking's ``price_snapshot`` (the webhook's
+    late-payment refund reverses exactly what :func:`_payment_captured` posts)."""
+    return _money(booking)
+
+
 @_register(BookingStatus.accepted, BookingEvent.payment_captured, ActorRole.system)
 async def _payment_captured(ctx: _Context) -> _Outcome:
     """The one upfront payment (A14): accepted -> deposit_paid -> confirmed.

@@ -58,7 +58,9 @@ class PaymentEvent:
     """One provider event, already verified and parsed.
 
     ``payment_reference`` is the provider reference of the payment it concerns
-    (the virtual account's reference for ``payment_captured``).
+    (the virtual account's reference for ``payment_captured``, the transfer's for
+    ``payout_completed``). ``recipient_code`` is the vendor's transfer recipient a
+    payout went to (``None`` when the event names none).
     """
 
     provider_event_id: str
@@ -66,6 +68,7 @@ class PaymentEvent:
     booking_id: uuid.UUID
     payment_reference: str
     amount: Decimal
+    recipient_code: str | None = None
 
 
 @runtime_checkable
@@ -171,17 +174,21 @@ class FakePaymentProvider:
         payment_reference: str,
         amount: Decimal,
         provider_event_id: str | None = None,
+        recipient_code: str | None = None,
     ) -> bytes:
         """A webhook body as the provider would send it (the event id defaults to
         one derived from the type and the reference, so a resend is a replay)."""
+        data = {
+            "booking_id": str(booking_id),
+            "reference": payment_reference,
+            "amount": str(amount),
+        }
+        if recipient_code is not None:
+            data["recipient_code"] = recipient_code
         event = {
             "id": provider_event_id or f"evt_{type}_{payment_reference}",
             "type": type,
-            "data": {
-                "booking_id": str(booking_id),
-                "reference": payment_reference,
-                "amount": str(amount),
-            },
+            "data": data,
         }
         return json.dumps(event, separators=(",", ":")).encode("utf-8")
 
@@ -204,6 +211,11 @@ class FakePaymentProvider:
             booking_id=booking_id,
             payment_reference=_text(data.get("reference"), "reference"),
             amount=_amount(data.get("amount")),
+            recipient_code=(
+                None
+                if data.get("recipient_code") is None
+                else _text(data["recipient_code"], "recipient_code")
+            ),
         )
 
 

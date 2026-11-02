@@ -21,6 +21,8 @@ from app.services.money import (
     payout_postings,
     refund_contribution_postings,
     rental_refund_postings,
+    reversal_postings,
+    unapplied_payment_postings,
 )
 
 D = Decimal
@@ -312,3 +314,30 @@ def test_cancellation_fee_lines() -> None:
     assert cancellation_fee_postings(D("0"), D("0")) == []
     with pytest.raises(ValueError):
         cancellation_fee_postings(D("-1"), D("2"))
+
+
+def test_unapplied_payment_lines_and_reversal() -> None:
+    received = unapplied_payment_postings(D("1000.00"))
+
+    assert _lines(received) == {
+        ("platform_cash", "dr", D("1000.00")),
+        ("renter_deposit_liability", "cr", D("1000.00")),
+    }
+    assert _lines(reversal_postings(received)) == {
+        ("platform_cash", "cr", D("1000.00")),
+        ("renter_deposit_liability", "dr", D("1000.00")),
+    }
+    assert unapplied_payment_postings(D("0")) == []
+    with pytest.raises(ValueError):
+        unapplied_payment_postings(D("-1"))
+
+
+def test_reversal_of_the_capture_nets_every_account_to_zero() -> None:
+    capture = payment_captured_postings(D("100"), D("5"), D("50"), D("10"), D("7.50"))
+    net: dict[str, Decimal] = {}
+    for posting in capture + reversal_postings(capture):
+        sign = 1 if posting.direction.value == "cr" else -1
+        net[posting.account.value] = net.get(posting.account.value, D(0)) + sign * posting.amount
+
+    assert set(net.values()) == {D(0)}
+    assert len(reversal_postings(capture)) == len(capture)

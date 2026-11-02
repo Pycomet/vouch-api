@@ -138,6 +138,22 @@ def test_make_event_takes_an_explicit_event_id() -> None:
 
     assert provider.parse_event(body).provider_event_id == "evt_42"
     assert provider.parse_event(body).type == "payout_completed"
+    assert provider.parse_event(body).recipient_code is None
+
+
+def test_a_payout_event_carries_its_recipient_code() -> None:
+    provider = FakePaymentProvider(SECRET)
+    body = provider.make_event(
+        "payout_completed",
+        booking_id=BOOKING_ID,
+        payment_reference="po-1",
+        amount=Decimal("1.00"),
+        recipient_code="RCP_1",
+    )
+
+    assert provider.parse_event(body).recipient_code == "RCP_1"
+    with pytest.raises(PaymentEventError):
+        provider.parse_event(_body(recipient_code=""))
 
 
 def test_parse_event_keeps_an_unknown_type_for_the_caller_to_refuse() -> None:
