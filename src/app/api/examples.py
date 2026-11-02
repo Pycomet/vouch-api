@@ -423,6 +423,40 @@ PAYMENT_UNAVAILABLE = Err(
     "Payments are not available right now.",
     description="No payment provider is configured; the booking stays requested.",
 )
+# Provider webhooks (R24).
+WEBHOOK_PROCESSED_EXAMPLE: dict[str, Any] = {"status": "processed", "processing_error": None}
+WEBHOOK_DUPLICATE_EXAMPLE: dict[str, Any] = {"status": "duplicate", "processing_error": None}
+WEBHOOK_ERROR_EXAMPLE: dict[str, Any] = {
+    "status": "processed",
+    "processing_error": "amount_mismatch",
+}
+WEBHOOK_BODY_EXAMPLE: dict[str, Any] = {
+    "id": "evt_payment_captured_fake-booking-9a1b2c3d4e5f4a6b8c7d0e1f2a3b4c5d",
+    "type": "payment_captured",
+    "data": {
+        "booking_id": BOOKING_ID,
+        "reference": "fake-booking-9a1b2c3d4e5f4a6b8c7d0e1f2a3b4c5d",
+        "amount": "312500.00",
+    },
+}
+INVALID_SIGNATURE = Err(
+    401,
+    "invalid_signature",
+    "The webhook signature is invalid.",
+    description="X-Vouch-Signature missing or wrong; the event is recorded and ignored.",
+)
+UNKNOWN_PROVIDER = Err(
+    404,
+    "resource_not_found",
+    "The requested resource was not found.",
+    description="No such payment provider.",
+)
+PAYLOAD_TOO_LARGE = Err(
+    413,
+    "payload_too_large",
+    "The request body is too large.",
+    description="The body is over the size cap.",
+)
 PAYMENT_PROVIDER_FAILED = Err(
     502,
     "payment_provider_error",

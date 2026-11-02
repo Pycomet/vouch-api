@@ -122,6 +122,18 @@ class OtpRejectedError(UnauthenticatedError):
     message = "The code is wrong or has expired."
 
 
+class WebhookSignatureError(VouchAPIError):
+    """Raised when a provider webhook's ``X-Vouch-Signature`` does not verify (R24).
+
+    Returns 401 ``invalid_signature``. The event is still recorded, with
+    ``signature_ok = false``, and nothing else happens.
+    """
+
+    status_code = 401
+    code = "invalid_signature"
+    message = "The webhook signature is invalid."
+
+
 class PayloadTooLargeError(VouchAPIError):
     """Raised (by the body-size middleware) when a request body exceeds the cap.
 

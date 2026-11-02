@@ -25,6 +25,7 @@ from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
 from app.schemas.home import RenterHome, VendorHome
 from app.schemas.pagination import Page
+from app.schemas.webhooks import WebhookAck
 
 PREFIX = get_settings().api_v1_prefix
 METHODS = {"get", "post", "put", "patch", "delete"}
@@ -249,6 +250,22 @@ def test_accept_documents_the_payment_provider_errors(schema) -> None:
     assert example["status"] == "accepted"
     # The accepting vendor's view (OpenAPI examples drop null values).
     assert example.get("payment_instructions") is None
+
+
+def test_webhook_documents_each_answer(schema) -> None:
+    operation = schema["paths"][f"{PREFIX}/webhooks/{{provider}}"]["post"]
+    responses = operation["responses"]
+
+    named = responses["200"]["content"]["application/json"]["examples"]
+    assert set(named) == {"processed", "duplicate", "processing_error"}
+    for example in named.values():
+        WebhookAck.model_validate(example["value"])
+    assert _named(responses, "401") == {"invalid_signature"}
+    assert _named(responses, "404") == {"resource_not_found"}
+    assert _named(responses, "413") == {"payload_too_large"}
+    assert "security" not in operation  # the signature, not a bearer token
+    body = operation["requestBody"]["content"]["application/json"]["example"]
+    assert body["type"] == "payment_captured"
 
 
 def test_get_booking_example_shows_the_renters_payment_instructions(schema) -> None:
