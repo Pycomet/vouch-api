@@ -38,6 +38,18 @@ def test_erd_render_is_deterministic() -> None:
     assert gen_erd.render() == gen_erd.render()
 
 
+def test_schema_doc_lists_every_table() -> None:
+    """Every table is a heading in SCHEMA.md (``### `name` ``) and an ERD entity."""
+    schema = (ROOT / "docs" / "SCHEMA.md").read_text(encoding="utf-8")
+    headings = set(re.findall(r"^### `([a-z_]+)`", schema, flags=re.MULTILINE))
+    erd = ERD_SOURCE.read_text(encoding="utf-8")
+    entities = set(re.findall(r"^    ([a-z_]+) \{$", erd, flags=re.MULTILINE))
+    tables = set(Base.metadata.tables)
+    assert tables - headings == set()
+    assert headings - tables == set()
+    assert tables == entities
+
+
 def test_erd_has_every_table_and_foreign_key() -> None:
     text = ERD_SOURCE.read_text(encoding="utf-8")
     entities = set(re.findall(r"^    ([a-z_]+) \{$", text, flags=re.MULTILINE))
