@@ -234,13 +234,28 @@ class RefundLine(BaseModel):
     )
 
 
+class ReturnedPayment(BaseModel):
+    """Money that reached the booking's account but was never applied to it, and
+    is being given back in full (a late, wrong-amount or second payment)."""
+
+    amount: str = Field(description="What arrived, all of it returned.", examples=["307500.00"])
+    reason: str = Field(
+        description=(
+            "Why it was not applied: ``late_payment`` (the booking had already closed), "
+            "``amount_mismatch`` (not the amount due), ``duplicate_payment`` (the booking "
+            "was already paid) or the code of the check that refused it."
+        ),
+        examples=["late_payment"],
+    )
+
+
 class NextStep(BaseModel):
     label: str = Field(examples=["Handover Fri 10 Oct"])
     amount_due: str = Field(examples=["0.00"])
 
 
 # Parts present only when they apply; absent (not null) otherwise.
-_OPTIONAL_PARTS = ("contribution", "cancellation_fee", "refund")
+_OPTIONAL_PARTS = ("contribution", "cancellation_fee", "refund", "returned_payments")
 
 
 class MoneyLine(BaseModel):
@@ -254,6 +269,11 @@ class MoneyLine(BaseModel):
     ``contribution`` appears only when the booking carries one, ``cancellation_fee``
     only after a paid renter cancellation, and ``refund`` only on a booking
     cancelled after payment.
+
+    Only the payment that was applied to the booking counts as paid. Money that
+    arrived but was not applied (late, the wrong amount, a second payment) is
+    listed in ``returned_payments``, which appears only when there is some; it
+    never changes the status of the deposit, contribution or rental.
     """
 
     deposit: DepositLine
@@ -261,6 +281,7 @@ class MoneyLine(BaseModel):
     rental: RentalLine
     cancellation_fee: CancellationFeeLine | None = None
     refund: RefundLine | None = None
+    returned_payments: list[ReturnedPayment] | None = None
     next: NextStep
 
     # No return annotation on purpose: with one, pydantic would publish that type

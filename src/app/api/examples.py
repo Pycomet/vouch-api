@@ -272,6 +272,13 @@ CLOSED_UNPAID_MONEY_LINE: dict[str, Any] = {
     "next": {"label": "Closed", "amount_due": "0.00"},
 }
 
+# Expired unpaid, then the payment arrived late: it was never applied, so every
+# part stays "cancelled", and the whole amount is listed as returned.
+LATE_PAYMENT_MONEY_LINE: dict[str, Any] = {
+    **CLOSED_UNPAID_MONEY_LINE,
+    "returned_payments": [{"amount": "307500.00", "reason": "late_payment"}],
+}
+
 DECLINED_BOOKING_EXAMPLE: dict[str, Any] = {
     **BOOKING_EXAMPLE,
     "status": "declined",
@@ -337,7 +344,15 @@ RENTER_HOME_EXAMPLE: dict[str, Any] = {
                 "rental": {"amount": "150000.00", "status": "paid_out"},
                 "next": {"label": "Closed", "amount_due": "0.00"},
             },
-        }
+        },
+        {
+            **_CARD,
+            "id": "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a",
+            "status": "expired",
+            "starts_on": "2026-10-16",
+            "ends_on": "2026-10-18",
+            "money_line": LATE_PAYMENT_MONEY_LINE,
+        },
     ],
 }
 

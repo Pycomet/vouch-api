@@ -4,9 +4,23 @@ It tells each party where the deposit and the rental money stand and what is
 due next. It is computed on every read from three things, and never stored:
 
 * the booking's ledger postings, summed per account and direction in one query
-  (payout postings are those whose ``payment_id`` is a ``payout`` payment);
+  (payout postings are those whose ``payment_id`` is a ``payout`` payment), and
+  its ``refund`` payment rows for money that was never applied;
 * the booking's last ``deposit.*`` audit row, when the deposit hold has ended;
 * the booking's status and dates.
+
+**Paid** means the upfront payment was *applied* to the booking (A14): the ledger
+holds a ``payment_captured`` group for it that no ``late_payment_refund`` group
+has reversed. The ledger is the one source (the ``booking.deposit_paid`` audit
+row says the same, but is not read). Money that reached the booking's account
+and was not applied (``unapplied_payment``: the wrong amount, a second payment,
+a capture the booking refused) or was captured only to be returned at once
+(``late_payment_refund``: the booking had closed) is never "paid": it shows in
+``returned_payments`` instead, one item per refund row linked to a
+``late_payment_refund`` or ``unapplied_payment_refund`` group, with the reason
+recorded on that row (``late_payment``, ``amount_mismatch``,
+``duplicate_payment`` or the refusing guard's code). It never changes the
+deposit, contribution or rental status.
 
 Amounts come from the booking's ``price_snapshot``: D (deposit), C (damage
 contribution), R (rental) and F (delivery fee).
@@ -48,7 +62,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -63,6 +77,7 @@ from app.schemas.bookings import (
     NextStep,
     RefundLine,
     RentalLine,
+    ReturnedPayment,
     format_money,
 )
 from app.services.pricing import money
@@ -85,6 +100,8 @@ _PAID_LIVE = frozenset(
 _CANCELLED = frozenset({BookingStatus.cancelled_by_renter, BookingStatus.cancelled_by_vendor})
 # Statuses that can close a booking before any payment is captured (A18).
 _CLOSED = frozenset({BookingStatus.declined, BookingStatus.expired, *_CANCELLED})
+# Ledger groups that give back money which was never applied to the booking.
+_RETURN_MEMOS = ("late_payment_refund", "unapplied_payment_refund")
 _DEPOSIT_ACTIONS = {
     "deposit.released": "released",
     "deposit.deducted": "deducted",
@@ -109,6 +126,7 @@ class _Ledger:
 
     sums: dict[tuple[str, str], Decimal]
     payouts: Decimal
+    applied: Decimal
 
     def total(self, account: LedgerAccount, direction: Direction) -> Decimal:
         return self.sums.get((account.value, direction.value), ZERO)
@@ -119,18 +137,33 @@ class _Ledger:
 
     @property
     def paid(self) -> bool:
-        """Whether money ever came in for this booking (the upfront payment)."""
-        return self.total(LedgerAccount.platform_cash, Direction.dr) > 0
+        """Whether the upfront payment was applied to this booking: a
+        ``payment_captured`` group that no ``late_payment_refund`` reversed."""
+        return self.applied > 0
 
 
 async def _ledger(session: AsyncSession, booking: Booking) -> _Ledger:
     payout = case((Payment.type == PaymentType.payout, LedgerEntry.amount), else_=ZERO)
+    cash = LedgerEntry.account == LedgerAccount.platform_cash.value
+    # Cash the upfront payment brought in, less any late-payment reversal of it.
+    applied = case(
+        (
+            and_(cash, LedgerEntry.memo == "payment_captured", LedgerEntry.direction == "dr"),
+            LedgerEntry.amount,
+        ),
+        (
+            and_(cash, LedgerEntry.memo == "late_payment_refund", LedgerEntry.direction == "cr"),
+            -LedgerEntry.amount,
+        ),
+        else_=ZERO,
+    )
     rows = await session.execute(
         select(
             LedgerEntry.account,
             LedgerEntry.direction,
             func.sum(LedgerEntry.amount),
             func.sum(payout),
+            func.sum(applied),
         )
         .outerjoin(Payment, Payment.id == LedgerEntry.payment_id)
         .where(LedgerEntry.booking_id == booking.id)
@@ -138,11 +171,29 @@ async def _ledger(session: AsyncSession, booking: Booking) -> _Ledger:
     )
     sums: dict[tuple[str, str], Decimal] = {}
     payouts = ZERO
-    for account, direction, amount, payout_amount in rows.all():
+    applied_total = ZERO
+    for account, direction, amount, payout_amount, applied_amount in rows.all():
         sums[(account, direction)] = Decimal(amount)
+        applied_total += Decimal(applied_amount)
         if account == LedgerAccount.vendor_payable.value and direction == Direction.dr.value:
             payouts = Decimal(payout_amount)
-    return _Ledger(sums, payouts)
+    return _Ledger(sums, payouts, applied_total)
+
+
+async def _returned_payments(session: AsyncSession, booking: Booking) -> list[ReturnedPayment]:
+    """Money returned without ever being applied, oldest first."""
+    returned = exists().where(
+        LedgerEntry.payment_id == Payment.id, LedgerEntry.memo.in_(_RETURN_MEMOS)
+    )
+    rows = await session.execute(
+        select(Payment.amount, Payment.metadata_)
+        .where(Payment.booking_id == booking.id, Payment.type == PaymentType.refund, returned)
+        .order_by(Payment.created_at, Payment.id)
+    )
+    return [
+        ReturnedPayment(amount=format_money(amount), reason=str((meta or {}).get("reason", "")))
+        for amount, meta in rows.all()
+    ]
 
 
 def _amount(booking: Booking, key: str) -> Decimal:
@@ -274,5 +325,6 @@ async def compute_money_line(
         rental=RentalLine(amount=format_money(rental), status=_rental_status(booking, ledger)),
         cancellation_fee=fee_line,
         refund=refund_line,
+        returned_payments=await _returned_payments(session, booking) or None,
         next=_next_step(booking, settings.business_zone, total),
     )

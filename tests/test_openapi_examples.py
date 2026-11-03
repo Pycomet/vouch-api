@@ -20,7 +20,7 @@ from app.core.config import get_settings
 from app.main import create_app
 from app.schemas.assets import CatalogueSearchPage, PublicAsset
 from app.schemas.auth import OtpSent, TokenOut
-from app.schemas.bookings import BookingOut
+from app.schemas.bookings import BookingOut, MoneyLine
 from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
 from app.schemas.home import RenterHome, VendorHome
@@ -211,6 +211,18 @@ def test_no_show_example_refunds_everything(schema) -> None:
     route = schema["paths"][f"{ACTION}/no-show"]["post"]["responses"]["200"]
     example = route["content"]["application/json"]["example"]
     assert (example["status"], example["money_line"]) == ("cancelled_by_vendor", line)
+
+
+def test_late_payment_example_returns_everything_and_owes_nothing(schema) -> None:
+    line = examples.LATE_PAYMENT_MONEY_LINE
+    MoneyLine.model_validate(line)
+    assert {line[part]["status"] for part in ("deposit", "contribution", "rental")} == {"cancelled"}
+    paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert line["returned_payments"] == [{"amount": str(paid), "reason": "late_payment"}]
+    assert "refund" not in line
+    home = schema["paths"][f"{PREFIX}/me/home"]["get"]["responses"]["200"]
+    past = home["content"]["application/json"]["example"]["past"]
+    assert line in [card["money_line"] for card in past]
 
 
 @pytest.mark.parametrize(

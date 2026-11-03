@@ -23,12 +23,14 @@ from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection
 from app.db.models.payment import PaymentStatus, PaymentType, PayoutStatus
 from app.db.models.user import RenterRole
+from app.providers.payment import FakePaymentProvider
 from app.services.audit import Actor
 from app.services.booking import BookingEvent, transition
 from app.services.ledger import post_txn
 from app.services.money import payout_postings
 from app.services.money_line import compute_money_line, local_day, local_time
 from app.services.notify import RecordingNotifier
+from app.services.webhooks import handle_webhook
 from tests.postgres.factories import (
     DEFAULT_NOW,
     create_asset,
@@ -463,3 +465,129 @@ async def test_unpaid_withdrawal_has_no_refund(db_session, clock, notifier) -> N
     assert line.contribution.status == "cancelled"
     assert line.refund is None
     assert line.cancellation_fee is None
+
+
+# ---------------------------------------------------------------------------
+# Money that was not applied (I1): wrong amount, late, duplicate
+# ---------------------------------------------------------------------------
+
+WEBHOOK_SECRET = "webhook-secret-for-tests-that-is-long-enough"
+
+
+async def _accepted_with_account(session, clock, notifier):
+    """An accepted booking whose virtual account is open (R21); (booking, provider)."""
+    provider = FakePaymentProvider(WEBHOOK_SECRET)
+    booking = await _booking(session, BookingStatus.requested)
+    await transition(
+        session,
+        booking.id,
+        vendor(booking),
+        BookingEvent.accept,
+        None,
+        clock=clock,
+        notifier=notifier,
+        settings=get_settings(),
+        payment_provider=provider,
+    )
+    return booking, provider
+
+
+async def _receive(session, provider, booking, amount, clock, notifier, event_id=None):
+    body = provider.make_event(
+        "payment_captured",
+        booking_id=booking.id,
+        payment_reference=f"fake-booking-{booking.id.hex}",
+        amount=amount,
+        provider_event_id=event_id,
+    )
+    result = await handle_webhook(
+        session,
+        provider,
+        body,
+        provider.sign(body),
+        clock=clock,
+        notifier=notifier,
+        settings=get_settings(),
+    )
+    await session.refresh(booking)
+    return result
+
+
+def _given_back(line) -> list[tuple[str, str]]:
+    return [(item.amount, item.reason) for item in line.returned_payments or []]
+
+
+async def test_wrong_amount_leaves_everything_due(db_session, clock, notifier) -> None:
+    booking, provider = await _accepted_with_account(db_session, clock, notifier)
+    short = TOTAL - D("1000.00")
+    await _receive(db_session, provider, booking, short, clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert booking.status == BookingStatus.accepted
+    assert (line.deposit.status, line.rental.status) == ("due", "due")
+    assert line.contribution.status == "due"
+    assert line.next.label.startswith("Payment due ")
+    assert line.next.amount_due == str(TOTAL)
+    assert line.refund is None
+    assert _given_back(line) == [(str(short), "amount_mismatch")]
+
+
+async def test_late_payment_after_expiry_is_returned(db_session, clock, notifier) -> None:
+    booking, provider = await _accepted_with_account(db_session, clock, notifier)
+    clock.advance(timedelta(hours=25))
+    await _go(db_session, booking, Actor.system(), BookingEvent.expire_deposit, clock, notifier)
+    await _receive(db_session, provider, booking, TOTAL, clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert booking.status == BookingStatus.expired
+    assert (line.deposit.status, line.rental.status) == ("cancelled", "cancelled")
+    assert line.contribution.status == "cancelled"
+    assert line.refund is None
+    assert line.cancellation_fee is None
+    assert (line.next.label, line.next.amount_due) == ("Closed", "0.00")
+    assert _given_back(line) == [(str(TOTAL), "late_payment")]
+
+
+async def test_late_wrong_amount_after_withdrawal_is_returned(db_session, clock, notifier) -> None:
+    booking, provider = await _accepted_with_account(db_session, clock, notifier)
+    await _go(db_session, booking, renter(booking), BookingEvent.cancel, clock, notifier)
+    await _receive(db_session, provider, booking, D("10.00"), clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert booking.status == BookingStatus.cancelled_by_renter
+    assert (line.deposit.status, line.rental.status) == ("cancelled", "cancelled")
+    assert line.contribution.status == "cancelled"
+    assert line.refund is None
+    assert _given_back(line) == [("10.00", "amount_mismatch")]
+
+
+async def test_duplicate_payment_is_returned_beside_the_paid_lines(
+    db_session, clock, notifier
+) -> None:
+    booking, provider = await _accepted_with_account(db_session, clock, notifier)
+    await _receive(db_session, provider, booking, TOTAL, clock, notifier)
+    await _receive(db_session, provider, booking, D("5000.00"), clock, notifier, "evt_again")
+
+    line = await _line(db_session, booking)
+
+    assert booking.status == BookingStatus.confirmed
+    assert (line.deposit.status, line.rental.status) == ("held", "received")
+    assert line.contribution.status == "received"
+    assert line.next.label == "Handover Fri 8 Jan"
+    assert _given_back(line) == [("5000.00", "duplicate_payment")]
+    assert "returned_payments" in line.model_dump()
+
+
+async def test_no_returned_payments_part_when_nothing_was_returned(
+    db_session, clock, notifier
+) -> None:
+    booking, provider = await _accepted_with_account(db_session, clock, notifier)
+    await _receive(db_session, provider, booking, TOTAL, clock, notifier)
+
+    line = await _line(db_session, booking)
+
+    assert line.returned_payments is None
+    assert "returned_payments" not in line.model_dump()
