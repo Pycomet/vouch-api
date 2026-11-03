@@ -11,8 +11,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_kyc_provider, require_role
+from app.api.deps import get_clock, get_kyc_provider, require_role
 from app.api.examples import KYC_EXAMPLE, KYC_UNAVAILABLE, documented
+from app.core.clock import Clock
 from app.db.models import ActorRole
 from app.db.session import get_session
 from app.providers.kyc import KycProvider
@@ -35,12 +36,14 @@ async def submit_kyc(
     actor: Actor = Depends(require_role(ActorRole.renter)),
     session: AsyncSession = Depends(get_session),
     provider: KycProvider = Depends(get_kyc_provider),
+    clock: Clock = Depends(get_clock),
 ) -> KycOut:
     """Tier 1 needs both the identity check and the address check to pass."""
     profile = await apply_kyc(
         session,
         actor.user_id,
         provider,
+        clock=clock,
         id_type=body.id_type,
         id_number=body.id_number,
         selfie=body.selfie_b64,

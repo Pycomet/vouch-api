@@ -18,7 +18,8 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_kyc_provider
+from app.api.deps import get_clock, get_kyc_provider
+from app.core.clock import FrozenClock
 from app.core.config import get_settings
 from app.db.models import ActorRole, AuditEvent, KYCProfile
 from app.db.models.user import KYCStatus, RenterRole
@@ -28,7 +29,7 @@ from app.providers.kyc import FakeKycProvider, KycProvider
 from app.services.kyc import apply_kyc
 from app.services.trust import tier_effective
 from tests.helpers.auth import bearer
-from tests.postgres.factories import create_user
+from tests.postgres.factories import DEFAULT_NOW, create_user
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("VOUCH_TEST_DATABASE_URL"),
@@ -77,6 +78,7 @@ async def client(db_session: AsyncSession, provider: KycProvider) -> AsyncIterat
 
     app.dependency_overrides[get_session] = session_override
     app.dependency_overrides[get_kyc_provider] = lambda: provider
+    app.dependency_overrides[get_clock] = lambda: FrozenClock(DEFAULT_NOW)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         yield http
 
@@ -86,11 +88,12 @@ async def _renter(session: AsyncSession) -> tuple[uuid.UUID, dict[str, str]]:
     return user.id, bearer(user.id, ActorRole.renter, SETTINGS)
 
 
-async def _apply(session, user_id, provider):
+async def _apply(session, user_id, provider, clock=None):
     return await apply_kyc(
         session,
         user_id,
         provider,
+        clock=clock or FrozenClock(DEFAULT_NOW),
         id_type="nin",
         id_number=ID_NUMBER,
         selfie=SELFIE,
@@ -111,11 +114,12 @@ async def _audits(session, user_id) -> list[AuditEvent]:
 async def test_both_checks_pass_gives_tier_1_verified(db_session: AsyncSession) -> None:
     user = await create_user(db_session)
 
-    profile = await _apply(db_session, user.id, FakeKycProvider())
+    at = DEFAULT_NOW.replace(year=2031)
+    profile = await _apply(db_session, user.id, FakeKycProvider(), FrozenClock(at))
 
     assert profile.status == KYCStatus.verified
     assert profile.tier == 1
-    assert profile.verified_at is not None
+    assert profile.verified_at == at  # the injected clock, not the wall clock
     assert profile.national_id_type == "nin"
     assert profile.provider == "fake"
     assert profile.provider_reference.startswith("fake-")
@@ -304,3 +308,17 @@ async def test_missing_field_422_echoes_nothing_submitted(
     assert ID_NUMBER not in response.text
     assert b64(SELFIE)[:16] not in response.text
     assert "input" not in response.text
+
+
+async def test_the_route_stamps_verified_at_with_the_app_clock(client, db_session) -> None:
+    user_id, headers = await _renter(db_session)
+
+    response = await client.post(URL, json=body(), headers=headers)
+
+    assert response.status_code == 200, response.text
+    profile = await db_session.scalar(
+        select(KYCProfile)
+        .where(KYCProfile.user_id == user_id)
+        .execution_options(populate_existing=True)
+    )
+    assert profile.verified_at == DEFAULT_NOW

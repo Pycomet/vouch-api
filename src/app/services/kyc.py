@@ -14,11 +14,11 @@ never commits; the caller owns the transaction.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import Clock
 from app.db.models import ActorRole, KYCProfile, User
 from app.db.models.user import KYCStatus, TrustTier
 from app.providers.kyc import KycProvider
@@ -30,13 +30,17 @@ async def apply_kyc(
     user_id: uuid.UUID,
     provider: KycProvider,
     *,
+    clock: Clock,
     id_type: str,
     id_number: str,
     selfie: bytes,
     address_doc: bytes,
     request_id: str | None = None,
 ) -> KYCProfile:
-    """Verify ``user_id`` with ``provider`` and return their KYC profile."""
+    """Verify ``user_id`` with ``provider`` and return their KYC profile.
+
+    ``verified_at`` is stamped from ``clock`` (the app's clock dependency).
+    """
     # Serialise concurrent attempts for one renter on the user row.
     await session.execute(select(User.id).where(User.id == user_id).with_for_update())
     profile = await session.scalar(select(KYCProfile).where(KYCProfile.user_id == user_id))
@@ -58,7 +62,7 @@ async def apply_kyc(
     if passed:
         profile.status = KYCStatus.verified
         profile.tier = TrustTier.identity_verified
-        profile.verified_at = datetime.now(UTC)
+        profile.verified_at = clock.now()
     else:
         profile.status = KYCStatus.failed
         profile.tier = TrustTier.phone_verified
