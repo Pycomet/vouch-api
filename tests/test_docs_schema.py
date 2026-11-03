@@ -70,6 +70,42 @@ def test_api_contract_lists_every_error_code() -> None:
     assert _error_codes() - documented == set()
 
 
+def _path_shape(path: str) -> str:
+    """``/bookings/{booking_id}`` and ``/bookings/{id}`` both become ``/bookings/{}``."""
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
+def test_api_contract_lists_every_endpoint() -> None:
+    """Every OpenAPI operation is a row of the contract's endpoint table."""
+    from app.core.config import Settings
+    from app.main import create_app
+
+    settings = Settings()
+    spec = create_app(settings).openapi()
+    prefix = settings.api_v1_prefix
+    operations = {
+        (method.upper(), _path_shape(path.removeprefix(prefix)))
+        for path, methods in spec["paths"].items()
+        for method in methods
+    }
+    contract = (ROOT / "docs" / "API_CONTRACT.md").read_text(encoding="utf-8")
+    rows = re.findall(
+        r"^\| (GET|POST|PUT|PATCH|DELETE) \| `([^`]+)` \|", contract, flags=re.MULTILINE
+    )
+    documented = {(method, _path_shape(path)) for method, path in rows}
+    assert operations - documented == set()
+
+
+def test_schema_doc_lists_every_transition() -> None:
+    """Every ``(status, event)`` of the booking registry is a row of SCHEMA.md §5."""
+    from app.services.booking import _TRANSITIONS
+
+    schema = (ROOT / "docs" / "SCHEMA.md").read_text(encoding="utf-8")
+    rows = set(re.findall(r"^\| `([a-z_]+)` \| `([a-z_]+)` \|", schema, flags=re.MULTILINE))
+    registered = {(status.value, event.value) for status, event in _TRANSITIONS}
+    assert registered - rows == set()
+
+
 def test_erd_has_every_table_and_foreign_key() -> None:
     text = ERD_SOURCE.read_text(encoding="utf-8")
     entities = set(re.findall(r"^    ([a-z_]+) \{$", text, flags=re.MULTILINE))
