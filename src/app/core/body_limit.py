@@ -66,7 +66,12 @@ class BodyLimitMiddleware:
             await self._reject(scope, headers, send)
 
     async def _reject(self, scope: Scope, headers: dict[bytes, bytes], send: Send) -> None:
-        request_id = _safe_request_id(headers.get(b"x-request-id", b"").decode("latin-1") or None)
+        # The request-context middleware (outside this one) has already chosen the
+        # id and will echo it as X-Request-ID: use the same one in the body.
+        request_id = scope.get("state", {}).get("request_id")
+        if not request_id:
+            raw = headers.get(b"x-request-id", b"").decode("latin-1") or None
+            request_id = _safe_request_id(raw)
         exc = PayloadTooLargeError()
         body = json.dumps(
             {

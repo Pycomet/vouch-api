@@ -117,3 +117,46 @@ def test_max_request_bytes_is_validated() -> None:
     assert Settings(_env_file=None).max_request_bytes == 8 * 1024 * 1024
     with pytest.raises(ValidationError):
         Settings(_env_file=None, max_request_bytes=CAP - 1)
+
+
+async def test_413_request_id_matches_the_header_without_x_request_id(client: AsyncClient) -> None:
+    """The request-context middleware's id is used, so body and header agree (both 413 paths)."""
+
+    async def chunks():
+        for _ in range(4):
+            yield b"x" * (CAP // 2)
+
+    declared = await client.post(VERIFY, content=b"x" * (CAP + 1))
+    streamed = await client.send(client.build_request("POST", VERIFY, content=chunks()))
+
+    for response in (declared, streamed):
+        assert response.status_code == 413
+        assert "x-request-id" not in response.request.headers
+        assert response.json()["error"]["request_id"] == response.headers["X-Request-ID"]
+        assert len(response.headers.get_list("X-Request-ID")) == 1
+
+
+async def test_413_outside_the_app_falls_back_to_the_header() -> None:
+    """Without the request-context middleware, the caller's id (or a new one) is used."""
+    from app.core.body_limit import BodyLimitMiddleware
+
+    async def never(scope, receive, send):  # pragma: no cover - the cap refuses first
+        raise AssertionError("reached the app")
+
+    bare = BodyLimitMiddleware(never, max_bytes=CAP)
+    async with AsyncClient(transport=ASGITransport(app=bare), base_url="http://test") as http:
+        named = await http.post("/", content=b"x" * (CAP + 1), headers={"X-Request-ID": "req-a"})
+        unnamed = await http.post("/", content=b"x" * (CAP + 1))
+
+    assert named.json()["error"]["request_id"] == "req-a"
+    assert unnamed.json()["error"]["request_id"] == unnamed.headers["X-Request-ID"]
+
+
+async def test_413_keeps_a_valid_caller_request_id(client: AsyncClient) -> None:
+    response = await client.post(
+        VERIFY, content=b"x" * (CAP + 1), headers={"X-Request-ID": "req-caller-1"}
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["request_id"] == "req-caller-1"
+    assert response.headers["X-Request-ID"] == "req-caller-1"
