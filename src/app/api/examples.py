@@ -405,7 +405,8 @@ INVALID_CURSOR = Err(
 # Phone OTP (R26).
 OTP_SENT_EXAMPLE: dict[str, Any] = {"status": "sent"}
 TOKEN_EXAMPLE: dict[str, Any] = {
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYzJkIn0.c2lnbmF0dXJl",
+    # A placeholder, deliberately not JWT-shaped, so secret scanners don't flag the docs.
+    "access_token": "<signed-jwt>",
     "token_type": "bearer",
     "expires_in": 604800,
 }
