@@ -1150,6 +1150,7 @@ async def test_payout_before_completion_is_posted_and_flagged(
     assert alert.data == {
         "booking_id": str(booking_id),
         "renter_id": str(booking.renter_id),
+        "vendor_id": str(booking.vendor_id),
         "booking_status": "confirmed",
         "amount": str(payable),
         "provider_event_id": "evt_payout_completed_trf_1",
@@ -1158,3 +1159,27 @@ async def test_payout_before_completion_is_posted_and_flagged(
     [audit] = await _audits(db_session, payout.id, "payout.paid")
     assert audit.after["booking_status"] == "confirmed"
     assert audit.after["note"] == "booking_not_completed"
+
+
+async def test_payout_on_a_lost_booking_raises_no_alert(
+    client, db_session, clock, notifier, provider
+) -> None:
+    """A lost booking's forfeited deposit is payable to the vendor: not unexpected."""
+    booking_id = await _confirmed(client, db_session, clock, notifier, provider)
+    booking = await _booking(db_session, booking_id)
+    booking.status = BookingStatus.lost
+    await db_session.commit()
+    payable = RENTAL + DELIVERY - COMMISSION
+
+    response = await _send(
+        client,
+        provider,
+        _payout(provider, booking_id, payable, recipient_code="RCP_vendor"),
+    )
+
+    assert response.json() == {"status": "processed", "processing_error": None}
+    assert not [call for call in notifier.calls if call.template == "ops.payout_unexpected"]
+    [payout] = await _payments(db_session, booking_id, PaymentType.payout)
+    [audit] = await _audits(db_session, payout.id, "payout.paid")
+    assert audit.after["booking_status"] == "lost"
+    assert "note" not in audit.after

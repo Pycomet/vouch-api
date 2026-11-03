@@ -621,7 +621,8 @@ async def _payout_completed(ctx: _Context, event: PaymentEvent) -> str | None:
         "recipient_code": recipient,
         "vendor_payable": payable - event.amount,
     }
-    early = booking.status != BookingStatus.completed
+    # A lost booking's forfeited deposit is legitimately payable to the vendor.
+    early = booking.status not in (BookingStatus.completed, BookingStatus.lost)
     if early:
         after["note"] = "booking_not_completed"
     await _audit_payment(ctx, payout, "payout.paid", {"vendor_payable": payable}, after)
@@ -632,6 +633,7 @@ async def _payout_completed(ctx: _Context, event: PaymentEvent) -> str | None:
             {
                 "booking_id": str(booking.id),
                 "renter_id": str(booking.renter_id),
+                "vendor_id": str(booking.vendor_id),
                 "booking_status": str(booking.status.value),
                 "amount": str(event.amount),
                 "provider_event_id": event.provider_event_id,
