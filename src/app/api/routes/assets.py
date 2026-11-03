@@ -1,8 +1,8 @@
 """Public inventory endpoints — read-only, no authentication required.
 
-These routes expose active Lagos creative-gear listings to unauthenticated
-callers.  All visibility filtering (listing status, vendor state, city gate)
-is enforced inside ``app.services.inventory``.
+These routes expose active creative-gear listings in the launched cities to
+unauthenticated callers.  All visibility filtering (listing status, vendor
+state, city gate) is enforced inside ``app.services.inventory``.
 
 Restricted fields are excluded at the schema layer (``PublicAsset``); the
 serialisation layer never returns serial numbers, vendor identity, condition
@@ -17,9 +17,11 @@ If either constraint is violated the endpoint returns 400.
 
 City gate
 ---------
-Only Lagos inventory is served.  ``city=abuja`` returns 400 because Abuja
-launch is gated on explicit product/operations approval and the enum alone
-does not constitute a launch decision.
+Launched cities come from ``Settings.launched_cities`` via the
+``get_launched_cities`` dependency.  A ``city`` filter outside that set returns
+400 ``city_not_launched`` (unknown cities included); without a ``city`` filter,
+results span every launched city.  The detail of an asset in a city that is not
+launched is a 404.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.dependencies import get_launched_cities
 from app.db.session import get_session
 from app.schemas.assets import DEFAULT_LIMIT, MAX_LIMIT, PublicAsset
 from app.schemas.errors import InvalidRequestError
@@ -40,9 +43,9 @@ from app.services.inventory import get_public_asset, search_public_assets
 router = APIRouter(prefix="/assets", tags=["inventory"])
 
 
-@router.get("", response_model=Page[PublicAsset], summary="Search public Lagos inventory")
+@router.get("", response_model=Page[PublicAsset], summary="Search public inventory")
 async def list_assets(
-    category: str | None = Query(None, description="Filter by asset category."),
+    category: str | None = Query(None, description="Filter by category slug."),
     starts_on: datetime.date | None = Query(
         None,
         description="Start date for availability check (inclusive, YYYY-MM-DD).  "
@@ -63,22 +66,16 @@ async def list_assets(
     cursor: str | None = Query(None, description="Opaque pagination cursor from a prior response."),
     city: str | None = Query(
         None,
-        description="City filter.  Only 'lagos' is currently supported.",
+        description="City slug filter.  Must be a launched city; omit it to search them all.",
     ),
     session: AsyncSession = Depends(get_session),
+    launched_cities: list[str] = Depends(get_launched_cities),
 ) -> Page[PublicAsset]:
-    """Return a paginated list of publicly visible Lagos creative-gear listings.
+    """Return a paginated list of publicly visible creative-gear listings.
 
     Filters are optional and additive.  Date filtering requires both
     ``starts_on`` and ``ends_on``; supplying only one returns 400.
     """
-    # --- Validate city ---
-    if city is not None and city != "lagos":
-        raise InvalidRequestError(
-            message="Only 'lagos' is currently available for inventory search.",
-            details={"city": city, "reason": "abuja_not_yet_launched"},
-        )
-
     # --- Validate date pair ---
     if (starts_on is None) != (ends_on is None):
         raise InvalidRequestError(
@@ -95,8 +92,12 @@ async def list_assets(
     if cursor is not None:
         decode_cursor(cursor)  # raises CursorDecodeError (→ 400) on failure
 
+    # The service raises CityNotLaunchedError (→ 400) before querying.
+    city = city.strip().lower() if city else None
     page = await search_public_assets(
         session,
+        launched_cities=launched_cities,
+        city=city,
         category=category,
         starts_on=starts_on,
         ends_on=ends_on,
@@ -106,9 +107,8 @@ async def list_assets(
         cursor=cursor,
     )
 
-    items = [PublicAsset.model_validate(a) for a in page.items]
     return Page(
-        items=items,
+        items=[PublicAsset.from_row(row) for row in page.items],
         pagination=PageMeta(limit=limit, next_cursor=page.next_cursor),
     )
 
@@ -122,11 +122,12 @@ async def list_assets(
 async def get_asset(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
+    launched_cities: list[str] = Depends(get_launched_cities),
 ) -> PublicAsset:
-    """Return the public detail of a single active Lagos listing.
+    """Return the public detail of a single active listing in a launched city.
 
-    Returns 404 for draft, paused, rejected, deleted, Abuja, or unknown
-    assets — all hidden states are indistinguishable from a genuine 404.
+    Returns 404 for draft, paused, rejected, deleted, not-launched-city, or
+    unknown assets — all hidden states are indistinguishable from a genuine 404.
     """
-    asset = await get_public_asset(session, asset_id)
-    return PublicAsset.model_validate(asset)
+    row = await get_public_asset(session, asset_id, launched_cities=launched_cities)
+    return PublicAsset.from_row(row)

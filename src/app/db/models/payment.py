@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import enum
 import uuid
-from collections.abc import Iterable
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Numeric, String, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -16,17 +14,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 from app.db.mixins import TimestampMixin
 
-if TYPE_CHECKING:
-    from app.db.models.booking import BookingStatus
-    from app.db.models.handover import HandoverRecord
-
 
 class PaymentType(enum.StrEnum):
     deposit = "deposit"
     rental_balance = "rental_balance"
     payout = "payout"
     refund = "refund"
-    protection_waiver = "protection_waiver"
+    damage_contribution = "damage_contribution"
 
 
 class PaymentStatus(enum.StrEnum):
@@ -150,54 +144,6 @@ class Payment(TimestampMixin, Base):
         back_populates="payments",
         lazy="raise",
     )
-
-    def is_payout_eligible(
-        self,
-        handovers: Iterable[HandoverRecord],
-        *,
-        booking_status: BookingStatus,
-        payout_on_hold: bool,
-    ) -> bool:
-        from app.db.models.booking import BookingStatus
-        from app.db.models.handover import HandoverDirection, HandoverStatus
-
-        if (
-            self.type is not PaymentType.payout
-            or booking_status is not BookingStatus.completed
-            or payout_on_hold
-        ):
-            return False
-
-        return any(
-            handover.booking_id == self.booking_id
-            and handover.direction is HandoverDirection.return_
-            and handover.status is HandoverStatus.completed
-            and handover.vendor_signer_id is not None
-            and handover.renter_signer_id is not None
-            and handover.vendor_signed_at is not None
-            and handover.renter_signed_at is not None
-            and bool(handover.evidence_urls)
-            for handover in handovers
-        )
-
-    def mark_payout_eligible(
-        self,
-        handovers: Iterable[HandoverRecord],
-        *,
-        booking_status: BookingStatus,
-        payout_on_hold: bool,
-        eligible_at: datetime,
-    ) -> None:
-        if not self.is_payout_eligible(
-            handovers,
-            booking_status=booking_status,
-            payout_on_hold=payout_on_hold,
-        ):
-            raise ValueError("payout requires a completed return handover")
-        if self.payout_status not in {None, PayoutStatus.pending}:
-            raise ValueError("payout cannot transition to eligible")
-        self.payout_status = PayoutStatus.eligible
-        self.payout_eligible_at = eligible_at
 
     def __repr__(self) -> str:
         return (

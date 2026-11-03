@@ -88,6 +88,20 @@ class InvalidRequestError(VouchAPIError):
     message = "The request is invalid."
 
 
+class CityNotLaunchedError(InvalidRequestError):
+    """Raised when a request names a city that is not in the launched set.
+
+    Unknown cities get the same answer, so the response reveals nothing about
+    which cities exist but are not yet open.
+    """
+
+    code = "city_not_launched"
+    message = "This city is not available yet."
+
+    def __init__(self, city: str) -> None:
+        super().__init__(details={"city": city})
+
+
 class CursorDecodeError(InvalidRequestError):
     """Raised when a pagination cursor cannot be decoded."""
 

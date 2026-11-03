@@ -60,6 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None if runtime_settings.is_production else "/openapi.json",
         lifespan=lifespan,
     )
+    application.state.settings = runtime_settings
     application.middleware("http")(request_context_middleware)
     application.add_middleware(
         CORSMiddleware,

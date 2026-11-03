@@ -2,41 +2,50 @@
 
 Uses the TestClient with a patched service layer so no live PostgreSQL is
 required.  Field-restriction and filter logic is asserted through the API
-contract; real SQL behavior is covered by ``test_postgres_listing.py``.
+contract; real SQL behaviour is covered by ``tests/postgres/test_inventory_api.py``.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
-from app.db.models.asset import AssetCategory, City, ListingStatus
+from app.api.dependencies import get_launched_cities
+from app.core.config import Settings
+from app.db.models.asset import ListingStatus
+from app.schemas.assets import PublicAsset
 from app.schemas.errors import ResourceNotFoundError
 from app.schemas.pagination import encode_cursor
+from app.services.inventory import PublicAssetRow, ensure_city_launched
+
+ROOT = Path(__file__).parents[1]
 
 # ---------------------------------------------------------------------------
 # Fake asset row helper
 # ---------------------------------------------------------------------------
 
 
-def _fake_asset(**overrides: Any) -> Any:
-    """Return a simple namespace that looks enough like an Asset ORM row."""
-    from types import SimpleNamespace
-
+def _fake_row(**overrides: Any) -> PublicAssetRow:
+    """Return a ``PublicAssetRow`` around a namespace that looks like an Asset."""
     now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
     defaults = dict(
         id=uuid.uuid4(),
-        name="Sony FX3",
+        name=None,
         description="Camera body",
-        category=AssetCategory.camera,
         daily_rate=Decimal("75000.00"),
         deposit_amount=Decimal("200000.00"),
+        weekend_rate=Decimal("120000.00"),
+        weekly_rate=None,
+        condition_grade="excellent",
         is_available=True,
-        city=City.lagos,
         minimum_trust_tier=1,
         listing_status=ListingStatus.active,
         created_at=now,
@@ -51,7 +60,13 @@ def _fake_asset(**overrides: Any) -> Any:
         deleted_at=None,
     )
     defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    return PublicAssetRow(
+        asset=SimpleNamespace(**defaults),
+        city_slug="abuja",
+        category_slug="camera",
+        make="Sony",
+        model="FX3",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +75,12 @@ def _fake_asset(**overrides: Any) -> Any:
 
 
 def test_list_assets_returns_200(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[asset], next_cursor=None)
+        return AssetPage(items=[row], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     resp = client.get("/api/v1/assets")
@@ -73,12 +88,12 @@ def test_list_assets_returns_200(client: TestClient, monkeypatch) -> None:
 
 
 def test_list_assets_returns_items_and_pagination(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[asset], next_cursor=None)
+        return AssetPage(items=[row], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     body = client.get("/api/v1/assets").json()
@@ -89,12 +104,12 @@ def test_list_assets_returns_items_and_pagination(client: TestClient, monkeypatc
 
 def test_list_assets_response_excludes_restricted_fields(client: TestClient, monkeypatch) -> None:
     """Restricted fields must never appear in public collection output."""
-    asset = _fake_asset()
+    row = _fake_row()
 
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[asset], next_cursor=None)
+        return AssetPage(items=[row], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     item = client.get("/api/v1/assets").json()["items"][0]
@@ -114,12 +129,12 @@ def test_list_assets_response_excludes_restricted_fields(client: TestClient, mon
 
 
 def test_list_assets_includes_required_public_fields(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[asset], next_cursor=None)
+        return AssetPage(items=[row], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     item = client.get("/api/v1/assets").json()["items"][0]
@@ -127,6 +142,12 @@ def test_list_assets_includes_required_public_fields(client: TestClient, monkeyp
     required = {
         "id",
         "name",
+        "display_name",
+        "make",
+        "model",
+        "condition_grade",
+        "weekend_rate",
+        "weekly_rate",
         "category",
         "daily_rate",
         "deposit_amount",
@@ -142,12 +163,12 @@ def test_list_assets_includes_required_public_fields(client: TestClient, monkeyp
 
 
 def test_list_assets_daily_rate_is_decimal_string(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[asset], next_cursor=None)
+        return AssetPage(items=[row], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     item = client.get("/api/v1/assets").json()["items"][0]
@@ -173,25 +194,98 @@ def test_list_assets_returns_next_cursor_when_more_pages(client: TestClient, mon
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
-        return AssetPage(items=[_fake_asset()], next_cursor=cursor)
+        return AssetPage(items=[_fake_row()], next_cursor=cursor)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
     body = client.get("/api/v1/assets?limit=1").json()
     assert body["pagination"]["next_cursor"] == cursor
 
 
-def test_list_assets_abuja_city_returns_400(client: TestClient, monkeypatch) -> None:
+def test_list_assets_passes_launched_cities_from_dependency(
+    client: TestClient, monkeypatch
+) -> None:
+    seen: dict[str, Any] = {}
+
     async def mock_search(*args, **kwargs):
         from app.services.inventory import AssetPage
 
+        seen.update(kwargs)
         return AssetPage(items=[], next_cursor=None)
 
     monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
-    resp = client.get("/api/v1/assets?city=abuja")
+    client.app.dependency_overrides[get_launched_cities] = lambda: ["kano", "enugu"]
+    try:
+        assert client.get("/api/v1/assets?city=kano").status_code == 200
+    finally:
+        client.app.dependency_overrides.clear()
+    assert seen["launched_cities"] == ["kano", "enugu"]
+    assert seen["city"] == "kano"
+
+
+def test_list_assets_unlaunched_city_returns_400_before_db(client: TestClient) -> None:
+    """The service rejects the city before it touches the (absent) database."""
+    client.app.dependency_overrides[get_launched_cities] = lambda: ["abuja"]
+    try:
+        resp = client.get("/api/v1/assets?city=lagos")
+    finally:
+        client.app.dependency_overrides.clear()
     assert resp.status_code == 400
-    body = resp.json()
-    assert body["error"]["code"] == "invalid_request"
-    assert body["error"]["details"]["reason"] == "abuja_not_yet_launched"
+    error = resp.json()["error"]
+    assert error["code"] == "city_not_launched"
+    assert error["details"] == {"city": "lagos"}
+
+
+def test_ensure_city_launched_accepts_launched_and_none() -> None:
+    ensure_city_launched(None, ["abuja"])
+    ensure_city_launched("abuja", ["abuja", "lagos"])
+
+
+def test_launched_cities_come_from_the_apps_own_settings(settings: Settings) -> None:
+    from app.main import create_app
+
+    own = settings.model_copy(update={"launched_cities": ["kano", "enugu"]})
+    application = create_app(own)
+    request = Request({"type": "http", "app": application, "headers": []})
+    assert get_launched_cities(request) == ["kano", "enugu"]
+
+
+def test_city_filter_is_stripped_and_lowercased(client: TestClient, monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    async def mock_search(*args, **kwargs):
+        from app.services.inventory import AssetPage
+
+        seen.update(kwargs)
+        return AssetPage(items=[], next_cursor=None)
+
+    monkeypatch.setattr("app.api.routes.assets.search_public_assets", mock_search)
+    client.app.dependency_overrides[get_launched_cities] = lambda: ["abuja"]
+    try:
+        assert client.get("/api/v1/assets", params={"city": " Abuja "}).status_code == 200
+    finally:
+        client.app.dependency_overrides.clear()
+    assert seen["city"] == "abuja"
+
+
+def test_display_name_prefers_name_then_make_model() -> None:
+    assert PublicAsset.from_row(_fake_row()).display_name == "Sony FX3"
+    assert PublicAsset.from_row(_fake_row(name="A-cam")).display_name == "A-cam"
+
+
+def test_no_city_literals_in_inventory_code() -> None:
+    files = (
+        ROOT / "src" / "app" / "services" / "inventory.py",
+        ROOT / "src" / "app" / "schemas" / "assets.py",
+        ROOT / "src" / "app" / "api" / "routes" / "assets.py",
+    )
+    pattern = re.compile("abuja|lagos", re.IGNORECASE)
+    hits = [
+        f"{path.name}:{lineno}"
+        for path in files
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert hits == []
 
 
 def test_list_assets_missing_ends_on_returns_400(client: TestClient, monkeypatch) -> None:
@@ -246,24 +340,24 @@ def test_list_assets_x_request_id_echoed(client: TestClient, monkeypatch) -> Non
 
 
 def test_get_asset_returns_200(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
-    async def mock_get(session, asset_id):
-        return asset
+    async def mock_get(session, asset_id, **kwargs):
+        return row
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
-    resp = client.get(f"/api/v1/assets/{asset.id}")
+    resp = client.get(f"/api/v1/assets/{row.asset.id}")
     assert resp.status_code == 200
 
 
 def test_get_asset_excludes_restricted_fields(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
-    async def mock_get(session, asset_id):
-        return asset
+    async def mock_get(session, asset_id, **kwargs):
+        return row
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
-    body = client.get(f"/api/v1/assets/{asset.id}").json()
+    body = client.get(f"/api/v1/assets/{row.asset.id}").json()
 
     restricted = {
         "serial_number",
@@ -280,7 +374,7 @@ def test_get_asset_excludes_restricted_fields(client: TestClient, monkeypatch) -
 
 
 def test_get_asset_not_found_returns_404(client: TestClient, monkeypatch) -> None:
-    async def mock_get(session, asset_id):
+    async def mock_get(session, asset_id, **kwargs):
         raise ResourceNotFoundError()
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
@@ -289,7 +383,7 @@ def test_get_asset_not_found_returns_404(client: TestClient, monkeypatch) -> Non
 
 
 def test_get_asset_not_found_uses_safe_code(client: TestClient, monkeypatch) -> None:
-    async def mock_get(session, asset_id):
+    async def mock_get(session, asset_id, **kwargs):
         raise ResourceNotFoundError()
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
@@ -298,7 +392,7 @@ def test_get_asset_not_found_uses_safe_code(client: TestClient, monkeypatch) -> 
 
 
 def test_get_asset_not_found_exposes_no_listing_state(client: TestClient, monkeypatch) -> None:
-    async def mock_get(session, asset_id):
+    async def mock_get(session, asset_id, **kwargs):
         raise ResourceNotFoundError()
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
@@ -312,7 +406,7 @@ def test_get_asset_not_found_exposes_no_listing_state(client: TestClient, monkey
 def test_get_asset_invalid_uuid_returns_422(client: TestClient, monkeypatch) -> None:
     """FastAPI should reject non-UUID path parameters with 422."""
 
-    async def mock_get(session, asset_id):
+    async def mock_get(session, asset_id, **kwargs):
         raise RuntimeError("Should not be reached")
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
@@ -321,11 +415,11 @@ def test_get_asset_invalid_uuid_returns_422(client: TestClient, monkeypatch) -> 
 
 
 def test_get_asset_currency_is_ngn(client: TestClient, monkeypatch) -> None:
-    asset = _fake_asset()
+    row = _fake_row()
 
-    async def mock_get(session, asset_id):
-        return asset
+    async def mock_get(session, asset_id, **kwargs):
+        return row
 
     monkeypatch.setattr("app.api.routes.assets.get_public_asset", mock_get)
-    body = client.get(f"/api/v1/assets/{asset.id}").json()
+    body = client.get(f"/api/v1/assets/{row.asset.id}").json()
     assert body["currency"] == "NGN"

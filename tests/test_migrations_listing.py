@@ -29,13 +29,13 @@ def test_migration_0002_exists_and_revises_0001() -> None:
     assert rev.down_revision == "0001_initial_schema"
 
 
-def test_single_head_after_adding_0002() -> None:
-    """There must be exactly one head revision to prevent migration conflicts."""
+def test_single_head_with_0002_in_chain() -> None:
+    """There must be exactly one head revision, and 0002 must be on its chain."""
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0002_listing_publication_fields"], (
-        f"Expected single head '0002_listing_publication_fields', got {heads}"
-    )
+    assert len(heads) == 1, f"Expected a single head, got {heads}"
+    chain = {rev.revision for rev in script.walk_revisions("base", heads[0])}
+    assert "0002_listing_publication_fields" in chain
 
 
 def test_0002_upgrade_sql_adds_listing_status_column() -> None:
