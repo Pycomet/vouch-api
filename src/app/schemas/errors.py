@@ -111,6 +111,74 @@ class UnauthenticatedError(VouchAPIError):
     headers: ClassVar[Mapping[str, str]] = MappingProxyType({"WWW-Authenticate": "Bearer"})
 
 
+class OtpRejectedError(UnauthenticatedError):
+    """Raised when an OTP verify fails, for any reason (R26).
+
+    No challenge, a wrong, expired, used or exhausted code, and an inactive or
+    deleted account all get this one 401 and message, so the answer reveals
+    nothing about the phone.
+    """
+
+    message = "The code is wrong or has expired."
+
+
+class WebhookSignatureError(VouchAPIError):
+    """Raised when a provider webhook's ``X-Vouch-Signature`` does not verify (R24).
+
+    Returns 401 ``invalid_signature``. The event is still recorded, with
+    ``signature_ok = false``, and nothing else happens.
+    """
+
+    status_code = 401
+    code = "invalid_signature"
+    message = "The webhook signature is invalid."
+
+
+class PayloadTooLargeError(VouchAPIError):
+    """Raised (by the body-size middleware) when a request body exceeds the cap.
+
+    Returns 413 ``payload_too_large``.
+    """
+
+    status_code = 413
+    code = "payload_too_large"
+    message = "The request body is too large."
+
+
+class KycUnavailableError(VouchAPIError):
+    """Raised when the app has no KYC provider configured (staging/production in M2).
+
+    Returns 503 ``kyc_unavailable``.
+    """
+
+    status_code = 503
+    code = "kyc_unavailable"
+    message = "Identity verification is not available right now."
+
+
+class PaymentUnavailableError(VouchAPIError):
+    """Raised when the app has no payment provider configured (staging/production in M2).
+
+    Returns 503 ``payment_unavailable``: a booking cannot be accepted without the
+    renter's payment account (R21).
+    """
+
+    status_code = 503
+    code = "payment_unavailable"
+    message = "Payments are not available right now."
+
+
+class PaymentAccountFailedError(VouchAPIError):
+    """Raised when the payment provider fails to open the renter's payment account.
+
+    Returns 502 ``payment_provider_error``; nothing about the booking changes (R21).
+    """
+
+    status_code = 502
+    code = "payment_provider_error"
+    message = "The payment provider could not open a payment account. Try again."
+
+
 class ForbiddenError(VouchAPIError):
     """Raised when an authenticated caller's role may not use this route.
 
@@ -120,6 +188,35 @@ class ForbiddenError(VouchAPIError):
     status_code = 403
     code = "forbidden"
     message = "You do not have permission to do this."
+
+
+class RateLimitedError(VouchAPIError):
+    """Raised when a caller has made too many requests of one kind.
+
+    Returns 429 ``rate_limited`` with ``Retry-After`` (whole seconds, at least 1).
+    The message never says which limit was hit.
+    """
+
+    status_code = 429
+    code = "rate_limited"
+    message = "Too many requests. Try again later."
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__()
+        self.retry_after = max(1, int(retry_after))
+        # Per instance (the wait differs per caller); read-only like the class default.
+        self.headers = MappingProxyType({"Retry-After": str(self.retry_after)})
+
+
+class OtpUnavailableError(VouchAPIError):
+    """Raised when the app has no OTP sender configured (staging/production in M2).
+
+    Returns 503 ``otp_unavailable``.
+    """
+
+    status_code = 503
+    code = "otp_unavailable"
+    message = "Phone login is not available right now."
 
 
 class InvalidRequestError(VouchAPIError):

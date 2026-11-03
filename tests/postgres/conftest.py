@@ -51,6 +51,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
+from app.db import models as _models  # noqa: F401  (registers every table on Base.metadata)
+from app.db.base import Base
 
 ROOT = Path(__file__).parents[2]
 DATABASE_URL = os.getenv("VOUCH_TEST_DATABASE_URL")
@@ -82,8 +84,16 @@ def alembic_config() -> Config:
 
 _HEAD = {"fresh": False}
 
-# Tables a fresh schema leaves empty; ``db_session`` refuses to start otherwise.
-_EMPTY_WHEN_FRESH = ("users", "assets", "bookings", "payments", "ledger_entries", "audit_events")
+# Reference tables migration 0003 seeds: never empty on a fresh schema, so not guarded.
+# (``alembic_version`` is not a model table, so ``Base.metadata`` never lists it.)
+_SEEDED_TABLES = frozenset({"cities", "categories"})
+
+
+def _guarded_tables() -> tuple[str, ...]:
+    """Every model table a fresh schema leaves empty; ``db_session`` refuses to start otherwise."""
+    return tuple(
+        table.name for table in Base.metadata.sorted_tables if table.name not in _SEEDED_TABLES
+    )
 
 
 async def _drop_public_schema(url: str) -> None:
@@ -290,8 +300,9 @@ async def _assert_fresh(connection) -> None:
     A leak means some test committed without going through a fixture that marks
     the schema stale (``alembic_cfg``, ``conn``, ``migrated_db``, ``session_factory``).
     """
+    # One round trip: the names of the guarded tables that hold any row.
     checks = " UNION ALL ".join(
-        f"SELECT '{table}' WHERE EXISTS (SELECT 1 FROM {table})" for table in _EMPTY_WHEN_FRESH
+        f"SELECT '{table}' WHERE EXISTS (SELECT 1 FROM \"{table}\")" for table in _guarded_tables()
     )
     leaked = (await connection.execute(text(checks))).scalars().all()
     if leaked:

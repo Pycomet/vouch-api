@@ -19,7 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.schemas.errors import BookingGuardFailed, ErrorEnvelope, ValidationErrorResponse
+from app.schemas.errors import (
+    BookingGuardFailed,
+    ErrorEnvelope,
+    OtpRejectedError,
+    ValidationErrorResponse,
+)
 
 REQUEST_ID = "4b9f7c1e-2d3a-4e5f-8a6b-7c8d9e0f1a2b"
 
@@ -66,6 +71,12 @@ _DEFAULT_ERRORS: dict[int, Err] = {
         "resource_not_found",
         "The requested resource was not found.",
         description="Not found, or not yours to see.",
+    ),
+    429: Err(
+        429,
+        "rate_limited",
+        "Too many requests. Try again later.",
+        description="Too many requests; retry after the seconds in Retry-After.",
     ),
     409: Err(
         409,
@@ -215,6 +226,7 @@ BOOKING_EXAMPLE: dict[str, Any] = {
         "currency": "NGN",
     },
     "money_line": MONEY_LINE_EXAMPLE,
+    "payment_instructions": None,
 }
 
 # A paid renter cancellation: refund + cancellation fee == everything paid.
@@ -260,6 +272,13 @@ CLOSED_UNPAID_MONEY_LINE: dict[str, Any] = {
     "next": {"label": "Closed", "amount_due": "0.00"},
 }
 
+# Expired unpaid, then the payment arrived late: it was never applied, so every
+# part stays "cancelled", and the whole amount is listed as returned.
+LATE_PAYMENT_MONEY_LINE: dict[str, Any] = {
+    **CLOSED_UNPAID_MONEY_LINE,
+    "returned_payments": [{"amount": "307500.00", "reason": "late_payment"}],
+}
+
 DECLINED_BOOKING_EXAMPLE: dict[str, Any] = {
     **BOOKING_EXAMPLE,
     "status": "declined",
@@ -274,6 +293,29 @@ REQUESTED_BOOKING_EXAMPLE: dict[str, Any] = {
     "hold_expires_at": "2026-11-02T13:00:00Z",
     "deposit_due_at": None,
     "money_line": REQUESTED_MONEY_LINE,
+}
+
+# The renter's view of an accepted booking: the whole payment is due, and where
+# to pay it (R21). The vendor (who accepts) and admins get null instructions.
+PAYMENT_INSTRUCTIONS_EXAMPLE: dict[str, Any] = {
+    "bank": "Fake Bank",
+    "account_number": "0123456789",
+    "reference": "fake-booking-1c2d3e4f5a6b4c7d8e9f0a1b2c3d4e5f",
+    "amount": "307500.00",
+    "due_by": "2026-11-02T21:00:00Z",
+}
+_ACCEPTED_MONEY_LINE: dict[str, Any] = {
+    **REQUESTED_MONEY_LINE,
+    "next": {"label": "Payment due Mon 2 Nov 22:00", "amount_due": "307500.00"},
+}
+ACCEPTED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **BOOKING_EXAMPLE,
+    "status": "accepted",
+    "money_line": _ACCEPTED_MONEY_LINE,
+}
+RENTER_ACCEPTED_BOOKING_EXAMPLE: dict[str, Any] = {
+    **ACCEPTED_BOOKING_EXAMPLE,
+    "payment_instructions": PAYMENT_INSTRUCTIONS_EXAMPLE,
 }
 
 _CARD: dict[str, Any] = {
@@ -302,7 +344,15 @@ RENTER_HOME_EXAMPLE: dict[str, Any] = {
                 "rental": {"amount": "150000.00", "status": "paid_out"},
                 "next": {"label": "Closed", "amount_due": "0.00"},
             },
-        }
+        },
+        {
+            **_CARD,
+            "id": "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a",
+            "status": "expired",
+            "starts_on": "2026-10-16",
+            "ends_on": "2026-10-18",
+            "money_line": LATE_PAYMENT_MONEY_LINE,
+        },
     ],
 }
 
@@ -350,4 +400,82 @@ INVALID_CURSOR = Err(
     "invalid_cursor",
     "The pagination cursor is invalid or has expired.",
     description="Bad cursor.",
+)
+
+# Phone OTP (R26).
+OTP_SENT_EXAMPLE: dict[str, Any] = {"status": "sent"}
+TOKEN_EXAMPLE: dict[str, Any] = {
+    # A placeholder, deliberately not JWT-shaped, so secret scanners don't flag the docs.
+    "access_token": "<signed-jwt>",
+    "token_type": "bearer",
+    "expires_in": 604800,
+}
+OTP_UNAVAILABLE = Err(
+    503,
+    "otp_unavailable",
+    "Phone login is not available right now.",
+    description="No OTP sender is configured.",
+)
+OTP_REJECTED = Err(
+    401,
+    "unauthenticated",
+    OtpRejectedError.message,
+    description="Wrong, expired, exhausted or used code, or no code was requested.",
+)
+
+# KYC (R27).
+KYC_EXAMPLE: dict[str, Any] = {"tier": 1, "status": "verified"}
+KYC_UNAVAILABLE = Err(
+    503,
+    "kyc_unavailable",
+    "Identity verification is not available right now.",
+    description="No KYC provider is configured.",
+)
+
+# Payments (R21).
+PAYMENT_UNAVAILABLE = Err(
+    503,
+    "payment_unavailable",
+    "Payments are not available right now.",
+    description="No payment provider is configured; the booking stays requested.",
+)
+# Provider webhooks (R24).
+WEBHOOK_PROCESSED_EXAMPLE: dict[str, Any] = {"status": "processed", "processing_error": None}
+WEBHOOK_DUPLICATE_EXAMPLE: dict[str, Any] = {"status": "duplicate", "processing_error": None}
+WEBHOOK_ERROR_EXAMPLE: dict[str, Any] = {
+    "status": "processed",
+    "processing_error": "amount_mismatch",
+}
+WEBHOOK_BODY_EXAMPLE: dict[str, Any] = {
+    "id": "evt_payment_captured_fake-booking-9a1b2c3d4e5f4a6b8c7d0e1f2a3b4c5d",
+    "type": "payment_captured",
+    "data": {
+        "booking_id": BOOKING_ID,
+        "reference": "fake-booking-9a1b2c3d4e5f4a6b8c7d0e1f2a3b4c5d",
+        "amount": "312500.00",
+    },
+}
+INVALID_SIGNATURE = Err(
+    401,
+    "invalid_signature",
+    "The webhook signature is invalid.",
+    description="X-Vouch-Signature missing or wrong; the event is recorded and ignored.",
+)
+UNKNOWN_PROVIDER = Err(
+    404,
+    "resource_not_found",
+    "The requested resource was not found.",
+    description="No such payment provider.",
+)
+PAYLOAD_TOO_LARGE = Err(
+    413,
+    "payload_too_large",
+    "The request body is too large.",
+    description="The body is over the size cap.",
+)
+PAYMENT_PROVIDER_FAILED = Err(
+    502,
+    "payment_provider_error",
+    "The payment provider could not open a payment account. Try again.",
+    description="The provider failed to open the virtual account; the booking stays requested.",
 )

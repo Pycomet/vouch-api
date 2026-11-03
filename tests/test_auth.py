@@ -1,7 +1,9 @@
 """Access tokens and the auth dependencies (Task 4.1).
 
 No database: a tiny test-only router exercises ``get_current_actor`` and
-``require_role`` through the real app, error envelope included.
+``require_role`` through the real app, error envelope included. The user lookup
+(R25) reads from an in-memory stand-in for the session (:class:`_Users`); the
+real lookup and its refusals are covered in ``tests/postgres/test_current_actor.py``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,9 @@ from pydantic import SecretStr, ValidationError
 from app.api.deps import get_current_actor, require_role
 from app.core.config import Environment, Settings
 from app.core.security import decode_token, issue_token
-from app.db.models import ActorRole
+from app.db.models import ActorRole, User
+from app.db.models.user import RenterRole
+from app.db.session import get_session
 from app.main import create_app
 from app.schemas.errors import ForbiddenError, UnauthenticatedError, VouchAPIError
 from app.services.audit import Actor
@@ -43,9 +47,35 @@ def auth_settings() -> Settings:
     return _settings()
 
 
+class _Users:
+    """Stands in for the request session: ``get(User, id)`` reads a dict."""
+
+    def __init__(self) -> None:
+        self.rows: dict[uuid.UUID, User] = {}
+
+    def add(self, user_id: uuid.UUID, role: ActorRole) -> None:
+        self.rows[user_id] = User(
+            id=user_id,
+            phone="+2348000000001",
+            role=RenterRole(role.value),
+            is_active=True,
+            deleted_at=None,
+        )
+
+    async def get(self, model: type, ident: uuid.UUID, **_: object) -> User | None:
+        assert model is User
+        return self.rows.get(ident)
+
+
 @pytest.fixture
-def auth_client(auth_settings: Settings):
+def users() -> _Users:
+    return _Users()
+
+
+@pytest.fixture
+def auth_client(auth_settings: Settings, users: _Users):
     app = create_app(auth_settings)
+    app.dependency_overrides[get_session] = lambda: users
     router = APIRouter(prefix="/test-auth")
 
     @router.get("/me")
@@ -262,7 +292,10 @@ def test_ttl_must_be_positive() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_route_returns_the_actor(auth_client: TestClient, auth_settings: Settings) -> None:
+def test_route_returns_the_actor(
+    auth_client: TestClient, auth_settings: Settings, users: _Users
+) -> None:
+    users.add(USER_ID, ActorRole.renter)
     response = auth_client.get(
         "/test-auth/me", headers=bearer(USER_ID, ActorRole.renter, auth_settings)
     )
@@ -313,7 +346,8 @@ def test_token_from_another_app_secret_401(auth_client: TestClient) -> None:
     _assert_error(response, 401, "unauthenticated")
 
 
-def test_wrong_role_403(auth_client: TestClient, auth_settings: Settings) -> None:
+def test_wrong_role_403(auth_client: TestClient, auth_settings: Settings, users: _Users) -> None:
+    users.add(USER_ID, ActorRole.renter)
     headers = bearer(USER_ID, ActorRole.renter, auth_settings)
 
     response = auth_client.get("/test-auth/vendor-only", headers=headers)
@@ -322,7 +356,10 @@ def test_wrong_role_403(auth_client: TestClient, auth_settings: Settings) -> Non
 
 
 @pytest.mark.parametrize("role", [ActorRole.vendor, ActorRole.admin])
-def test_allowed_role_200(auth_client: TestClient, auth_settings: Settings, role) -> None:
+def test_allowed_role_200(
+    auth_client: TestClient, auth_settings: Settings, users: _Users, role
+) -> None:
+    users.add(USER_ID, role)
     response = auth_client.get(
         "/test-auth/vendor-only", headers=bearer(USER_ID, role, auth_settings)
     )

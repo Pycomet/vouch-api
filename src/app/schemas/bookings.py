@@ -62,7 +62,13 @@ EvidenceUrls = Annotated[list[HttpUrl], Field(min_length=1, max_length=20)]
 # each value a short string, a boolean, a number or null (no nested objects/lists).
 CHECKLIST_MAX_KEYS = 50
 ChecklistKey = Annotated[str, StringConstraints(max_length=100)]
-ChecklistValue = Annotated[str, StringConstraints(max_length=500)] | bool | int | float | None
+ChecklistValue = (
+    Annotated[str, StringConstraints(max_length=500)]
+    | bool
+    | int
+    | Annotated[float, Field(allow_inf_nan=False)]
+    | None
+)
 Checklist = Annotated[dict[ChecklistKey, ChecklistValue], Field(max_length=CHECKLIST_MAX_KEYS)]
 
 
@@ -228,13 +234,28 @@ class RefundLine(BaseModel):
     )
 
 
+class ReturnedPayment(BaseModel):
+    """Money that reached the booking's account but was never applied to it, and
+    is being given back in full (a late, wrong-amount or second payment)."""
+
+    amount: str = Field(description="What arrived, all of it returned.", examples=["307500.00"])
+    reason: str = Field(
+        description=(
+            "Why it was not applied: ``late_payment`` (the booking had already closed), "
+            "``amount_mismatch`` (not the amount due), ``duplicate_payment`` (the booking "
+            "was already paid) or the code of the check that refused it."
+        ),
+        examples=["late_payment"],
+    )
+
+
 class NextStep(BaseModel):
     label: str = Field(examples=["Handover Fri 10 Oct"])
     amount_due: str = Field(examples=["0.00"])
 
 
 # Parts present only when they apply; absent (not null) otherwise.
-_OPTIONAL_PARTS = ("contribution", "cancellation_fee", "refund")
+_OPTIONAL_PARTS = ("contribution", "cancellation_fee", "refund", "returned_payments")
 
 
 class MoneyLine(BaseModel):
@@ -248,6 +269,11 @@ class MoneyLine(BaseModel):
     ``contribution`` appears only when the booking carries one, ``cancellation_fee``
     only after a paid renter cancellation, and ``refund`` only on a booking
     cancelled after payment.
+
+    Only the payment that was applied to the booking counts as paid. Money that
+    arrived but was not applied (late, the wrong amount, a second payment) is
+    listed in ``returned_payments``, which appears only when there is some; it
+    never changes the status of the deposit, contribution or rental.
     """
 
     deposit: DepositLine
@@ -255,6 +281,7 @@ class MoneyLine(BaseModel):
     rental: RentalLine
     cancellation_fee: CancellationFeeLine | None = None
     refund: RefundLine | None = None
+    returned_payments: list[ReturnedPayment] | None = None
     next: NextStep
 
     # No return annotation on purpose: with one, pydantic would publish that type
@@ -278,6 +305,20 @@ class PriceOut(BaseModel):
     currency: str = "NGN"
 
 
+class PaymentInstructions(BaseModel):
+    """Where the renter pays the one upfront payment (R21)."""
+
+    bank: str = Field(examples=["Fake Bank"])
+    account_number: str = Field(
+        description="The booking's virtual account.", examples=["0123456789"]
+    )
+    reference: str = Field(description="The provider's reference for this payment.")
+    amount: str = Field(description="D + C + R + F, the whole payment.", examples=["307500.00"])
+    due_by: datetime.datetime | None = Field(
+        description="Pay before this time or the booking expires (``deposit_due_at``)."
+    )
+
+
 class BookingOut(BaseModel):
     id: uuid.UUID
     status: str
@@ -293,3 +334,7 @@ class BookingOut(BaseModel):
     vendor_approved_at: datetime.datetime | None
     price: PriceOut
     money_line: MoneyLine
+    payment_instructions: PaymentInstructions | None = Field(
+        default=None,
+        description="Shown to the booking's renter only, while it is accepted and unpaid.",
+    )

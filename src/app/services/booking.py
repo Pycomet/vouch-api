@@ -19,6 +19,13 @@ writes the ``booking.deposit_paid`` audit row inside its handler and returns
 ``deposit_paid``. Money transitions post their ledger groups with the recipes in
 :mod:`app.services.money`, using amounts from the booking's ``price_snapshot``.
 
+Payment rows (:mod:`app.services.payments`): ``accept`` opens the renter's
+virtual account through the ``payment_provider`` passed to :func:`transition`
+and records the pending ``booking`` payment (R21); it refuses to run without a
+provider (503 ``payment_unavailable``), so a booking is never accepted without
+somewhere to pay. Every refund of a paid booking records a pending ``refund``
+payment, and its reversal ledger groups point at that row (R22).
+
 ``_TRANSITIONS`` is a plain dict from ``(BookingStatus, BookingEvent)`` to a
 :class:`_Rule`. Later steps add their rows to it with :func:`_register`. A missing
 row, a role the rule does not allow, or a renter or vendor who is not this
@@ -59,10 +66,12 @@ from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
 from app.db.models.payment import PaymentStatus, PaymentType
 from app.db.models.user import TrustTier
+from app.providers.payment import PaymentProvider
 from app.schemas.errors import (
     BookingGuardFailed,
     InvalidRequestError,
     InvalidTransition,
+    PaymentUnavailableError,
     ResourceNotFoundError,
 )
 from app.services.audit import Actor, record_audit
@@ -81,6 +90,14 @@ from app.services.money import (
     rental_refund_postings,
 )
 from app.services.notify import Notifier
+from app.services.payments import (
+    captured_booking_payment,
+    fail_pending_booking_payment,
+    open_booking_account,
+    payment_instructions,
+    record_refund,
+    refund_to_renter,
+)
 from app.services.pricing import money, price_snapshot
 from app.services.trust import required_tier_met, tier_effective
 
@@ -152,6 +169,8 @@ class _Context:
     settings: Settings
     # The caller's request id (R16), written on every audit row of this transition.
     request_id: str | None = None
+    # Opens the renter's virtual account on accept (R21); other events ignore it.
+    payment_provider: PaymentProvider | None = None
 
 
 @dataclass(frozen=True)
@@ -240,11 +259,13 @@ async def transition(
     notifier: Notifier,
     settings: Settings,
     request_id: str | None = None,
+    payment_provider: PaymentProvider | None = None,
 ) -> Booking:
     """Apply ``event`` to the booking as ``actor``; flush, never commit.
 
     ``request_id`` (the HTTP request's id, R16) is stored on every audit row the
-    transition writes, the handlers' own rows included.
+    transition writes, the handlers' own rows included. ``payment_provider`` is
+    required by ``accept`` (R21) and ignored by every other event.
 
     Raises :class:`ResourceNotFoundError` for an unknown booking,
     :class:`InvalidTransition` when the table has no such row or the actor may not
@@ -277,6 +298,7 @@ async def transition(
         notifier=notifier,
         settings=settings,
         request_id=request_id,
+        payment_provider=payment_provider,
     )
     outcome = await rule.handler(context)
 
@@ -336,6 +358,12 @@ def _reason(payload: Mapping[str, Any]) -> str | None:
 
 @_register(BookingStatus.requested, BookingEvent.accept, ActorRole.vendor)
 async def _accept(ctx: _Context) -> _Outcome:
+    """Accept within the hold: open the renter's virtual account for D + C + R + F.
+
+    The guards run first, then the provider call, then the state change, so a
+    failed guard never reaches the provider, and a provider failure (502) or no
+    provider (503) changes nothing (R21).
+    """
     booking = ctx.booking
     if not ctx.now < booking.hold_expires_at:
         raise BookingGuardFailed(
@@ -349,18 +377,35 @@ async def _accept(ctx: _Context) -> _Outcome:
     await _check_renter_may_book(ctx.session, renter, minimum)
     if minimum == TrustTier.vendor_approved and booking.vendor_approved_at is None:
         raise BookingGuardFailed("vendor_approval_required")
+    if ctx.payment_provider is None:
+        raise PaymentUnavailableError()
 
+    payment = await open_booking_account(
+        ctx.session, booking, ctx.payment_provider, _money(booking).total
+    )
     booking.status = BookingStatus.accepted
     booking.deposit_due_at = ctx.now + DEPOSIT_PERIOD
+    instructions = {
+        key: _plain(value) for key, value in payment_instructions(booking, payment).items()
+    }
     return _Outcome(
+        after={
+            "payment": {
+                "id": payment.id,
+                "amount": payment.amount,
+                "provider": payment.provider,
+                "reference": payment.provider_reference,
+            }
+        },
         notices=(
             _notice(
                 booking,
                 booking.renter_id,
                 "booking.accepted",
                 deposit_due_at=booking.deposit_due_at,
+                payment_instructions=instructions,
             ),
-        )
+        ),
     )
 
 
@@ -526,6 +571,12 @@ def _money(booking: Booking) -> _Money:
     )
 
 
+def booking_amounts(booking: Booking) -> _Money:
+    """D, C, R, F and K frozen in the booking's ``price_snapshot`` (the webhook's
+    late-payment refund reverses exactly what :func:`_payment_captured` posts)."""
+    return _money(booking)
+
+
 @_register(BookingStatus.accepted, BookingEvent.payment_captured, ActorRole.system)
 async def _payment_captured(ctx: _Context) -> _Outcome:
     """The one upfront payment (A14): accepted -> deposit_paid -> confirmed.
@@ -601,6 +652,7 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
     booking = ctx.booking
     if not ctx.now > booking.deposit_due_at:
         raise InvalidTransition(booking.status.value, ctx.event.value)
+    await fail_pending_booking_payment(ctx.session, booking.id, ctx.now)
     booking.status = BookingStatus.expired
     return _Outcome(notices=_both(booking, "booking.expired"))
 
@@ -660,30 +712,51 @@ async def _cancel_unpaid(ctx: _Context) -> _Outcome:
         reason = _vendor_reason(ctx)
         await _close_cancelled(ctx, BookingStatus.cancelled_by_vendor, reason)
         notices = _both(booking, "booking.cancelled")
+    # An accepted booking's virtual account is no longer expected to be paid (N1);
+    # a request has no payment row, so this is a no-op there.
+    await fail_pending_booking_payment(ctx.session, booking.id, ctx.now)
     return _Outcome(reason=reason, notices=notices)
 
 
-async def _reverse_capture(ctx: _Context, amounts: _Money) -> dict[str, Any]:
+async def _reverse_capture(
+    ctx: _Context, amounts: _Money, *, refund_amount: Decimal, reason: str
+) -> dict[str, Any]:
     """Reverse the whole upfront payment, so every booking account returns to 0.
 
-    Each part goes back in its own txn_group (deposit, contribution, rental with
-    the delivery fee and commission). Returns the refund breakdown for the audit row.
+    First a pending ``refund`` payment row for ``refund_amount`` (what goes back
+    to the renter: everything paid, less any fee kept), with the provider of the
+    captured payment (R22). Then each part goes back in its own txn_group
+    (deposit, contribution, rental with the delivery fee and commission), each
+    pointing at the refund row. A refund of 0.00 (a fee that keeps everything)
+    writes no row, and the groups point at nothing. Returns the audit after-data:
+    ``refund`` (the breakdown) and ``refund_payment`` (the row's id and amount, or
+    None).
     """
-    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund")
+    paid = await captured_booking_payment(ctx.session, ctx.booking.id)
+    refund = await record_refund(ctx.session, paid, refund_amount, reason=reason)
+    refund_id = None if refund is None else refund.id
+    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund", refund_id)
     await _post(
-        ctx, refund_contribution_postings(amounts.contribution), "cancel_contribution_refund"
+        ctx,
+        refund_contribution_postings(amounts.contribution),
+        "cancel_contribution_refund",
+        refund_id,
     )
     await _post(
         ctx,
         rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
         "cancel_rental_refund",
+        refund_id,
     )
     return {
-        "deposit": amounts.deposit,
-        "damage_contribution": amounts.contribution,
-        "rental": amounts.rental,
-        "delivery_fee": amounts.delivery_fee,
-        "commission": amounts.commission,
+        "refund": {
+            "deposit": amounts.deposit,
+            "damage_contribution": amounts.contribution,
+            "rental": amounts.rental,
+            "delivery_fee": amounts.delivery_fee,
+            "commission": amounts.commission,
+        },
+        "refund_payment": None if refund is None else {"id": refund.id, "amount": refund_amount},
     }
 
 
@@ -716,15 +789,27 @@ async def _cancel_paid(ctx: _Context) -> _Outcome:
         status = BookingStatus.cancelled_by_vendor
 
     amounts = _money(booking)
-    after: dict[str, Any] = {"refund": await _reverse_capture(ctx, amounts)}
+    fee = ZERO
     if status == BookingStatus.cancelled_by_renter:
         fee = cancellation_fee_amount(
             amounts.rental, Decimal(booking.price_snapshot["cancellation_fee_rate"])
         )
+    after = await _reverse_capture(
+        ctx, amounts, refund_amount=amounts.total - fee, reason=status.value
+    )
+    if status == BookingStatus.cancelled_by_renter:
         vendor_part, platform_part = cancellation_fee_split(
             fee, Decimal(booking.price_snapshot["cancellation_fee_vendor_share"])
         )
-        await _post(ctx, cancellation_fee_postings(vendor_part, platform_part), "cancellation_fee")
+        # The fee is kept out of the refund row's money: link it there, so the cash
+        # that row's groups move out (everything paid, less the fee) is its amount.
+        refund_row = after["refund_payment"]
+        await _post(
+            ctx,
+            cancellation_fee_postings(vendor_part, platform_part),
+            "cancellation_fee",
+            None if refund_row is None else refund_row["id"],
+        )
         after["cancellation_fee"] = {
             "amount": fee,
             "vendor_part": vendor_part,
@@ -835,7 +920,8 @@ async def _report_no_show(ctx: _Context) -> _Outcome:
 
     note = _reason(ctx.payload)
     reason = NO_SHOW_REASON if note is None else f"{NO_SHOW_REASON}: {note}"
-    after = {"refund": await _reverse_capture(ctx, _money(booking))}
+    amounts = _money(booking)
+    after = await _reverse_capture(ctx, amounts, refund_amount=amounts.total, reason=NO_SHOW_REASON)
     await _close_cancelled(
         ctx, BookingStatus.cancelled_by_vendor, reason, penalty_reason=NO_SHOW_REASON
     )
@@ -921,16 +1007,26 @@ async def _deposit_audit(ctx: _Context, action: str, **after: Any) -> None:
 
 @_register(BookingStatus.returned, BookingEvent.complete, ActorRole.system)
 async def _complete(ctx: _Context) -> _Outcome:
-    """After the claim window with no claim: release the deposit."""
+    """After the claim window with no claim: release the deposit.
+
+    D goes back to the renter: a pending ``deposit_released`` refund row.
+    """
     booking = ctx.booking
     if not ctx.now > booking.claim_window_ends_at or booking.claimed_at is not None:
         raise InvalidTransition(booking.status.value, ctx.event.value)
     deposit = _snapshot_amount(booking, "deposit")
-    await _post(ctx, deposit_release_postings(deposit), "deposit_released")
+    refund_id = await _refund_id(ctx, deposit, "deposit_released")
+    await _post(ctx, deposit_release_postings(deposit), "deposit_released", refund_id)
     await _deposit_audit(ctx, "deposit.released", deposit=deposit)
     # "Payout eligible": the vendor_payable balance is now final (payouts are Step 5).
     booking.status = BookingStatus.completed
     return _Outcome(notices=_both(booking, "booking.completed"))
+
+
+async def _refund_id(ctx: _Context, amount: Decimal, reason: str) -> uuid.UUID | None:
+    """Record ``amount`` going back to the renter; the refund row's id, or None for 0.00."""
+    refund = await refund_to_renter(ctx.session, ctx.booking.id, amount, reason=reason)
+    return None if refund is None else refund.id
 
 
 _RESOLVE_DECISIONS = ("release", "deduct", "forfeit")
@@ -959,16 +1055,22 @@ async def _resolve(ctx: _Context) -> _Outcome:
         after.update(amount=deduction, requested_amount=requested)
         postings = deposit_deduct_postings(deposit, deduction)
         action = "deposit.deducted"
+        returned = deposit - deduction
     elif decision == "forfeit":
         after["amount"] = deposit
         postings = deposit_forfeit_postings(deposit)
         action = "deposit.forfeited"
+        returned = ZERO
     else:
         after["amount"] = ZERO
         postings = deposit_release_postings(deposit)
         action = "deposit.released"
+        returned = deposit
 
-    await _post(ctx, postings, f"resolve_{decision}")
+    # What goes back to the renter (D, D - X, or nothing on a forfeit) gets a
+    # pending refund row, and the ledger group points at it.
+    memo = f"resolve_{decision}"
+    await _post(ctx, postings, memo, await _refund_id(ctx, returned, memo))
     await _deposit_audit(ctx, action, deposit=deposit, **after)
     booking.status = BookingStatus.completed
     return _Outcome(

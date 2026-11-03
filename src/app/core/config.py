@@ -6,7 +6,7 @@ import re
 from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
@@ -28,6 +28,15 @@ class Environment(StrEnum):
 
 # Environments where the JWT secret rules are not enforced.
 _UNGUARDED_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
+
+
+def _check_secret(field: str, value: SecretStr, env: str) -> None:
+    """Refuse the placeholder or a key shorter than :data:`JWT_SECRET_MIN_BYTES`."""
+    secret = value.get_secret_value()
+    if secret == JWT_SECRET_PLACEHOLDER:
+        raise ValueError(f"{field} must be set in {env}")
+    if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
+        raise ValueError(f"{field} must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}")
 
 
 class Settings(BaseSettings):
@@ -65,9 +74,25 @@ class Settings(BaseSettings):
     # ahead (days after today in the business zone) a rental may start.
     max_rental_days: int = Field(default=90, ge=1)
     booking_horizon_days: int = Field(default=365, ge=1)
+    # Largest accepted request body (413 ``payload_too_large`` above it).
+    max_request_bytes: int = Field(default=8 * 1024 * 1024, ge=1024 * 1024)
     # HS256 signing key for access tokens; checked outside development and test.
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
+    # Where phone OTP codes go. Only the in-memory fake exists in M2 (R26), and it
+    # is refused outside development and test; unset there means "no sender" (the
+    # OTP request route answers 503). Unset in development and test means the fake.
+    otp_sender: Literal["fake"] | None = None
+    # Which KYC provider verifies renters (R27); same rules as ``otp_sender``.
+    kyc_provider: Literal["fake"] | None = None
+    # Which payment provider opens virtual accounts and sends webhooks (R21, R28);
+    # same rules as ``otp_sender``. Unset outside development and test means no
+    # provider: accepting a booking then answers 503 ``payment_unavailable``.
+    payment_provider: Literal["fake"] | None = None
+    # HMAC-SHA256 key the fake provider signs webhook bodies with (R24). Outside
+    # development and test it is checked like ``jwt_secret``, but only when
+    # ``payment_provider`` is "fake" (the only provider that uses it).
+    fake_payment_webhook_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
 
     @field_validator("launched_cities", mode="before")
     @classmethod
@@ -115,14 +140,38 @@ class Settings(BaseSettings):
         # so a staging deployment cannot run on the placeholder or a weak key either.
         if self.environment not in _UNGUARDED_ENVIRONMENTS:
             env = self.environment.value
-            secret = self.jwt_secret.get_secret_value()
-            if secret == JWT_SECRET_PLACEHOLDER:
-                raise ValueError(f"jwt_secret must be set in {env}")
-            if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
-                raise ValueError(
-                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}"
-                )
+            _check_secret("jwt_secret", self.jwt_secret, env)
+            if self.otp_sender == "fake":
+                raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
+            if self.kyc_provider == "fake":
+                raise ValueError(f"kyc_provider 'fake' is not allowed in {env}")
+            if self.payment_provider == "fake":
+                # The secret is the fake's own, so it is checked only when the fake
+                # is selected (and the fake itself is then refused here anyway).
+                _check_secret("fake_payment_webhook_secret", self.fake_payment_webhook_secret, env)
+                raise ValueError(f"payment_provider 'fake' is not allowed in {env}")
         return self
+
+    @property
+    def effective_otp_sender(self) -> str | None:
+        """The OTP sender to build: the setting, or the fake in development and test."""
+        if self.otp_sender is not None:
+            return self.otp_sender
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+
+    @property
+    def effective_kyc_provider(self) -> str | None:
+        """The KYC provider to build: the setting, or the fake in development and test."""
+        if self.kyc_provider is not None:
+            return self.kyc_provider
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+
+    @property
+    def effective_payment_provider(self) -> str | None:
+        """The payment provider to build: the setting, or the fake in development and test."""
+        if self.payment_provider is not None:
+            return self.payment_provider
+        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
 
     @property
     def is_production(self) -> bool:

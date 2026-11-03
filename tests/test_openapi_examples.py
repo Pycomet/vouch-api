@@ -19,11 +19,13 @@ from app.api import examples
 from app.core.config import get_settings
 from app.main import create_app
 from app.schemas.assets import CatalogueSearchPage, PublicAsset
-from app.schemas.bookings import BookingOut
+from app.schemas.auth import OtpSent, TokenOut
+from app.schemas.bookings import BookingOut, MoneyLine
 from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
 from app.schemas.home import RenterHome, VendorHome
 from app.schemas.pagination import Page
+from app.schemas.webhooks import WebhookAck
 
 PREFIX = get_settings().api_v1_prefix
 METHODS = {"get", "post", "put", "patch", "delete"}
@@ -211,6 +213,18 @@ def test_no_show_example_refunds_everything(schema) -> None:
     assert (example["status"], example["money_line"]) == ("cancelled_by_vendor", line)
 
 
+def test_late_payment_example_returns_everything_and_owes_nothing(schema) -> None:
+    line = examples.LATE_PAYMENT_MONEY_LINE
+    MoneyLine.model_validate(line)
+    assert {line[part]["status"] for part in ("deposit", "contribution", "rental")} == {"cancelled"}
+    paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
+    assert line["returned_payments"] == [{"amount": str(paid), "reason": "late_payment"}]
+    assert "refund" not in line
+    home = schema["paths"][f"{PREFIX}/me/home"]["get"]["responses"]["200"]
+    past = home["content"]["application/json"]["example"]["past"]
+    assert line in [card["money_line"] for card in past]
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
@@ -222,17 +236,58 @@ def test_no_show_example_refunds_everything(schema) -> None:
         (CatalogueSearchPage, examples.SEARCH_EXAMPLE),
         (BookingOut, examples.BOOKING_EXAMPLE),
         (BookingOut, examples.REQUESTED_BOOKING_EXAMPLE),
+        (BookingOut, examples.ACCEPTED_BOOKING_EXAMPLE),
+        (BookingOut, examples.RENTER_ACCEPTED_BOOKING_EXAMPLE),
         (RenterHome, examples.RENTER_HOME_EXAMPLE),
         (VendorHome, examples.VENDOR_HOME_EXAMPLE),
         (ServiceStatus, examples.LIVE_EXAMPLE),
         (ReadinessStatus, examples.READY_EXAMPLE),
         (ReadinessStatus, examples.NOT_READY_EXAMPLE),
         (ErrorEnvelope, examples.error_body("forbidden", "No.")),
+        (OtpSent, examples.OTP_SENT_EXAMPLE),
+        (TokenOut, examples.TOKEN_EXAMPLE),
         (ValidationErrorResponse, examples._VALIDATION_EXAMPLE),
     ],
 )
 def test_examples_match_their_models(model: type[BaseModel], payload: dict) -> None:
     model.model_validate(payload)
+
+
+def test_accept_documents_the_payment_provider_errors(schema) -> None:
+    responses = schema["paths"][f"{ACTION}/accept"]["post"]["responses"]
+
+    assert _named(responses, "502") == {"payment_provider_error"}
+    assert _named(responses, "503") == {"payment_unavailable"}
+    example = responses["200"]["content"]["application/json"]["example"]
+    assert example["status"] == "accepted"
+    # The accepting vendor's view (OpenAPI examples drop null values).
+    assert example.get("payment_instructions") is None
+
+
+def test_webhook_documents_each_answer(schema) -> None:
+    operation = schema["paths"][f"{PREFIX}/webhooks/{{provider}}"]["post"]
+    responses = operation["responses"]
+
+    named = responses["200"]["content"]["application/json"]["examples"]
+    assert set(named) == {"processed", "duplicate", "processing_error"}
+    for example in named.values():
+        WebhookAck.model_validate(example["value"])
+    assert _named(responses, "401") == {"invalid_signature"}
+    assert _named(responses, "404") == {"resource_not_found"}
+    assert _named(responses, "413") == {"payload_too_large"}
+    assert "security" not in operation  # the signature, not a bearer token
+    body = operation["requestBody"]["content"]["application/json"]["example"]
+    assert body["type"] == "payment_captured"
+
+
+def test_get_booking_example_shows_the_renters_payment_instructions(schema) -> None:
+    responses = schema["paths"][ACTION]["get"]["responses"]
+    example = responses["200"]["content"]["application/json"]["example"]
+    instructions = example["payment_instructions"]
+
+    assert example["status"] == "accepted"
+    assert instructions["amount"] == example["money_line"]["next"]["amount_due"]
+    assert schema["components"]["schemas"]["PaymentInstructions"]["required"]
 
 
 def test_next_payout_description_names_every_closed_source(schema) -> None:
@@ -242,3 +297,17 @@ def test_next_payout_description_names_every_closed_source(schema) -> None:
 
     for source in ("completed", "cancellation fee", "lost", "closed"):
         assert source in description
+
+
+def test_otp_routes_document_their_errors(schema) -> None:
+    request = schema["paths"][f"{PREFIX}/auth/otp/request"]["post"]["responses"]
+    verify = schema["paths"][f"{PREFIX}/auth/otp/verify"]["post"]["responses"]
+
+    assert {"202", "422", "429", "503"} <= set(request)
+    assert _named(request, "503") == {"otp_unavailable"}
+    assert "401" not in request  # the request never reveals anything about the phone
+    assert _named(request, "429") == {"rate_limited"}
+    assert "Retry-After" in request["429"]["headers"]
+    assert {"200", "401", "422"} <= set(verify)
+    media = verify["401"]["content"]["application/json"]["example"]
+    assert media["error"]["message"] == "The code is wrong or has expired."

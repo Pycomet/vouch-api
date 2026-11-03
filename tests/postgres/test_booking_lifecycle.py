@@ -31,6 +31,7 @@ from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
 from app.db.models.payment import PaymentType
 from app.db.models.user import RenterRole
+from app.providers.payment import FakePaymentProvider
 from app.schemas.errors import BookingGuardFailed, InvalidRequestError, InvalidTransition
 from app.services import booking as booking_service
 from app.services.audit import Actor
@@ -62,6 +63,8 @@ CONTRIBUTION = D("7500.00")
 COMMISSION = D("22500.00")  # 15% of the rental (not of the delivery fee)
 TOTAL = DEPOSIT + CONTRIBUTION + RENTAL + DELIVERY  # the one upfront payment (A14)
 VENDOR_SHARE = RENTAL + DELIVERY - COMMISSION
+# Accept opens the renter's virtual account through it (R21).
+PROVIDER = FakePaymentProvider("test-webhook-secret")
 START = date(2027, 1, 4)
 # Ends 2026-10-29, so at risk from 2026-10-29 23:00 UTC: before DEFAULT_NOW.
 OVERDUE_START = date(2026, 10, 27)
@@ -100,6 +103,7 @@ async def _transition(session, booking, actor, event, clock, notifier, payload=N
         clock=clock,
         notifier=notifier,
         settings=get_settings(),
+        payment_provider=PROVIDER,
     )
 
 
@@ -129,12 +133,15 @@ async def _booking(
 
 
 async def _paid(session: AsyncSession, status: BookingStatus, **kwargs) -> Booking:
-    """A booking in ``status`` whose one upfront payment (D+C+R+F) is on the ledger."""
+    """A booking in ``status`` whose one upfront payment (D+C+R+F) is on the ledger,
+    with its captured ``booking`` payment row (refunds are recorded against it, R22)."""
     booking = await _booking(session, status, **kwargs)
+    payment = await create_payment(session, booking, type=PaymentType.booking, amount=TOTAL)
     await post_txn(
         session,
         postings=payment_captured_postings(DEPOSIT, CONTRIBUTION, RENTAL, DELIVERY, COMMISSION),
         booking_id=booking.id,
+        payment_id=payment.id,
         memo="payment_captured",
     )
     return booking
@@ -430,6 +437,19 @@ async def test_no_show_after_the_vendor_signed_the_pickup_is_refused(db_session,
         notifier,
         "vendor_signed_handover",
     )
+
+
+async def test_no_show_too_early_wins_over_a_vendor_signed_pickup(db_session, notifier) -> None:
+    # Two guards would refuse; the first one (too early) is the one reported.
+    booking = await _paid(db_session, BookingStatus.confirmed)
+    record = await create_handover(db_session, booking, completed=False)
+    record.status = HandoverStatus.vendor_signed
+    record.vendor_signer_id = booking.vendor_id
+    record.vendor_signed_at = DEFAULT_NOW
+    await db_session.flush()
+    just_before = FrozenClock(_no_show_from(booking) - timedelta(microseconds=1))
+
+    await _assert_no_show_refused(db_session, booking, just_before, notifier, "no_show_too_early")
 
 
 async def test_no_show_with_only_a_draft_pickup_is_allowed(db_session, notifier) -> None:
@@ -1848,6 +1868,7 @@ async def _transition_as_request(session, booking, actor, event, clock, notifier
         notifier=notifier,
         settings=get_settings(),
         request_id="req_test",
+        payment_provider=PROVIDER,
     )
 
 

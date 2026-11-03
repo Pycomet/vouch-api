@@ -474,10 +474,13 @@ async def test_party_isolation(client, db_session) -> None:
     same_as_unknown(
         await client.post(f"{API}/{booking_id}/handover", json=_handover(), headers=stranger_renter)
     )
-    # The renter's own id under the vendor role is not this booking's vendor.
-    same_as_unknown(
-        await client.get(f"{API}/{booking_id}", headers=auth(parties.renter_id, ActorRole.vendor))
+    # The renter's own id under the vendor role is not a vendor at all: the token's
+    # role must match users.role (R25), so it is refused before visibility.
+    wrong_role = await client.get(
+        f"{API}/{booking_id}", headers=auth(parties.renter_id, ActorRole.vendor)
     )
+    assert wrong_role.status_code == 401
+    assert _error(wrong_role)["code"] == "unauthenticated"
 
     # A party with the wrong role for the action: 403.
     for path in ("accept", "decline", "approve", "claim", "resolve"):
@@ -643,6 +646,24 @@ async def test_handover_both_sign_starts_rental(client, db_session, clock, notif
         "renter": {"body": "small scuff"},
     }
     assert record.evidence_urls == [EVIDENCE[0], "https://cdn.example/handover/2.jpg"]
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_handover_checklist_refuses_nan_and_infinity(
+    client, db_session, clock, notifier, bad
+) -> None:
+    booking_id, parties = await _confirmed(db_session, clock, notifier)
+    # Raw content: json.dumps would not write NaN/Infinity by default.
+    raw = f'{{"checklist": {{"fuel": {bad}}}, "evidence_urls": ["{EVIDENCE[0]}"], "sign": true}}'
+
+    response = await client.post(
+        f"{API}/{booking_id}/handover",
+        content=raw,
+        headers={**parties.vendor, "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert {issue["type"] for issue in response.json()["detail"]} >= {"finite_number"}
 
 
 async def test_handover_without_signing_stays_draft(client, db_session, clock, notifier) -> None:

@@ -86,7 +86,8 @@ def alembic_config(output_buffer: StringIO | None = None) -> Config:
 def test_single_initial_migration_is_head() -> None:
     script = ScriptDirectory.from_config(alembic_config())
 
-    assert script.get_heads() == ["0004_booking_payment"]
+    assert script.get_heads() == ["0005_otp_challenges"]
+    assert script.get_revision("0005_otp_challenges").down_revision == "0004_booking_payment"
     assert script.get_revision("0004_booking_payment").down_revision == "0003_schema_alignment"
     assert script.get_revision("0001_initial_schema").down_revision is None
 

@@ -26,7 +26,9 @@ from app.core.config import get_settings
 from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry, User
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
+from app.db.models.payment import PaymentType
 from app.jobs import timers as timers_cli
+from app.providers.payment import FakePaymentProvider
 from app.schemas.errors import BookingGuardFailed, InvalidTransition
 from app.services import timers as timers_module
 from app.services.audit import Actor
@@ -39,6 +41,7 @@ from tests.postgres.factories import (
     DEFAULT_NOW,
     create_asset,
     create_booking,
+    create_payment,
     create_user,
     money_snapshot,
 )
@@ -88,10 +91,16 @@ async def _booking(
         claimed=claimed,
     )
     if with_deposit:
+        # The captured payment row too: the deposit released on completion is
+        # recorded as a refund against it (R22).
+        payment = await create_payment(
+            session, booking, type=PaymentType.booking, amount=DEPOSIT + RENTAL
+        )
         await post_txn(
             session,
             postings=payment_captured_postings(DEPOSIT, ZERO, RENTAL, ZERO, COMMISSION),
             booking_id=booking.id,
+            payment_id=payment.id,
             memo="payment_captured",
         )
     return booking
@@ -248,6 +257,7 @@ async def test_timer_and_accept_race_one_wins(session_factory) -> None:
                 clock=FrozenClock(HOLD_END - timedelta(seconds=1)),
                 notifier=RecordingNotifier(),
                 settings=settings,
+                payment_provider=FakePaymentProvider("test-webhook-secret"),
             )
     after = await _run(session_factory, HOLD_END + timedelta(seconds=2))
     assert after.expired_holds == 0
@@ -275,6 +285,7 @@ async def test_timer_and_accept_race_one_wins(session_factory) -> None:
                 clock=FrozenClock(HOLD_END - timedelta(seconds=1)),
                 notifier=RecordingNotifier(),
                 settings=settings,
+                payment_provider=FakePaymentProvider("test-webhook-secret"),
             )
     assert (await _fetch(session_factory, expired.id)).status == BookingStatus.expired
     actions = await _actions(session_factory, expired.id)
@@ -473,17 +484,34 @@ async def test_cli_loop_stops_on_sigterm(migrated_db, vouch_caplog) -> None:
     assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
 
 
-async def test_cli_loop_runs_again_after_interval(migrated_db, vouch_caplog) -> None:
+async def test_cli_loop_runs_again_after_interval(migrated_db, vouch_caplog, monkeypatch) -> None:
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    loop.call_later(0.5, stop.set)
+    calls: list[int] = []
+    waits: list[float | None] = []
+    real_run = timers_cli.run_timers
+    real_wait_for = asyncio.wait_for
 
-    code = await asyncio.wait_for(
+    async def counting_run(*args, **kwargs) -> TimerReport:
+        report = await real_run(*args, **kwargs)
+        calls.append(len(calls))
+        if len(calls) == 2:
+            stop.set()
+        return report
+
+    async def recording_wait_for(aw, timeout=None):  # noqa: ASYNC109
+        waits.append(timeout)
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(timers_cli, "run_timers", counting_run)
+    monkeypatch.setattr(timers_cli.asyncio, "wait_for", recording_wait_for)
+    code = await real_wait_for(
         timers_cli.serve(get_settings(), once=False, interval=0.1, stop=stop), 10
     )
 
     assert code == 0
-    assert vouch_caplog.text.count("timer_run ") >= 2
+    assert len(calls) == 2
+    assert waits == [0.1]  # the loop waited the configured interval between the two runs
+    assert vouch_caplog.text.count("timer_run ") == 2
 
 
 async def test_cli_loop_survives_a_failed_run(migrated_db, vouch_caplog, monkeypatch) -> None:

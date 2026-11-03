@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -134,3 +136,12 @@ def test_booking_limits_default() -> None:
 def test_booking_limits_must_be_at_least_one(field: str) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: 0})
+
+
+def test_every_setting_is_documented_in_env_example() -> None:
+    """Each ``Settings`` field has a ``VOUCH_<NAME>=`` line in ``.env.example``."""
+    example = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    documented = set(re.findall(r"^#?\s*VOUCH_([A-Z0-9_]+)=", example, flags=re.MULTILINE))
+
+    missing = {name.upper() for name in Settings.model_fields} - documented
+    assert missing == set()

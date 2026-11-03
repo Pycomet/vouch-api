@@ -58,7 +58,26 @@ class PayoutStatus(enum.StrEnum):
 
 
 class Payment(TimestampMixin, Base):
-    """Represents a financial transaction tied to a booking."""
+    """Represents a financial transaction tied to a booking.
+
+    Lifecycle in M2 (R21, R22, A14):
+
+    * ``booking``: the one upfront payment (D + C + R + F). Recorded ``pending``
+      when the vendor accepts, with the provider's reference and virtual account
+      number (the bank name in ``metadata``); the payment webhook marks it
+      ``captured`` with ``captured_at``. If the booking leaves ``accepted`` unpaid
+      (deposit expiry, withdraw, vendor cancel) it is marked ``failed`` with
+      ``failed_at``.
+    * ``refund``: recorded ``pending`` for the amount, with the provider of the
+      captured payment, whenever money goes back to the renter: paid cancels and
+      no-shows, the deposit released on completion or by an admin, and the rest
+      of a deducted deposit. Never for 0.00. ``metadata`` holds the reason and the
+      id of the payment refunded. Executing it is a later adapter's job.
+    * ``payout``: the vendor's money (Task 5.4).
+
+    The ``deposit_*`` lifecycle columns are unused: the deposit hold is tracked by
+    the ledger (``renter_deposit_liability``), not by a payment row.
+    """
 
     __tablename__ = "payments"
     __table_args__ = (
