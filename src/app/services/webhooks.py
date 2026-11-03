@@ -48,6 +48,13 @@
   ``payment.refunded_unapplied``), with the guard's code as
   ``processing_error``.
 
+Every refund of money that was not applied (late, the wrong amount, refused,
+a second payment) tells two parties: the renter gets ``payment.refunded``
+(``booking_id``, ``amount``, ``reason``, ``next_step``: ``request_again`` when the
+booking can no longer be paid, else ``None``) and ops gets
+``ops.payment_refunded`` (``booking_id``, ``renter_id``, ``amount``, ``reason``,
+``provider_event_id``).
+
 Money never moves without a ledger entry: a payment into an account whose row
 is already ``captured`` (a second transfer) is held and returned the same way
 (``unapplied_payment`` / ``unapplied_payment_refund``, a pending refund row with
@@ -98,7 +105,7 @@ from app.services.money import (
     unapplied_payment_postings,
 )
 from app.services.notify import Notifier
-from app.services.payments import record_refund
+from app.services.payments import pending_booking_payment, record_refund
 
 UNVERIFIED_PREFIX = "unverified:"
 UNPARSED_PREFIX = "sha256:"
@@ -323,10 +330,10 @@ async def _payment_captured(ctx: _Context, event: PaymentEvent) -> str | None:
         await _refund_duplicate(ctx, booking, payment, event)
         return "payment_already_captured"
     if event.amount != payment.amount:
-        await _refund_mismatch(ctx, booking, payment, event.amount, expected=payment.amount)
+        await _refund_mismatch(ctx, booking, payment, event, expected=payment.amount)
         return "amount_mismatch"
     if booking.status != BookingStatus.accepted:
-        await _refund_late(ctx, booking, payment)
+        await _refund_late(ctx, booking, payment, event)
         return None
 
     try:
@@ -355,7 +362,7 @@ async def _payment_captured(ctx: _Context, event: PaymentEvent) -> str | None:
             ctx,
             booking,
             payment,
-            event.amount,
+            event,
             expected=booking_amounts(booking).total,
             reason=refused.code,
         )
@@ -363,7 +370,58 @@ async def _payment_captured(ctx: _Context, event: PaymentEvent) -> str | None:
     return None
 
 
-async def _refund_late(ctx: _Context, booking: Booking, payment: Payment) -> None:
+# Closed statuses: a booking in one of them can never be paid again.
+_CLOSED = frozenset(
+    {
+        BookingStatus.declined,
+        BookingStatus.expired,
+        BookingStatus.cancelled_by_renter,
+        BookingStatus.cancelled_by_vendor,
+    }
+)
+
+
+async def _next_step(ctx: _Context, booking: Booking) -> str | None:
+    """``request_again`` when the booking can no longer be paid (it closed, or it is
+    accepted with no open payment account left); ``None`` otherwise."""
+    if booking.status in _CLOSED:
+        return "request_again"
+    if booking.status == BookingStatus.accepted:
+        pending = await pending_booking_payment(ctx.session, booking.id)
+        return None if pending is not None else "request_again"
+    return None
+
+
+async def _tell_refunded(
+    ctx: _Context, booking: Booking, amount: Decimal, reason: str, event: PaymentEvent
+) -> None:
+    """The renter and ops hear about every refund of money that was not applied."""
+    await ctx.notifier.send(
+        booking.renter_id,
+        "payment.refunded",
+        {
+            "booking_id": str(booking.id),
+            "amount": str(amount),
+            "reason": reason,
+            "next_step": await _next_step(ctx, booking),
+        },
+    )
+    await ctx.notifier.send(
+        None,
+        "ops.payment_refunded",
+        {
+            "booking_id": str(booking.id),
+            "renter_id": str(booking.renter_id),
+            "amount": str(amount),
+            "reason": reason,
+            "provider_event_id": event.provider_event_id,
+        },
+    )
+
+
+async def _refund_late(
+    ctx: _Context, booking: Booking, payment: Payment, event: PaymentEvent
+) -> None:
     """R23: the booking closed before the money came; capture it and give it back."""
     before = {"status": payment.status}
     _capture(ctx, payment)
@@ -392,6 +450,7 @@ async def _refund_late(ctx: _Context, booking: Booking, payment: Payment) -> Non
             "refund_payment": {"id": refund.id, "amount": refund.amount},
         },
     )
+    await _tell_refunded(ctx, booking, refund.amount, "late_payment", event)
 
 
 async def _hold_and_return(
@@ -416,7 +475,7 @@ async def _refund_mismatch(
     ctx: _Context,
     booking: Booking,
     payment: Payment,
-    received: Decimal,
+    event: PaymentEvent,
     *,
     expected: Decimal,
     reason: str = "amount_mismatch",
@@ -424,6 +483,7 @@ async def _refund_mismatch(
     """Money the booking will not take (a wrong amount, or a capture the booking
     refused with ``reason``): the row records what arrived, which is held for the
     renter and returned. The booking is not touched."""
+    received = event.amount
     before = {"status": payment.status, "amount": payment.amount}
     _capture(ctx, payment)
     payment.amount = received
@@ -447,6 +507,7 @@ async def _refund_mismatch(
             "refund_payment": {"id": refund.id, "amount": refund.amount},
         },
     )
+    await _tell_refunded(ctx, booking, received, reason, event)
 
 
 async def _refund_duplicate(
@@ -473,6 +534,7 @@ async def _refund_duplicate(
             "refund_payment": {"id": refund.id, "amount": refund.amount},
         },
     )
+    await _tell_refunded(ctx, booking, event.amount, "duplicate_payment", event)
 
 
 # ---------------------------------------------------------------------------

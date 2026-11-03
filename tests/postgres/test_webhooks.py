@@ -939,3 +939,94 @@ async def test_concurrent_duplicate_deliveries_post_once(session_factory) -> Non
         assert len(await _webhook_rows(check)) == 1
         assert len(await _audits(check, booking_id, "booking.confirmed")) == 1
         assert await _payments(check, booking_id, PaymentType.refund) == []
+
+
+# ---------------------------------------------------------------------------
+# Every unapplied or late refund tells the renter and ops (I2)
+# ---------------------------------------------------------------------------
+
+
+def _refund_notices(notifier: RecordingNotifier) -> list:
+    templates = ("payment.refunded", "ops.payment_refunded")
+    return [call for call in notifier.calls if call.template in templates]
+
+
+def _assert_told(notifier, booking: Booking, amount, reason, event_id, next_step) -> None:
+    told, ops = _refund_notices(notifier)
+    assert (told.user_id, told.template) == (booking.renter_id, "payment.refunded")
+    assert told.data == {
+        "booking_id": str(booking.id),
+        "amount": str(amount),
+        "reason": reason,
+        "next_step": next_step,
+    }
+    assert (ops.user_id, ops.template) == (None, "ops.payment_refunded")
+    assert ops.data == {
+        "booking_id": str(booking.id),
+        "renter_id": str(booking.renter_id),
+        "amount": str(amount),
+        "reason": reason,
+        "provider_event_id": event_id,
+    }
+
+
+async def test_late_refund_tells_the_renter_and_ops(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    await _expire(db_session, booking_id, clock, notifier)
+    await db_session.commit()
+
+    await _send(client, provider, _event(provider, booking_id, reference))
+
+    booking = await _booking(db_session, booking_id)
+    event_id = f"evt_payment_captured_{reference}"
+    _assert_told(notifier, booking, TOTAL, "late_payment", event_id, "request_again")
+
+
+async def test_mismatch_refund_tells_the_renter_and_ops(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    short = TOTAL - D("1000.00")
+
+    await _send(client, provider, _event(provider, booking_id, reference, short))
+
+    booking = await _booking(db_session, booking_id)
+    assert booking.status == BookingStatus.accepted  # but it can no longer be paid
+    event_id = f"evt_payment_captured_{reference}"
+    _assert_told(notifier, booking, short, "amount_mismatch", event_id, "request_again")
+
+
+async def test_duplicate_refund_tells_the_renter_and_ops(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    await _send(client, provider, _event(provider, booking_id, reference))
+    assert _refund_notices(notifier) == []
+
+    second = D("50000.00")
+    await _send(
+        client,
+        provider,
+        _event(provider, booking_id, reference, second, provider_event_id="evt_again"),
+    )
+
+    booking = await _booking(db_session, booking_id)
+    _assert_told(notifier, booking, second, "duplicate_payment", "evt_again", None)
+
+
+async def test_refused_capture_refund_tells_the_renter_and_ops(
+    client, db_session, provider, notifier
+) -> None:
+    booking_id = await _odd_payment_booking(db_session)
+
+    await _send(
+        client, provider, _event(provider, booking_id, "fake-booking-odd", amount=D("1000.00"))
+    )
+
+    booking = await _booking(db_session, booking_id)
+    event_id = "evt_payment_captured_fake-booking-odd"
+    _assert_told(notifier, booking, D("1000.00"), "amount_mismatch", event_id, "request_again")
+    # The refused transition sent nothing of its own.
+    assert notifier.templates() == ["payment.refunded", "ops.payment_refunded"]
