@@ -133,7 +133,7 @@ Timer -> not returned by the end of the last day: at-risk flag, renter frozen
 Admin -> mark lost from day 7: deposit forfeited to the vendor, asset paused
 ```
 
-The vendor's payout is the rental plus delivery, less the commission, plus any deduction or forfeit. Ops pays it out in M2, and the provider's payout webhook posts it.
+The vendor's payout is the rental plus delivery, less the commission, plus any deduction from the deposit, the vendor's share of a renter's cancellation fee, and the forfeited deposit when an item is lost. Ops pays it out in M2, and the provider's payout webhook posts it.
 
 ## 6. Lifecycle ownership
 

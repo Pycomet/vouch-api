@@ -10,7 +10,7 @@ The **authoritative request and response schemas are the OpenAPI document** the 
 
 - **JSON** request and response bodies. Request bodies refuse unknown fields (422).
 - **Ids** are UUID strings. **Dates** are `YYYY-MM-DD` and inclusive at both ends. **Timestamps** are RFC 3339 with an offset (UTC).
-- **Money** is a string with two decimals, such as `"150000.00"`, in `NGN`. Request bodies accept money only as such a string: at most 10 digits before the point and 2 after. JSON numbers, exponents and signs are 422, so no amount passes through a binary float.
+- **Money** is in `NGN`. Responses always write it as a string with exactly two decimals, such as `"150000.00"`. Request bodies accept money only as a string with at most 10 digits before the point and at most 2 after (`"150000"`, `"150000.5"` and `"150000.00"` are all accepted). JSON numbers, exponents and signs are 422, so no amount passes through a binary float.
 - **Request ids.** A caller may send `X-Request-ID` (1–128 printable ASCII characters); otherwise the server makes one. It is echoed on every response, appears in every error body, and is stored on every audit row the request writes. CORS exposes `X-Request-ID` and `Retry-After`.
 - **Pagination** (`/assets`, `/catalogue/search`): `limit` (1–100, default 20) and an opaque `cursor`. The response is `{"items": [...], "pagination": {"limit", "next_cursor"}}`.
 - **Body size.** Every request body is capped at `VOUCH_MAX_REQUEST_BYTES` (default 8 MiB). Above it the answer is 413 `payload_too_large`, before anything is parsed.
@@ -119,7 +119,7 @@ A booking that ends `declined`, `expired`, `cancelled_by_renter` or `cancelled_b
 
 Each card is `{id, status, asset_id, asset_name, starts_on, ends_on, hold_expires_at, money_line}`.
 
-- `GET /me/home`: `active` is the live (or disputed) booking that starts soonest, or `null`. `past` holds closed bookings, newest first, at most 20.
+- `GET /me/home`: `active` is the live (or disputed) booking that starts soonest, or `null`. `past` holds closed bookings, newest start first, at most 20.
 - `GET /vendor/home`:
   - `requests`: unanswered requests whose hold has not lapsed, ordered by `hold_expires_at` ascending;
   - `today.handovers`: paid bookings starting today; `today.returns`: rentals ending today;

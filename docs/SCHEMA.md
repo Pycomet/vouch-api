@@ -7,7 +7,7 @@ This document describes the **current** schema: what migrations `0001` to `0005`
 Sources of truth, in order:
 
 1. `migrations/versions/0001_initial_schema.py` … `0005_otp_challenges.py` (what the database has);
-2. `src/app/db/models/` (the ORM, which `tests/test_migrations*.py` keeps in step with the migrations);
+2. `src/app/db/models/` (the ORM; `tests/test_migrations*.py` checks it against the migrations, but that drift check does not catch foreign-key drift: see the `handover_records` drift note in §4);
 3. the services that write the rows: `src/app/services/booking.py` (the `_TRANSITIONS` registry), `money.py` (ledger recipes), `payments.py`, `webhooks.py` and `money_line.py`.
 
 The spec is [`docs/specs/M2.md`](specs/M2.md). Where it differs from the code, [`docs/specs/M2-amendments.md`](specs/M2-amendments.md) (A1–A18) wins, and this document follows the amendments.
@@ -19,7 +19,7 @@ python scripts/gen_erd.py
 npx -y @mermaid-js/mermaid-cli -i docs/erd.mmd -o docs/erd.svg
 ```
 
-**Money rule.** Every amount is `NUMERIC(12,2)` in `NGN` in the database, and a Python `Decimal` in code. Never use floating point, and never do money arithmetic outside `Decimal`. Quantize with `Decimal("0.01")` and `ROUND_HALF_UP`. The API reads and writes amounts as strings with two decimal places, such as `"150000.00"`. Request bodies refuse JSON numbers for money (422). A test greps the services and schemas for `float(`.
+**Money rule.** Every amount is `NUMERIC(12,2)` in `NGN` in the database, and a Python `Decimal` in code. Never use floating point, and never do money arithmetic outside `Decimal`. Quantize with `Decimal("0.01")` and `ROUND_HALF_UP`. The API writes amounts as strings with exactly two decimal places, such as `"150000.00"`. Request bodies take money as a string with at most 10 digits before the point and at most 2 after (`"150000"`, `"150000.5"` and `"150000.00"` are all accepted), and refuse JSON numbers for money (422). A test greps the services and schemas for `float(`.
 
 Other conventions:
 
@@ -27,7 +27,7 @@ Other conventions:
 - UUID primary keys come from `gen_random_uuid()` (`pgcrypto`). The append-only tables and `webhook_events` use `BIGSERIAL`. The reference tables use `SMALLSERIAL`.
 - "Python default" means the ORM sets the value on insert. The column has no database default.
 - `created_at` / `updated_at` come from `TimestampMixin`: both default to `now()`, and the ORM refreshes `updated_at` on update. No database trigger maintains `updated_at`.
-- No query, schema or docstring names a city. Launched cities come from `VOUCH_LAUNCHED_CITIES` (A2). The city slugs appear only in the seed data of migration `0003`.
+- No query, schema or docstring names a city. Launched cities come from `VOUCH_LAUNCHED_CITIES` (A2). City slugs appear only as data and configuration: the seed rows of migration `0003`, the settings default `launched_cities = ["abuja"]` (`app/core/config.py`), `VOUCH_LAUNCHED_CITIES=abuja` in `.env.example`, and the name of 0002's index `ix_assets_public_lagos`, which 0003 dropped.
 
 ## 2. Extensions, functions and triggers
 
@@ -160,7 +160,7 @@ One row per login code sent (0005; spec §4, A10).
 |---|---|---|---|
 | `id` | UUID | NOT NULL | `gen_random_uuid()` |
 | `phone` | TEXT | NOT NULL | Normalized `+234…` |
-| `code_hash` | TEXT | NOT NULL | HMAC-SHA256 of the 6-digit code, keyed with the JWT secret. The code itself is never stored. |
+| `code_hash` | TEXT | NOT NULL | HMAC-SHA256 (hex) of `"<phone>:<code>"`, keyed with the JWT secret, so a code is bound to its phone. The code itself is never stored. |
 | `expires_at` | TIMESTAMPTZ | NOT NULL | Ten minutes after it is sent |
 | `attempts` | SMALLINT | NOT NULL | `0`. Each wrong guess adds one. |
 | `consumed_at` | TIMESTAMPTZ | NULL | "Can no longer be used": used, replaced by a newer code, or cleared by a successful login |
@@ -460,7 +460,7 @@ The transition table is the `_TRANSITIONS` registry in `app/services/booking.py`
 | `requested` | `decline` | vendor | `declined` | — | Audit with the optional reason; renter notified |
 | `requested` | `cancel` | renter | `cancelled_by_renter` | — | Free withdrawal (A13): no money moves; `cancelled_at`; vendor notified `booking.withdrawn` |
 | `requested` | `expire_hold` | system (timer) | `expired` | `now > hold_expires_at` | Dates freed; renter notified |
-| `accepted` | `payment_captured` | system (webhook) | `deposit_paid` → `confirmed` | Amount = D + C + R + F exactly, and the payload names this booking's captured `booking` payment of that amount (`amount_mismatch`) | One ledger group, `payment_captured` (§8); audit `booking.deposit_paid` then `booking.confirmed`; both parties notified with each other's phone |
+| `accepted` | `payment_captured` | system (webhook) | `deposit_paid` → `confirmed` | Amount = D + C + R + F exactly (`amount_mismatch`); the payload's `payment_id` must be this booking's captured `booking` payment (missing, malformed or another booking's: 400 `invalid_request`), and that row's amount must equal the payload's (`amount_mismatch`) | One ledger group, `payment_captured` (§8); audit `booking.deposit_paid` then `booking.confirmed`; both parties notified with each other's phone |
 | `accepted` | `cancel` | renter | `cancelled_by_renter` | — | Free withdrawal (A13); the pending `booking` payment is marked `failed`; vendor notified `booking.withdrawn` |
 | `accepted` | `cancel` | vendor | `cancelled_by_vendor` | Reason required (`reason_required`) | The pending payment is marked `failed`; audit `vendor.reliability_penalty`; both notified |
 | `accepted` | `expire_deposit` | system (timer) | `expired` | `now > deposit_due_at` | The pending payment is marked `failed`; both notified |
@@ -561,7 +561,7 @@ The cancellation fee is `rental × cancellation_fee_rate`, quantized half up. Th
 3. **Dispatch** by type, in a savepoint. A domain refusal rolls the savepoint back and records its code in `processing_error`. The event row stays, and the answer is still 200, so the provider does not retry an event that can never succeed. Any other error is a 500 and rolls everything back, event row included, so the provider's retry runs it again.
 4. `processed_at` is set on every verified event.
 
-`processing_error` values: `unsupported_event`, `malformed_event`, `booking_not_found`, `payment_not_found` (no `booking` payment with that reference, so unknown-reference money is kept only as this row; see `docs/OPERATIONS-NOTES.md`), `amount_mismatch`, `payment_already_captured`, a booking guard code, `payout_not_found`, `payout_already_paid`, `recipient_missing` and `payout_exceeds_payable`.
+`processing_error` values: `unsupported_event`, `malformed_event`, `booking_not_found`, `payment_not_found` (no `booking` payment with that reference, so unknown-reference money is kept only as this row; see `docs/OPERATIONS-NOTES.md`), `amount_mismatch`, `payment_already_captured`, a booking guard code, `payout_not_found`, `payout_already_paid`, `recipient_missing` and `payout_exceeds_payable`. A refused `payout_completed` (any of its codes) posts nothing and records or updates no payout row, although the transfer has left; like `payment_not_found`, `malformed_event` and `unsupported_event`, it must be reconciled by ops against the provider (`docs/OPERATIONS-NOTES.md` §1).
 
 `payment_captured` outcomes:
 
