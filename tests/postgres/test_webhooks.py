@@ -13,6 +13,7 @@ transactions, so it runs on ``session_factory`` against the service directly.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -320,7 +321,12 @@ async def test_bad_signature_401_and_recorded(
     [row] = await _webhook_rows(db_session)  # one body, recorded once
     assert row.signature_ok is False
     assert row.processed_at is None
-    assert row.payload["id"] == f"evt_payment_captured_{reference}"
+    # Only what identifies the delivery is kept, never the unverified body.
+    assert row.payload == {
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "claimed_event_id": f"evt_payment_captured_{reference}",
+        "size": len(body),
+    }
     # Stored under the body's hash: a forged body cannot take the real event's id.
     assert row.provider_event_id.startswith("unverified:")
     assert (await _booking(db_session, booking_id)).status == BookingStatus.accepted
@@ -345,7 +351,23 @@ async def test_bad_signature_on_a_body_that_is_not_json_is_recorded(client, db_s
     assert len(rows) == len(bodies)
     for row in rows:
         assert row.signature_ok is False
-        assert set(row.payload) == {"body_sha256"}
+        assert set(row.payload) == {"body_sha256", "size"}
+
+
+async def test_unverified_body_keeps_no_payload_and_no_long_claimed_id(client, db_session) -> None:
+    body = json.dumps(
+        {"id": "e" * 201, "type": "payment_captured", "data": {"amount": "1.00", "phone": "x"}}
+    ).encode()
+    other = json.dumps({"id": 7, "data": {"amount": "2.00"}}).encode()
+
+    for sent in (body, other):
+        assert (await _send(client, None, sent, signature="abc")).status_code == 401
+
+    rows = await _webhook_rows(db_session)
+    assert [row.payload for row in rows] == [
+        {"body_sha256": hashlib.sha256(body).hexdigest(), "size": len(body)},
+        {"body_sha256": hashlib.sha256(other).hexdigest(), "size": len(other)},
+    ]
 
 
 async def test_unknown_provider_is_404_and_records_nothing(client, db_session, provider) -> None:

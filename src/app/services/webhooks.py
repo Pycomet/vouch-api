@@ -6,7 +6,9 @@
    ``signature_ok = false`` and nothing else happens (the route answers 401). It
    is stored under ``unverified:<sha256 of the body>``, never under the id the
    body claims, so a forged body cannot take a real event's id and make the
-   genuine delivery look like a replay. The claimed id stays in the payload.
+   genuine delivery look like a replay. The unverified body itself is never
+   stored: only its hash, its size and, if it parses and is short enough, the id
+   it claims (:func:`_unverified_payload`).
 2. A verified event is inserted with ``ON CONFLICT (provider, provider_event_id)
    DO NOTHING RETURNING id``. No row back means the event was seen before: the
    answer is ``duplicate`` and nothing else is done, so a replay never posts
@@ -175,6 +177,20 @@ def _stored_payload(body: bytes) -> dict[str, Any]:
     return _loose_json(body) or {"body_sha256": _body_hash(body)}
 
 
+MAX_CLAIMED_ID = 200
+
+
+def _unverified_payload(body: bytes) -> dict[str, Any]:
+    """What is kept of a body whose signature failed: its hash and size, and the
+    event id it claims when that is a string of at most 200 characters. Nobody
+    vouches for the rest, so it is not stored."""
+    payload: dict[str, Any] = {"body_sha256": _body_hash(body), "size": len(body)}
+    claimed = (_loose_json(body) or {}).get("id")
+    if isinstance(claimed, str) and 0 < len(claimed) <= MAX_CLAIMED_ID:
+        payload["claimed_event_id"] = claimed
+    return payload
+
+
 async def _record(
     session: AsyncSession,
     provider: str,
@@ -226,7 +242,7 @@ async def handle_webhook(
             session,
             provider.name,
             UNVERIFIED_PREFIX + _body_hash(body),
-            _stored_payload(body),
+            _unverified_payload(body),
             signature_ok=False,
         )
         return WebhookResult("invalid_signature")
