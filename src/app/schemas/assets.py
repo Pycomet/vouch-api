@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_serializer
 
+from app.schemas.pagination import Page
+
 if TYPE_CHECKING:
     from app.services.inventory import PublicAssetRow
 
@@ -99,6 +101,15 @@ class PublicAsset(BaseModel):
             created_at=asset.created_at,
             updated_at=asset.updated_at,
         )
+
+
+class CatalogueSearchPage(Page[PublicAsset]):
+    """``GET /catalogue/search``: a page of free units, flagged when they are equivalents."""
+
+    equivalents: bool = Field(
+        description="True when nothing matched ``q`` for these dates and the items are "
+        "free units of the same category instead."
+    )
 
 
 class AssetSearchFilters(BaseModel):

@@ -6,10 +6,10 @@ One run of :func:`run_timers` performs four sweeps, in this order:
 * expire deposit windows: ``accepted`` bookings whose ``deposit_due_at`` has passed;
 * complete: ``returned`` bookings whose claim window has closed with no claim
   (the transition releases the deposit);
-* flag at risk: ``in_progress`` bookings not yet flagged whose return day ended at
-  least 48 hours ago. The spec says "T+48h no contact"; M2 has no contact signal,
-  so "no contact" is read as "not returned": a booking is at risk from
-  ``start_of_business_day(ends_on + 1 day) + 48h`` (``booking.at_risk_last_end_date``,
+* flag at risk: ``in_progress`` bookings not yet flagged whose last rental day
+  has ended (A15: no 48-hour wait). M2 has no contact signal, so "no contact" is
+  read as "not returned": a booking is at risk from
+  ``start_of_business_day(ends_on + 1 day)`` (``booking.at_risk_last_end_date``,
   which the transition itself also enforces).
 
 Every action is an ordinary :func:`app.services.booking.transition` sent as

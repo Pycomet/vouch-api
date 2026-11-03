@@ -30,7 +30,7 @@ def _error_response(request: Request, exc: VouchAPIError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content=body.model_dump(),
-        headers={"X-Request-ID": request_id},
+        headers={**exc.headers, "X-Request-ID": request_id},
     )
 
 

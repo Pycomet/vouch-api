@@ -10,15 +10,17 @@ import pytest
 from app.db.models import Direction, LedgerAccount
 from app.services.ledger import Posting
 from app.services.money import (
-    balance_captured_postings,
-    balance_refund_postings,
+    cancellation_fee_amount,
+    cancellation_fee_postings,
+    cancellation_fee_split,
     commission_amount,
-    deposit_captured_postings,
     deposit_deduct_postings,
     deposit_forfeit_postings,
     deposit_release_postings,
+    payment_captured_postings,
     payout_postings,
     refund_contribution_postings,
+    rental_refund_postings,
 )
 
 D = Decimal
@@ -36,18 +38,13 @@ def _sums(postings: Sequence[Posting]) -> tuple[Decimal, Decimal]:
 
 
 CASES: list[tuple[str, Callable[..., list[Posting]], tuple[str, ...]]] = [
-    ("captured_small", deposit_captured_postings, ("0.01", "0.01")),
-    ("captured_no_contribution", deposit_captured_postings, ("150000.00", "0")),
-    ("captured_max", deposit_captured_postings, ("9999999999.98", "0.01")),
-    ("captured_only_contribution", deposit_captured_postings, ("0", "0.01")),
-    ("balance_small", balance_captured_postings, ("0.01", "0", "0")),
-    ("balance_typical", balance_captured_postings, ("150000.00", "2500.00", "22500.00")),
-    ("balance_max", balance_captured_postings, ("9999999999.98", "0.01", "0.01")),
-    ("balance_all_commission", balance_captured_postings, ("100.00", "0", "100.00")),
-    ("balance_refund_small", balance_refund_postings, ("0.01", "0", "0")),
-    ("balance_refund_typical", balance_refund_postings, ("150000.00", "7500.00", "22500.00")),
-    ("balance_refund_max", balance_refund_postings, ("9999999999.98", "0.01", "0.01")),
-    ("balance_refund_all_commission", balance_refund_postings, ("100.00", "0", "100.00")),
+    ("rental_refund_small", rental_refund_postings, ("0.01", "0", "0")),
+    ("rental_refund_typical", rental_refund_postings, ("150000.00", "7500.00", "22500.00")),
+    ("rental_refund_max", rental_refund_postings, ("9999999999.98", "0.01", "0.01")),
+    ("rental_refund_all_commission", rental_refund_postings, ("100.00", "0", "100.00")),
+    ("fee_typical", cancellation_fee_postings, ("2250.00", "2250.00")),
+    ("fee_vendor_only", cancellation_fee_postings, ("0.01", "0")),
+    ("fee_platform_only", cancellation_fee_postings, ("0", "0.01")),
     ("release_small", deposit_release_postings, ("0.01",)),
     ("release_max", deposit_release_postings, (MAX,)),
     ("deduct_partial", deposit_deduct_postings, ("150000.00", "0.01")),
@@ -75,65 +72,47 @@ def test_every_recipe_balances(recipe, args) -> None:
     assert all(p.amount > 0 for p in postings)
 
 
-def test_deposit_captured_lines() -> None:
-    assert _lines(deposit_captured_postings(D("150000.00"), D("7500.00"))) == {
-        ("platform_cash", "dr", D("157500.00")),
-        ("renter_deposit_liability", "cr", D("150000.00")),
-        ("protection_pool", "cr", D("7500.00")),
-    }
-
-
-def test_deposit_captured_omits_zero_contribution() -> None:
-    assert _lines(deposit_captured_postings(D("150000.00"), D("0.00"))) == {
-        ("platform_cash", "dr", D("150000.00")),
-        ("renter_deposit_liability", "cr", D("150000.00")),
-    }
-
-
-def test_balance_captured_lines() -> None:
-    assert _lines(balance_captured_postings(D("150000.00"), D("2500.00"), D("22500.00"))) == {
-        ("platform_cash", "dr", D("152500.00")),
-        ("vendor_payable", "cr", D("130000.00")),
-        ("platform_revenue", "cr", D("22500.00")),
-    }
-
-
-def test_balance_captured_rejects_commission_above_total() -> None:
-    with pytest.raises(ValueError):
-        balance_captured_postings(D("100.00"), D("0"), D("100.01"))
-
-
-def test_balance_refund_lines() -> None:
-    assert _lines(balance_refund_postings(D("150000.00"), D("7500.00"), D("22500.00"))) == {
+def test_rental_refund_lines() -> None:
+    assert _lines(rental_refund_postings(D("150000.00"), D("7500.00"), D("22500.00"))) == {
         ("vendor_payable", "dr", D("135000.00")),
         ("platform_revenue", "dr", D("22500.00")),
         ("platform_cash", "cr", D("157500.00")),
     }
 
 
-def test_balance_refund_reverses_balance_captured() -> None:
-    args = (D("150000.00"), D("7500.00"), D("22500.00"))
-    captured = {(p.account, p.amount) for p in balance_captured_postings(*args)}
-    refunded = {(p.account, p.amount) for p in balance_refund_postings(*args)}
-    assert captured == refunded
-    for c, r in zip(
-        sorted(balance_captured_postings(*args), key=lambda p: p.account.value),
-        sorted(balance_refund_postings(*args), key=lambda p: p.account.value),
-        strict=True,
-    ):
-        assert c.direction != r.direction
+def test_existing_recipes_reverse_the_whole_payment() -> None:
+    """R15: deposit release + contribution refund + rental refund undo the capture."""
+    d, c, r, f, k = D("150000.00"), D("7500.00"), D("150000.00"), D("7500.00"), D("22500.00")
+    postings = [
+        *payment_captured_postings(d, c, r, f, k),
+        *deposit_release_postings(d),
+        *refund_contribution_postings(c),
+        *rental_refund_postings(r, f, k),
+    ]
+    net: dict[str, Decimal] = {}
+    for p in postings:
+        sign = 1 if p.direction == Direction.cr else -1
+        net[p.account.value] = net.get(p.account.value, D(0)) + sign * p.amount
+    assert set(net.values()) == {D(0)}
+    assert set(net) == {
+        "platform_cash",
+        "renter_deposit_liability",
+        "protection_pool",
+        "vendor_payable",
+        "platform_revenue",
+    }
 
 
-def test_balance_refund_omits_zero_commission() -> None:
-    assert _lines(balance_refund_postings(D("100.00"), D("0"), D("0"))) == {
+def test_rental_refund_omits_zero_commission() -> None:
+    assert _lines(rental_refund_postings(D("100.00"), D("0"), D("0"))) == {
         ("vendor_payable", "dr", D("100.00")),
         ("platform_cash", "cr", D("100.00")),
     }
 
 
-def test_balance_refund_rejects_commission_above_total() -> None:
+def test_rental_refund_rejects_commission_above_total() -> None:
     with pytest.raises(ValueError):
-        balance_refund_postings(D("100.00"), D("0"), D("100.01"))
+        rental_refund_postings(D("100.00"), D("0"), D("100.01"))
 
 
 def test_release_forfeit_refund_payout_lines() -> None:
@@ -172,9 +151,7 @@ def test_deduct_splits_and_caps() -> None:
 @pytest.mark.parametrize(
     ("recipe", "args"),
     [
-        (deposit_captured_postings, ("0", "0")),
-        (balance_captured_postings, ("0", "0", "0")),
-        (balance_refund_postings, ("0", "0", "0")),
+        (rental_refund_postings, ("0", "0", "0")),
         (deposit_release_postings, ("0",)),
         (deposit_deduct_postings, ("0", "10.00")),
         (deposit_forfeit_postings, ("0",)),
@@ -189,12 +166,8 @@ def test_zero_total_returns_empty(recipe, args) -> None:
 @pytest.mark.parametrize(
     ("recipe", "args"),
     [
-        (deposit_captured_postings, ("-0.01", "0")),
-        (deposit_captured_postings, ("1.00", "-1.00")),
-        (balance_captured_postings, ("1.00", "-0.01", "0")),
-        (balance_captured_postings, ("1.00", "0", "-0.01")),
-        (balance_refund_postings, ("-0.01", "0", "0")),
-        (balance_refund_postings, ("1.00", "0", "-0.01")),
+        (rental_refund_postings, ("-0.01", "0", "0")),
+        (rental_refund_postings, ("1.00", "0", "-0.01")),
         (deposit_release_postings, ("-1",)),
         (deposit_deduct_postings, ("10.00", "-1.00")),
         (deposit_forfeit_postings, ("-1",)),
@@ -223,3 +196,119 @@ def test_recipes_reject_non_decimal() -> None:
 )
 def test_commission_amount_rounds_half_up(rental, rate, expected) -> None:
     assert commission_amount(D(rental), D(rate)) == D(expected)
+
+
+# ---------------------------------------------------------------------------
+# A14 full payment upfront; A13/R15 renter cancellation fee
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("0.01", "0", "0", "0", "0"),
+        ("0", "0", "0.01", "0", "0"),
+        ("150000.00", "7500.00", "150000.00", "7500.00", "22500.00"),
+        ("150000.00", "0", "100.00", "0", "100.00"),
+        ("9999999999.95", "0.01", "0.01", "0.01", "0.01"),
+    ],
+)
+def test_payment_captured_balances(args) -> None:
+    postings = payment_captured_postings(*(D(a) for a in args))
+
+    dr, cr = _sums(postings)
+    assert len(postings) >= 2
+    assert dr == cr
+    assert all(p.amount > 0 for p in postings)
+
+
+def test_payment_captured_lines() -> None:
+    postings = payment_captured_postings(
+        D("150000.00"), D("7500.00"), D("150000.00"), D("7500.00"), D("22500.00")
+    )
+    assert _lines(postings) == {
+        ("platform_cash", "dr", D("315000.00")),
+        ("renter_deposit_liability", "cr", D("150000.00")),
+        ("protection_pool", "cr", D("7500.00")),
+        ("vendor_payable", "cr", D("135000.00")),
+        ("platform_revenue", "cr", D("22500.00")),
+    }
+
+
+def test_payment_captured_omits_zero_lines() -> None:
+    postings = payment_captured_postings(D("150000.00"), D("0"), D("100.00"), D("0"), D("0"))
+    assert _lines(postings) == {
+        ("platform_cash", "dr", D("150100.00")),
+        ("renter_deposit_liability", "cr", D("150000.00")),
+        ("vendor_payable", "cr", D("100.00")),
+    }
+    assert payment_captured_postings(D("0"), D("0"), D("0"), D("0"), D("0")) == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("-0.01", "0", "0", "0", "0"),
+        ("0", "-0.01", "0", "0", "0"),
+        ("0", "0", "-0.01", "0", "0"),
+        ("0", "0", "0", "-0.01", "0"),
+        ("0", "0", "1.00", "0", "-0.01"),
+        ("0", "0", "100.00", "0", "100.01"),  # K above R + F
+    ],
+)
+def test_payment_captured_rejects_bad_amounts(args) -> None:
+    with pytest.raises(ValueError):
+        payment_captured_postings(*(D(a) for a in args))
+
+
+@pytest.mark.parametrize(
+    ("rental", "rate", "expected"),
+    [
+        ("45000.00", "0.10", "4500.00"),
+        ("0.05", "0.10", "0.01"),  # 0.005 rounds half up
+        ("0.04", "0.10", "0.00"),
+        ("45000.00", "0", "0.00"),
+    ],
+)
+def test_cancellation_fee_amount_rounds_half_up(rental, rate, expected) -> None:
+    assert cancellation_fee_amount(D(rental), D(rate)) == D(expected)
+
+
+@pytest.mark.parametrize(
+    ("fee", "share", "vendor", "platform"),
+    [
+        ("4500.00", "0.50", "2250.00", "2250.00"),
+        ("0.05", "0.50", "0.03", "0.02"),  # 0.025 rounds half up; Vouch gets the rest
+        ("0.01", "0.50", "0.01", "0.00"),
+        ("100.00", "0", "0.00", "100.00"),
+        ("333.33", "0.333", "111.00", "222.33"),
+        ("0.00", "0.50", "0.00", "0.00"),
+    ],
+)
+def test_fee_split_rounds_to_sum(fee, share, vendor, platform) -> None:
+    vendor_part, platform_part = cancellation_fee_split(D(fee), D(share))
+
+    assert (vendor_part, platform_part) == (D(vendor), D(platform))
+    assert vendor_part + platform_part == D(fee)
+
+
+def test_fee_split_rejects_bad_input() -> None:
+    with pytest.raises(ValueError):
+        cancellation_fee_split(D("-0.01"), D("0.5"))
+    with pytest.raises(TypeError):
+        cancellation_fee_split(1.0, D("0.5"))  # type: ignore[arg-type]
+
+
+def test_cancellation_fee_lines() -> None:
+    assert _lines(cancellation_fee_postings(D("2250.00"), D("2250.00"))) == {
+        ("platform_cash", "dr", D("4500.00")),
+        ("vendor_payable", "cr", D("2250.00")),
+        ("platform_revenue", "cr", D("2250.00")),
+    }
+    assert _lines(cancellation_fee_postings(D("0.01"), D("0"))) == {
+        ("platform_cash", "dr", D("0.01")),
+        ("vendor_payable", "cr", D("0.01")),
+    }
+    assert cancellation_fee_postings(D("0"), D("0")) == []
+    with pytest.raises(ValueError):
+        cancellation_fee_postings(D("-1"), D("2"))

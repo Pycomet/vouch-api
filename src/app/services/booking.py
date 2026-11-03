@@ -13,7 +13,7 @@ Two entry points:
   (``SELECT ... FOR UPDATE``), looks up ``(status, event)`` in ``_TRANSITIONS``,
   checks the actor, runs the handler, writes one audit row and flushes.
 
-A handler may also record an intermediate step itself: ``deposit_captured``
+A handler may also record an intermediate step itself: ``payment_captured``
 writes the ``booking.deposit_paid`` audit row inside its handler and returns
 ``_Outcome.before`` so the engine's ``booking.confirmed`` row starts from
 ``deposit_paid``. Money transitions post their ledger groups with the recipes in
@@ -47,13 +47,9 @@ from app.core.clock import Clock, business_date, start_of_business_day
 from app.core.config import Settings
 from app.db.models import (
     Asset,
-    AuditEvent,
     AvailabilityWindow,
     Booking,
-    Direction,
     HandoverRecord,
-    LedgerAccount,
-    LedgerEntry,
     Payment,
     User,
 )
@@ -73,14 +69,16 @@ from app.services.audit import Actor, record_audit
 from app.services.inventory import get_public_asset
 from app.services.ledger import CENT, MAX_AMOUNT, Posting, post_txn
 from app.services.money import (
-    balance_captured_postings,
-    balance_refund_postings,
+    cancellation_fee_amount,
+    cancellation_fee_postings,
+    cancellation_fee_split,
     commission_amount,
-    deposit_captured_postings,
     deposit_deduct_postings,
     deposit_forfeit_postings,
     deposit_release_postings,
+    payment_captured_postings,
     refund_contribution_postings,
+    rental_refund_postings,
 )
 from app.services.notify import Notifier
 from app.services.pricing import money, price_snapshot
@@ -90,7 +88,6 @@ HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
 CLAIM_WINDOW = timedelta(hours=24)
 LOST_AFTER = timedelta(days=7)
-AT_RISK_AFTER = timedelta(hours=48)
 ZERO = Decimal("0.00")
 
 AUDIT_ENTITY = "booking"
@@ -101,6 +98,8 @@ _EXCLUSION_VIOLATION = "23P01"
 _DEADLOCK_DETECTED = "40P01"
 _CHECK_VIOLATION = "23514"
 _NOT_SELF_CONSTRAINT = "ck_bookings_not_self"
+# An amount too large for its Numeric column (the date limits normally stop this).
+_NUMERIC_VALUE_OUT_OF_RANGE = "22003"
 
 # Columns never reported in an audit diff (maintained by the database).
 _UNAUDITED_COLUMNS = frozenset({"created_at", "updated_at"})
@@ -111,17 +110,17 @@ class BookingEvent(StrEnum):
     decline = "decline"
     approve_vendor = "approve_vendor"
     expire_hold = "expire_hold"
-    deposit_captured = "deposit_captured"
+    payment_captured = "payment_captured"
     expire_deposit = "expire_deposit"
     cancel = "cancel"
     handover_completed = "handover_completed"
-    balance_captured = "balance_captured"
     return_completed = "return_completed"
     claim_raised = "claim_raised"
     complete = "complete"
     resolve = "resolve"
     flag_at_risk = "flag_at_risk"
     mark_lost = "mark_lost"
+    report_no_show = "report_no_show"
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +150,8 @@ class _Context:
     clock: Clock
     notifier: Notifier
     settings: Settings
+    # The caller's request id (R16), written on every audit row of this transition.
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -238,8 +239,12 @@ async def transition(
     clock: Clock,
     notifier: Notifier,
     settings: Settings,
+    request_id: str | None = None,
 ) -> Booking:
     """Apply ``event`` to the booking as ``actor``; flush, never commit.
+
+    ``request_id`` (the HTTP request's id, R16) is stored on every audit row the
+    transition writes, the handlers' own rows included.
 
     Raises :class:`ResourceNotFoundError` for an unknown booking,
     :class:`InvalidTransition` when the table has no such row or the actor may not
@@ -271,6 +276,7 @@ async def transition(
         clock=clock,
         notifier=notifier,
         settings=settings,
+        request_id=request_id,
     )
     outcome = await rule.handler(context)
 
@@ -295,6 +301,7 @@ async def transition(
         before=before,
         after=after,
         reason=outcome.reason,
+        request_id=request_id,
     )
     for notice in outcome.notices:
         await notifier.send(notice.user_id, notice.template, notice.data)
@@ -370,9 +377,19 @@ async def _decline(ctx: _Context) -> _Outcome:
 
 @_register(BookingStatus.requested, BookingEvent.approve_vendor, ActorRole.vendor)
 async def _approve_vendor(ctx: _Context) -> _Outcome:
+    """The vendor approves the renter of a tier-3 item (A3), while the hold lasts (R18)."""
     booking = ctx.booking
     if booking.vendor_approved_at is not None:
         raise InvalidTransition(booking.status.value, ctx.event.value)
+    if not ctx.now < booking.hold_expires_at:
+        raise BookingGuardFailed(
+            "hold_expired", {"hold_expires_at": _plain(booking.hold_expires_at)}
+        )
+    minimum = await ctx.session.scalar(
+        select(Asset.minimum_trust_tier).where(Asset.id == booking.asset_id)
+    )
+    if minimum != TrustTier.vendor_approved:
+        raise BookingGuardFailed("approval_not_required", {"minimum_trust_tier": minimum})
     booking.vendor_approved_at = ctx.now
     return _Outcome(action="booking.vendor_approved")
 
@@ -420,25 +437,35 @@ def _payload_amount(payload: Mapping[str, Any]) -> Decimal | None:
     return amount if amount == amount.quantize(CENT) else None
 
 
-async def _deposit_payment_id(ctx: _Context) -> uuid.UUID:
-    """The payload's ``payment_id``, which must be this booking's deposit payment."""
+async def _booking_payment_id(ctx: _Context, amount: Decimal) -> uuid.UUID:
+    """The payload's ``payment_id``: this booking's captured upfront payment (A14).
+
+    The payment row must also be for ``amount`` (the payload's, already checked
+    against D + C + R + F); otherwise ``amount_mismatch``.
+    """
     raw = ctx.payload.get("payment_id")
     try:
         payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
     except ValueError:
         payment_id = None
-    found = payment_id is not None and await ctx.session.scalar(
-        select(
-            exists().where(
+    captured = None
+    if payment_id is not None:
+        captured = await ctx.session.scalar(
+            select(Payment.amount).where(
                 Payment.id == payment_id,
                 Payment.booking_id == ctx.booking.id,
-                Payment.type == PaymentType.deposit,
+                Payment.type == PaymentType.booking,
+                Payment.status == PaymentStatus.captured,
             )
         )
-    )
-    if not found:
+    if captured is None:
         raise InvalidRequestError(
-            "The payment is not this booking's deposit.", {"payment_id": _plain(raw)}
+            "The payment is not this booking's captured payment.", {"payment_id": _plain(raw)}
+        )
+    if captured != amount:
+        raise BookingGuardFailed(
+            "amount_mismatch",
+            {"expected": str(amount), "amount": str(amount), "payment_amount": str(captured)},
         )
     return payment_id
 
@@ -472,20 +499,51 @@ def _both(booking: Booking, template: str, **extra: Any) -> tuple[Notice, ...]:
     )
 
 
-@_register(BookingStatus.accepted, BookingEvent.deposit_captured, ActorRole.system)
-async def _deposit_captured(ctx: _Context) -> _Outcome:
-    """accepted -> deposit_paid -> confirmed in one call, with two audit rows."""
+@dataclass(frozen=True)
+class _Money:
+    """The booking's frozen amounts: D, C, R, F and the commission K on R."""
+
+    deposit: Decimal
+    contribution: Decimal
+    rental: Decimal
+    delivery_fee: Decimal
+    commission: Decimal
+
+    @property
+    def total(self) -> Decimal:
+        """Everything the renter pays upfront (A14): D + C + R + F."""
+        return self.deposit + self.contribution + self.rental + self.delivery_fee
+
+
+def _money(booking: Booking) -> _Money:
+    rental = _snapshot_amount(booking, "rental_total")
+    return _Money(
+        deposit=_snapshot_amount(booking, "deposit"),
+        contribution=_snapshot_amount(booking, "damage_contribution"),
+        rental=rental,
+        delivery_fee=_snapshot_amount(booking, "delivery_fee"),
+        commission=_snapshot_commission(booking, rental),
+    )
+
+
+@_register(BookingStatus.accepted, BookingEvent.payment_captured, ActorRole.system)
+async def _payment_captured(ctx: _Context) -> _Outcome:
+    """The one upfront payment (A14): accepted -> deposit_paid -> confirmed.
+
+    The amount must be D + C + R + F exactly; one ledger group splits it between
+    the deposit hold, the protection pool, the vendor's share and the commission.
+    Two audit rows: ``booking.deposit_paid`` here and ``booking.confirmed``.
+    """
     booking = ctx.booking
-    deposit = _snapshot_amount(booking, "deposit")
-    contribution = _snapshot_amount(booking, "damage_contribution")
-    expected = deposit + contribution
+    amounts = _money(booking)
+    expected = amounts.total
     amount = _payload_amount(ctx.payload)
     if amount is None or amount != expected:
         raise BookingGuardFailed(
             "amount_mismatch",
             {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
         )
-    payment_id = await _deposit_payment_id(ctx)
+    payment_id = await _booking_payment_id(ctx, amount)
 
     booking.status = BookingStatus.deposit_paid
     await record_audit(
@@ -499,10 +557,21 @@ async def _deposit_captured(ctx: _Context) -> _Outcome:
             "status": BookingStatus.deposit_paid,
             "amount": money(amount),
             "payment_id": payment_id,
+            "commission": amounts.commission,
         },
+        request_id=ctx.request_id,
     )
     await _post(
-        ctx, deposit_captured_postings(deposit, contribution), "deposit_captured", payment_id
+        ctx,
+        payment_captured_postings(
+            amounts.deposit,
+            amounts.contribution,
+            amounts.rental,
+            amounts.delivery_fee,
+            amounts.commission,
+        ),
+        "payment_captured",
+        payment_id,
     )
 
     booking.status = BookingStatus.confirmed
@@ -536,47 +605,18 @@ async def _expire_deposit(ctx: _Context) -> _Outcome:
     return _Outcome(notices=_both(booking, "booking.expired"))
 
 
-@_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
-async def _cancel(ctx: _Context) -> _Outcome:
-    """Renter before the start day, or vendor before the pickup; both refund in full (A8).
+async def _close_cancelled(
+    ctx: _Context,
+    status: BookingStatus,
+    reason: str | None,
+    *,
+    penalty_reason: str | None = None,
+) -> None:
+    """Set the cancelled columns; a vendor cancel also writes the penalty audit row.
 
-    Nobody cancels once both parties have signed the pickup handover: the item has
-    changed hands, so the rental is under way whatever the booking status says.
+    The penalty row's reason is ``penalty_reason`` when given, else ``reason``.
     """
     booking = ctx.booking
-    if await _handover_done(ctx, HandoverDirection.pickup):
-        raise BookingGuardFailed("handover_signed")
-    reason = _reason(ctx.payload)
-    if ctx.actor.role == ActorRole.renter:
-        cutoff = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
-        if not ctx.now < cutoff:
-            raise BookingGuardFailed("cancel_window_closed", {"cancel_before": _plain(cutoff)})
-        status = BookingStatus.cancelled_by_renter
-    else:
-        if reason is None:
-            raise BookingGuardFailed("reason_required")
-        status = BookingStatus.cancelled_by_vendor
-
-    # By `confirmed` the renter has paid the deposit and the damage contribution,
-    # and may already have paid the rental balance (balance first, handover later).
-    # Everything paid goes back, each part in its own txn_group.
-    deposit = _snapshot_amount(booking, "deposit")
-    contribution = _snapshot_amount(booking, "damage_contribution")
-    refund: dict[str, Any] = {"deposit": deposit, "damage_contribution": contribution}
-    balance_paid = await _balance_posted(ctx)
-    await _post(ctx, deposit_release_postings(deposit), "cancel_deposit_refund")
-    await _post(ctx, refund_contribution_postings(contribution), "cancel_contribution_refund")
-    if balance_paid:
-        rental = _snapshot_amount(booking, "rental_total")
-        delivery_fee = _snapshot_amount(booking, "delivery_fee")
-        commission = _snapshot_commission(booking, rental)
-        await _post(
-            ctx,
-            balance_refund_postings(rental, delivery_fee, commission),
-            "cancel_balance_refund",
-        )
-        refund.update(rental=rental, delivery_fee=delivery_fee, commission=commission)
-
     booking.status = status
     booking.cancelled_at = ctx.now
     booking.cancellation_reason = reason
@@ -589,17 +629,114 @@ async def _cancel(ctx: _Context) -> _Outcome:
             action="vendor.reliability_penalty",
             before=None,
             after={"booking_id": booking.id, "status": status},
-            reason=reason,
+            reason=penalty_reason or reason,
+            request_id=ctx.request_id,
         )
-    return _Outcome(
-        after={"refund": refund},
-        reason=reason,
-        notices=_both(booking, "booking.cancelled"),
+
+
+def _vendor_reason(ctx: _Context) -> str:
+    """A vendor cancellation always needs a reason (it carries a reliability penalty)."""
+    reason = _reason(ctx.payload)
+    if reason is None:
+        raise BookingGuardFailed("reason_required")
+    return reason
+
+
+@_register(BookingStatus.requested, BookingEvent.cancel, ActorRole.renter)
+@_register(BookingStatus.accepted, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
+async def _cancel_unpaid(ctx: _Context) -> _Outcome:
+    """Before payment nothing has moved, so nothing is refunded (A13, R14).
+
+    The renter withdraws for free (the vendor is told ``booking.withdrawn``). A
+    vendor may cancel an accepted booking with a reason, at the cost of the
+    reliability penalty (for a request, the vendor has ``decline``).
+    """
+    booking = ctx.booking
+    if ctx.actor.role == ActorRole.renter:
+        reason = _reason(ctx.payload)
+        await _close_cancelled(ctx, BookingStatus.cancelled_by_renter, reason)
+        notices: tuple[Notice, ...] = (_notice(booking, booking.vendor_id, "booking.withdrawn"),)
+    else:
+        reason = _vendor_reason(ctx)
+        await _close_cancelled(ctx, BookingStatus.cancelled_by_vendor, reason)
+        notices = _both(booking, "booking.cancelled")
+    return _Outcome(reason=reason, notices=notices)
+
+
+async def _reverse_capture(ctx: _Context, amounts: _Money) -> dict[str, Any]:
+    """Reverse the whole upfront payment, so every booking account returns to 0.
+
+    Each part goes back in its own txn_group (deposit, contribution, rental with
+    the delivery fee and commission). Returns the refund breakdown for the audit row.
+    """
+    await _post(ctx, deposit_release_postings(amounts.deposit), "cancel_deposit_refund")
+    await _post(
+        ctx, refund_contribution_postings(amounts.contribution), "cancel_contribution_refund"
     )
+    await _post(
+        ctx,
+        rental_refund_postings(amounts.rental, amounts.delivery_fee, amounts.commission),
+        "cancel_rental_refund",
+    )
+    return {
+        "deposit": amounts.deposit,
+        "damage_contribution": amounts.contribution,
+        "rental": amounts.rental,
+        "delivery_fee": amounts.delivery_fee,
+        "commission": amounts.commission,
+    }
+
+
+@_register(BookingStatus.confirmed, BookingEvent.cancel, ActorRole.renter, ActorRole.vendor)
+async def _cancel_paid(ctx: _Context) -> _Outcome:
+    """Cancel a paid booking: everything goes back, less the renter's fee (A13, R15).
+
+    The renter may cancel until 00:00 (business zone) on ``starts_on`` and pays the
+    cancellation fee; the vendor may cancel any time before the pickup, with a
+    reason, a full refund to the renter and the reliability penalty. Nobody
+    cancels once both parties have signed the pickup handover: the item has changed
+    hands, so the rental is under way whatever the booking status says.
+
+    Postings: the capture is reversed in full with the existing recipes (each part
+    in its own txn_group, so every booking account returns to 0); then, for a
+    renter, one fee group keeps ``rental x cancellation_fee_rate`` as cash, split
+    between the vendor and Vouch at the rates frozen in ``price_snapshot``.
+    """
+    booking = ctx.booking
+    if await _handover_done(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("handover_signed")
+    if ctx.actor.role == ActorRole.renter:
+        cutoff = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
+        if not ctx.now < cutoff:
+            raise BookingGuardFailed("cancel_window_closed", {"cancel_before": _plain(cutoff)})
+        reason = _reason(ctx.payload)
+        status = BookingStatus.cancelled_by_renter
+    else:
+        reason = _vendor_reason(ctx)
+        status = BookingStatus.cancelled_by_vendor
+
+    amounts = _money(booking)
+    after: dict[str, Any] = {"refund": await _reverse_capture(ctx, amounts)}
+    if status == BookingStatus.cancelled_by_renter:
+        fee = cancellation_fee_amount(
+            amounts.rental, Decimal(booking.price_snapshot["cancellation_fee_rate"])
+        )
+        vendor_part, platform_part = cancellation_fee_split(
+            fee, Decimal(booking.price_snapshot["cancellation_fee_vendor_share"])
+        )
+        await _post(ctx, cancellation_fee_postings(vendor_part, platform_part), "cancellation_fee")
+        after["cancellation_fee"] = {
+            "amount": fee,
+            "vendor_part": vendor_part,
+            "platform_part": platform_part,
+        }
+
+    await _close_cancelled(ctx, status, reason)
+    return _Outcome(after=after, reason=reason, notices=_both(booking, "booking.cancelled"))
 
 
 # ---------------------------------------------------------------------------
-# Handlers: handover, balance and return (confirmed, in_progress)
+# Handlers: handover and return (confirmed, in_progress)
 # ---------------------------------------------------------------------------
 
 
@@ -618,73 +755,6 @@ async def _handover_done(ctx: _Context, direction: HandoverDirection) -> bool:
     )
 
 
-async def _balance_posted(ctx: _Context) -> bool:
-    """Whether ``balance_captured`` has already run for this booking.
-
-    Its ledger group is the only one that credits ``vendor_payable`` or
-    ``platform_revenue`` before the booking leaves ``confirmed``.
-    """
-    return bool(
-        await ctx.session.scalar(
-            select(
-                exists().where(
-                    LedgerEntry.booking_id == ctx.booking.id,
-                    LedgerEntry.direction == Direction.cr.value,
-                    LedgerEntry.account.in_(
-                        (LedgerAccount.vendor_payable.value, LedgerAccount.platform_revenue.value)
-                    ),
-                )
-            )
-        )
-    )
-
-
-async def _handover_signal_recorded(ctx: _Context) -> bool:
-    """Whether an earlier ``handover_completed`` left a ``booking.handover_signed`` row."""
-    return bool(
-        await ctx.session.scalar(
-            select(
-                exists().where(
-                    AuditEvent.entity == AUDIT_ENTITY,
-                    AuditEvent.entity_id == ctx.booking.id,
-                    AuditEvent.action == "booking.handover_signed",
-                )
-            )
-        )
-    )
-
-
-async def _balance_payment_id(ctx: _Context) -> uuid.UUID:
-    """The payload's ``payment_id``: this booking's captured rental-balance payment."""
-    raw = ctx.payload.get("payment_id")
-    try:
-        payment_id = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
-    except ValueError:
-        payment_id = None
-    found = payment_id is not None and await ctx.session.scalar(
-        select(
-            exists().where(
-                Payment.id == payment_id,
-                Payment.booking_id == ctx.booking.id,
-                Payment.type == PaymentType.rental_balance,
-                Payment.status == PaymentStatus.captured,
-            )
-        )
-    )
-    if not found:
-        raise InvalidRequestError(
-            "The payment is not this booking's captured rental balance.",
-            {"payment_id": _plain(raw)},
-        )
-    return payment_id
-
-
-def _start_rental(booking: Booking, outcome_after: Mapping[str, Any]) -> _Outcome:
-    """Both in_progress facts hold: confirmed -> in_progress."""
-    booking.status = BookingStatus.in_progress
-    return _Outcome(after=outcome_after, notices=_both(booking, "booking.in_progress"))
-
-
 @_register(
     BookingStatus.confirmed,
     BookingEvent.handover_completed,
@@ -693,47 +763,15 @@ def _start_rental(booking: Booking, outcome_after: Mapping[str, Any]) -> _Outcom
     ActorRole.system,
 )
 async def _handover_completed(ctx: _Context) -> _Outcome:
-    """Record the signed pickup; start the rental if the balance is already captured."""
-    if await _handover_signal_recorded(ctx):
-        raise InvalidTransition(ctx.booking.status.value, ctx.event.value)
+    """Both pickup signatures: the rental starts (everything was paid upfront, A14)."""
     if not await _handover_done(ctx, HandoverDirection.pickup):
         raise BookingGuardFailed("handover_incomplete", {"direction": "pickup"})
-
-    after = {"handover": HandoverDirection.pickup.value}
-    if await _balance_posted(ctx):
-        return _start_rental(ctx.booking, after)
-    return _Outcome(action="booking.handover_signed", after=after)
-
-
-@_register(BookingStatus.confirmed, BookingEvent.balance_captured, ActorRole.system)
-async def _balance_captured(ctx: _Context) -> _Outcome:
-    """Post R + F (vendor share and commission K); start the rental if handed over."""
     booking = ctx.booking
-    if await _balance_posted(ctx):
-        raise InvalidTransition(booking.status.value, ctx.event.value)
-    rental = _snapshot_amount(booking, "rental_total")
-    delivery_fee = _snapshot_amount(booking, "delivery_fee")
-    expected = rental + delivery_fee
-    amount = _payload_amount(ctx.payload)
-    if amount is None or amount != expected:
-        raise BookingGuardFailed(
-            "amount_mismatch",
-            {"expected": str(expected), "amount": _plain(ctx.payload.get("amount"))},
-        )
-    payment_id = await _balance_payment_id(ctx)
-
-    commission = _snapshot_commission(booking, rental)
-    await _post(
-        ctx,
-        balance_captured_postings(rental, delivery_fee, commission),
-        "balance_captured",
-        payment_id,
+    booking.status = BookingStatus.in_progress
+    return _Outcome(
+        after={"handover": HandoverDirection.pickup.value},
+        notices=_both(booking, "booking.in_progress"),
     )
-
-    after = {"amount": money(amount), "payment_id": payment_id, "commission": commission}
-    if await _handover_done(ctx, HandoverDirection.pickup):
-        return _start_rental(booking, after)
-    return _Outcome(action="booking.balance_captured", after=after)
 
 
 @_register(
@@ -754,6 +792,61 @@ async def _return_completed(ctx: _Context) -> _Outcome:
         notices=_both(
             booking, "booking.returned", claim_window_ends_at=booking.claim_window_ends_at
         )
+    )
+
+
+NO_SHOW_REASON = "vendor_no_show"
+
+
+async def _vendor_signed(ctx: _Context, direction: HandoverDirection) -> bool:
+    """Whether the vendor has signed its side of this booking's ``direction`` record."""
+    return bool(
+        await ctx.session.scalar(
+            select(
+                exists().where(
+                    HandoverRecord.booking_id == ctx.booking.id,
+                    HandoverRecord.direction == direction,
+                    HandoverRecord.vendor_signed_at.is_not(None),
+                )
+            )
+        )
+    )
+
+
+@_register(BookingStatus.confirmed, BookingEvent.report_no_show, ActorRole.renter)
+async def _report_no_show(ctx: _Context) -> _Outcome:
+    """The renter reports that the vendor did not hand the item over (A17).
+
+    From 00:00 (business zone) on ``starts_on``, and only while the vendor has not
+    signed the pickup handover (a completed pickup is ``handover_signed``; the
+    vendor's side alone is ``vendor_signed_handover``, so a renter cannot refuse to
+    sign a real pickup and then claim a no-show). The booking closes as
+    ``cancelled_by_vendor`` with a full refund and no fee, the same postings as a
+    vendor cancellation of a paid booking, and the vendor's reliability penalty.
+    """
+    booking = ctx.booking
+    opens = start_of_business_day(booking.starts_on, ctx.settings.business_zone)
+    if not ctx.now >= opens:
+        raise BookingGuardFailed("no_show_too_early", {"report_from": _plain(opens)})
+    if await _handover_done(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("handover_signed")
+    if await _vendor_signed(ctx, HandoverDirection.pickup):
+        raise BookingGuardFailed("vendor_signed_handover")
+
+    note = _reason(ctx.payload)
+    reason = NO_SHOW_REASON if note is None else f"{NO_SHOW_REASON}: {note}"
+    after = {"refund": await _reverse_capture(ctx, _money(booking))}
+    await _close_cancelled(
+        ctx, BookingStatus.cancelled_by_vendor, reason, penalty_reason=NO_SHOW_REASON
+    )
+    return _Outcome(
+        after=after,
+        reason=reason,
+        notices=(
+            _notice(booking, booking.renter_id, "booking.no_show_refunded"),
+            _notice(booking, booking.vendor_id, "booking.no_show_reported"),
+            _ops(booking, "vendor_no_show", vendor_id=booking.vendor_id),
+        ),
     )
 
 
@@ -822,6 +915,7 @@ async def _deposit_audit(ctx: _Context, action: str, **after: Any) -> None:
         before=None,
         after=after,
         reason=_reason(ctx.payload),
+        request_id=ctx.request_id,
     )
 
 
@@ -915,6 +1009,7 @@ async def _restrict_renter(ctx: _Context, reason: str, *, override: bool) -> Non
             "booking_id": ctx.booking.id,
         },
         reason=_reason(ctx.payload),
+        request_id=ctx.request_id,
     )
 
 
@@ -926,23 +1021,24 @@ def _ops(booking: Booking, event: str, **extra: Any) -> Notice:
 
 
 def at_risk_last_end_date(now: datetime, settings: Settings) -> date:
-    """The latest ``ends_on`` that is at risk at ``now``.
+    """The latest ``ends_on`` that is at risk at ``now`` (A15).
 
-    At risk iff ``now >= start_of_business_day(ends_on + 1 day) + 48h``, that is
-    ``start_of_business_day(ends_on + 1 day) <= now - 48h``. Local midnight of a
+    A rental is at risk once its last day has ended without a signed return:
+    iff ``now >= start_of_business_day(ends_on + 1 day)``. Local midnight of a
     date is at or before an instant exactly when the date is at or before that
     instant's business date, so the condition is
-    ``ends_on + 1 day <= business_date(now - 48h)``. The timer's at-risk sweep and
+    ``ends_on + 1 day <= business_date(now)``. The timer's at-risk sweep and
     :func:`_flag_at_risk` both use it.
     """
-    return business_date(now - AT_RISK_AFTER, settings.business_zone) - timedelta(days=1)
+    return business_date(now, settings.business_zone) - timedelta(days=1)
 
 
 @_register(BookingStatus.in_progress, BookingEvent.flag_at_risk, ActorRole.system)
 async def _flag_at_risk(ctx: _Context) -> _Outcome:
-    """No contact past the return: flag the booking (not a state), freeze the renter.
+    """Not returned by the end of the last day: flag the booking (not a state).
 
-    Only from 48 hours after the end of the return day (:func:`at_risk_last_end_date`).
+    The renter is frozen too. Only from 00:00 (business zone) after ``ends_on``
+    (:func:`at_risk_last_end_date`, A15); "no contact" is read as "not returned".
     """
     booking = ctx.booking
     if booking.at_risk_at is not None or booking.ends_on > at_risk_last_end_date(
@@ -986,6 +1082,7 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
             before={"listing_status": previous},
             after={"listing_status": ListingStatus.paused, "booking_id": booking.id},
             reason=reason,
+            request_id=ctx.request_id,
         )
 
     booking.status = BookingStatus.lost
@@ -1001,10 +1098,15 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
 # ---------------------------------------------------------------------------
 
 
+def _sqlstate(exc: DBAPIError) -> str | None:
+    orig = exc.orig
+    return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+
+
 def _insert_conflict(exc: DBAPIError) -> str | None:
     """The guard code for a booking insert failure, or None to re-raise it."""
     orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    sqlstate = _sqlstate(exc)
     if sqlstate in (_EXCLUSION_VIOLATION, _DEADLOCK_DETECTED):
         return "dates_unavailable"
     if sqlstate == _CHECK_VIOLATION:
@@ -1053,8 +1155,12 @@ async def request_booking(
     clock: Clock,
     notifier: Notifier,
     settings: Settings,
+    request_id: str | None = None,
 ) -> Booking:
-    """Create a ``requested`` booking holding the unit for four hours."""
+    """Create a ``requested`` booking holding the unit for four hours.
+
+    ``request_id`` (the HTTP request's id, R16) is stored on the audit row.
+    """
     if renter.role != ActorRole.renter:
         raise InvalidTransition(None, REQUEST_EVENT)
 
@@ -1063,10 +1169,21 @@ async def request_booking(
     ).asset
 
     now = clock.now()
+    today = business_date(now, settings.business_zone)
     if starts_on > ends_on:
         raise InvalidRequestError("The start date must not be after the end date.")
-    if starts_on < business_date(now, settings.business_zone):
+    if starts_on < today:
         raise InvalidRequestError("The start date must not be in the past.")
+    if (ends_on - starts_on).days + 1 > settings.max_rental_days:
+        raise InvalidRequestError(
+            "The rental is longer than the maximum allowed.",
+            {"max_rental_days": settings.max_rental_days},
+        )
+    if (starts_on - today).days > settings.booking_horizon_days:
+        raise InvalidRequestError(
+            "The start date is too far ahead.",
+            {"booking_horizon_days": settings.booking_horizon_days},
+        )
     if fulfilment not in ("pickup", "delivery") or not (asset.fulfilment or {}).get(fulfilment):
         raise InvalidRequestError(
             "This item does not offer that fulfilment.", {"fulfilment": fulfilment}
@@ -1107,6 +1224,8 @@ async def request_booking(
             session.add(booking)
             await session.flush()
     except DBAPIError as exc:
+        if _sqlstate(exc) == _NUMERIC_VALUE_OUT_OF_RANGE:
+            raise InvalidRequestError("An amount for this booking is out of range.") from exc
         code = _insert_conflict(exc)
         if code is None:
             raise
@@ -1130,6 +1249,7 @@ async def request_booking(
             "deposit_amount": booking.deposit_amount,
             "price_snapshot": booking.price_snapshot,
         },
+        request_id=request_id,
     )
     notice = _notice(
         booking, booking.vendor_id, "booking.requested", hold_expires_at=booking.hold_expires_at

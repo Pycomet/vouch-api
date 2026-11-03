@@ -15,11 +15,15 @@ Error codes are stable machine-readable strings.  HTTP status codes follow the
 contract defined in ``docs/API_CONTRACT.md``.
 
 Only the error envelope, minimal exception classes, and exception handlers are
-defined here.  Auth-specific (401/403) and write-command-specific (409
-idempotency_key_reused) codes are added alongside the features that produce them.
+defined here.  Write-command-specific codes (409 idempotency_key_reused) are added
+alongside the features that produce them.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +43,21 @@ class ErrorEnvelope(BaseModel):
     error: ErrorDetail
 
 
+class ValidationIssue(BaseModel):
+    """One problem FastAPI found while validating the request."""
+
+    type: str
+    loc: list[str | int]
+    msg: str
+    input: object | None = None
+
+
+class ValidationErrorResponse(BaseModel):
+    """The 422 body FastAPI returns when a request fails validation."""
+
+    detail: list[ValidationIssue]
+
+
 # ---------------------------------------------------------------------------
 # Domain exception classes
 # ---------------------------------------------------------------------------
@@ -50,6 +69,8 @@ class VouchAPIError(Exception):
     status_code: int = 500
     code: str = "internal_error"
     message: str = "An unexpected error occurred."
+    # Extra response headers (e.g. ``WWW-Authenticate`` on a 401); read-only.
+    headers: ClassVar[Mapping[str, str]] = MappingProxyType({})
 
     def __init__(self, message: str | None = None, details: dict | None = None) -> None:
         super().__init__(message or self.message)
@@ -75,6 +96,30 @@ class ResourceNotFoundError(VouchAPIError):
     status_code = 404
     code = "resource_not_found"
     message = "The requested resource was not found."
+
+
+class UnauthenticatedError(VouchAPIError):
+    """Raised when the bearer token is missing, expired, tampered or malformed.
+
+    Returns 401 ``unauthenticated`` with ``WWW-Authenticate: Bearer``. The message
+    never says which check failed.
+    """
+
+    status_code = 401
+    code = "unauthenticated"
+    message = "Authentication is required."
+    headers: ClassVar[Mapping[str, str]] = MappingProxyType({"WWW-Authenticate": "Bearer"})
+
+
+class ForbiddenError(VouchAPIError):
+    """Raised when an authenticated caller's role may not use this route.
+
+    Returns 403 ``forbidden``.
+    """
+
+    status_code = 403
+    code = "forbidden"
+    message = "You do not have permission to do this."
 
 
 class InvalidRequestError(VouchAPIError):
@@ -139,6 +184,12 @@ _GUARD_MESSAGES = {
     "reason_required": "A reason is required.",
     "handover_incomplete": "Both parties have not signed the handover yet.",
     "handover_signed": "The item has been handed over; the booking can no longer be cancelled.",
+    "approval_not_required": "This item does not need the vendor's approval of the renter.",
+    "handover_already_signed": "You have already signed this handover record.",
+    "no_show_too_early": "A no-show can only be reported from the start day of the rental.",
+    "vendor_signed_handover": (
+        "The vendor has signed the pickup handover; a no-show cannot be reported."
+    ),
 }
 
 

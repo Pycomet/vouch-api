@@ -28,9 +28,12 @@ def test_requested_rows_registered_with_their_roles() -> None:
 def test_money_rows_registered_with_their_roles() -> None:
     table = booking_service._TRANSITIONS
     expected = {
-        (BookingStatus.accepted, BookingEvent.deposit_captured): {ActorRole.system},
+        (BookingStatus.accepted, BookingEvent.payment_captured): {ActorRole.system},
         (BookingStatus.accepted, BookingEvent.expire_deposit): {ActorRole.system},
         (BookingStatus.confirmed, BookingEvent.cancel): {ActorRole.renter, ActorRole.vendor},
+        # A13/R14: free withdrawal before payment; the vendor declines a request.
+        (BookingStatus.requested, BookingEvent.cancel): {ActorRole.renter},
+        (BookingStatus.accepted, BookingEvent.cancel): {ActorRole.renter, ActorRole.vendor},
     }
     for key, roles in expected.items():
         assert table[key].roles == roles
@@ -42,7 +45,6 @@ def test_lifecycle_rows_registered_with_their_roles() -> None:
     parties = {ActorRole.renter, ActorRole.vendor, ActorRole.system}
     expected = {
         (BookingStatus.confirmed, BookingEvent.handover_completed): parties,
-        (BookingStatus.confirmed, BookingEvent.balance_captured): {ActorRole.system},
         (BookingStatus.in_progress, BookingEvent.return_completed): parties,
         (BookingStatus.returned, BookingEvent.claim_raised): {ActorRole.vendor},
         (BookingStatus.returned, BookingEvent.complete): {ActorRole.system},
@@ -61,10 +63,23 @@ def test_handover_incomplete_is_a_guard_code() -> None:
     assert (error.status_code, error.code) == (409, "handover_incomplete")
 
 
+def test_balance_step_is_gone() -> None:
+    # A14: everything is paid upfront, so there is no balance event or row.
+    assert "balance_captured" not in {event.value for event in BookingEvent}
+    assert "deposit_captured" not in {event.value for event in BookingEvent}
+    assert BookingEvent.payment_captured.value == "payment_captured"
+
+
 def test_handover_signed_is_a_guard_code() -> None:
     error = BookingGuardFailed("handover_signed")
 
     assert (error.status_code, error.code) == (409, "handover_signed")
+
+
+def test_approval_not_required_is_a_guard_code() -> None:
+    error = BookingGuardFailed("approval_not_required")
+
+    assert (error.status_code, error.code) == (409, "approval_not_required")
 
 
 def test_duplicate_registration_rejected() -> None:
@@ -99,3 +114,18 @@ def test_invalid_transition_details() -> None:
     assert error.status_code == 409
     assert error.code == "invalid_transition"
     assert error.error_details == {"from": "requested", "event": "cancel"}
+
+
+def test_no_show_row_registered_for_the_renter() -> None:
+    # A17: the renter reports a vendor no-show on a paid, confirmed booking.
+    rule = booking_service._TRANSITIONS[(BookingStatus.confirmed, BookingEvent.report_no_show)]
+
+    assert rule.roles == {ActorRole.renter}
+    assert rule.party_only is True
+
+
+@pytest.mark.parametrize("code", ["no_show_too_early", "vendor_signed_handover"])
+def test_no_show_guard_codes(code: str) -> None:
+    error = BookingGuardFailed(code)
+
+    assert (error.status_code, error.code) == (409, code)

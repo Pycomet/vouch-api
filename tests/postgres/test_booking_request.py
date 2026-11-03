@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import FrozenClock
 from app.core.config import get_settings
-from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile
+from app.db.models import AuditEvent, AvailabilityWindow, Booking, KYCProfile, LedgerEntry
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.user import KYCStatus, RenterRole, TrustTier, User
@@ -121,6 +121,16 @@ async def _audits(session: AsyncSession, booking_id: uuid.UUID) -> list[AuditEve
 # ---------------------------------------------------------------------------
 # request
 # ---------------------------------------------------------------------------
+
+
+async def test_request_writes_request_id_on_its_audit_row(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session, minimum_trust_tier=1)
+
+    booking = await _request(db_session, renter, asset, clock, notifier, request_id="req_test")
+
+    rows = await _audits(db_session, booking.id)
+    assert [(row.action, row.request_id) for row in rows] == [("booking.requested", "req_test")]
 
 
 async def test_request_sets_hold_and_snapshot(db_session, clock, notifier) -> None:
@@ -523,6 +533,53 @@ async def test_vendor_approve_twice_is_invalid(db_session, clock, notifier) -> N
         await _transition(db_session, booking, vendor, BookingEvent.approve_vendor, clock, notifier)
 
 
+async def test_approve_after_hold_expired_refused(db_session, clock, notifier) -> None:
+    renter = await _tier2_renter(db_session)
+    asset = await create_asset(db_session, minimum_trust_tier=3, band="C")
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    clock.advance(timedelta(hours=4))  # exactly at expiry: the hold is over
+    audits = len(await _audits(db_session, booking.id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.approve_vendor,
+            clock,
+            notifier,
+        )
+
+    assert caught.value.code == "hold_expired"
+    await db_session.refresh(booking)
+    assert booking.vendor_approved_at is None
+    assert len(await _audits(db_session, booking.id)) == audits
+
+
+@pytest.mark.parametrize("minimum", [0, 1, 2])
+async def test_approve_on_non_tier3_refused(db_session, clock, notifier, minimum) -> None:
+    renter = await _tier2_renter(db_session)
+    asset = await create_asset(db_session, minimum_trust_tier=minimum)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    audits = len(await _audits(db_session, booking.id))
+
+    with pytest.raises(BookingGuardFailed) as caught:
+        await _transition(
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.approve_vendor,
+            clock,
+            notifier,
+        )
+
+    assert caught.value.code == "approval_not_required"
+    assert caught.value.status_code == 409
+    await db_session.refresh(booking)
+    assert booking.vendor_approved_at is None
+    assert len(await _audits(db_session, booking.id)) == audits
+
+
 async def test_decline_releases_slot(db_session, clock, notifier) -> None:
     asset = await create_asset(db_session)
     first = await create_user(db_session, kyc_verified=True)
@@ -582,15 +639,69 @@ async def test_renter_cannot_accept_own_booking(db_session, clock, notifier) -> 
         )
 
 
-async def test_renter_cannot_withdraw_request(db_session, clock, notifier) -> None:
-    """Not in the spec 3.1 table (spec gap, R7): a requested booking has no cancel."""
+async def test_renter_withdraws_requested_free(db_session, clock, notifier) -> None:
+    """A13/R14: the renter may withdraw before the vendor answers; no money moves."""
+    asset = await create_asset(db_session)
+    renter = await create_user(db_session, kyc_verified=True)
+    other = await create_user(db_session, kyc_verified=True)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+    notifier.calls.clear()
+    ledger_before = await db_session.scalar(select(func.count()).select_from(LedgerEntry))
+
+    withdrawn = await _transition(
+        db_session,
+        booking,
+        renter_actor(renter),
+        BookingEvent.cancel,
+        clock,
+        notifier,
+        payload={"reason": "  Shoot moved  "},
+    )
+
+    assert withdrawn.status == BookingStatus.cancelled_by_renter
+    assert withdrawn.cancelled_at == clock.now()
+    assert withdrawn.cancellation_reason == "Shoot moved"
+    assert await db_session.scalar(select(func.count()).select_from(LedgerEntry)) == ledger_before
+    audit = (await _audits(db_session, booking.id))[-1]
+    assert audit.action == "booking.cancelled_by_renter"
+    assert audit.actor_role == "renter"
+    assert (audit.before["status"], audit.after["status"]) == ("requested", "cancelled_by_renter")
+    assert audit.reason == "Shoot moved"
+    assert [(c.user_id, c.template) for c in notifier.calls] == [
+        (asset.vendor_id, "booking.withdrawn")
+    ]
+    # The dates are free again.
+    again = await _request(db_session, other, asset, clock, notifier)
+    assert again.status == BookingStatus.requested
+
+
+async def test_vendor_cannot_cancel_requested(db_session, clock, notifier) -> None:
+    """The vendor answers a request with decline, not cancel (R14)."""
     renter = await create_user(db_session, kyc_verified=True)
     asset = await create_asset(db_session)
     booking = await _request(db_session, renter, asset, clock, notifier)
 
     with pytest.raises(InvalidTransition):
         await _transition(
-            db_session, booking, renter_actor(renter), BookingEvent.cancel, clock, notifier
+            db_session,
+            booking,
+            vendor_actor(asset.vendor_id),
+            BookingEvent.cancel,
+            clock,
+            notifier,
+            payload={"reason": "No"},
+        )
+
+
+async def test_stranger_cannot_withdraw_request(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    stranger = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    booking = await _request(db_session, renter, asset, clock, notifier)
+
+    with pytest.raises(InvalidTransition):
+        await _transition(
+            db_session, booking, renter_actor(stranger), BookingEvent.cancel, clock, notifier
         )
 
 
@@ -678,8 +789,13 @@ async def test_vendor_cannot_expire_hold(db_session, clock, notifier) -> None:
 async def test_each_transition_writes_one_audit_row(
     db_session, clock, notifier, event, actor_kind, advance
 ) -> None:
-    renter = await create_user(db_session, kyc_verified=True)
-    asset = await create_asset(db_session)
+    if event == BookingEvent.approve_vendor:
+        # Approval only applies to tier-3 items (R18).
+        renter = await _tier2_renter(db_session)
+        asset = await create_asset(db_session, minimum_trust_tier=3, band="C")
+    else:
+        renter = await create_user(db_session, kyc_verified=True)
+        asset = await create_asset(db_session)
     booking = await _request(db_session, renter, asset, clock, notifier)
     before = len(await _audits(db_session, booking.id))
     clock.advance(advance)
@@ -693,3 +809,73 @@ async def test_each_transition_writes_one_audit_row(
     assert audit.entity == "booking"
     assert audit.before["status"] == "requested"
     assert audit.after["status"] == result.status.value
+
+
+# ---------------------------------------------------------------------------
+# Date-range limits (rental length and start horizon)
+# ---------------------------------------------------------------------------
+
+
+async def test_request_longer_than_max_rental_days_400(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        # 91 days, inclusive.
+        await _request(
+            db_session, renter, asset, clock, notifier, ends_on=START + timedelta(days=90)
+        )
+
+    assert caught.value.error_details == {"max_rental_days": 90}
+
+
+async def test_request_of_max_rental_days_ok(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    booking = await _request(
+        db_session, renter, asset, clock, notifier, ends_on=START + timedelta(days=89)
+    )
+
+    assert (booking.ends_on - booking.starts_on).days + 1 == 90
+
+
+async def test_request_beyond_booking_horizon_400(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    start = DEFAULT_NOW.date() + timedelta(days=366)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        await _request(db_session, renter, asset, clock, notifier, starts_on=start, ends_on=start)
+
+    assert caught.value.error_details == {"booking_horizon_days": 365}
+
+
+async def test_request_at_booking_horizon_ok(db_session, clock, notifier) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    start = DEFAULT_NOW.date() + timedelta(days=365)
+
+    booking = await _request(
+        db_session, renter, asset, clock, notifier, starts_on=start, ends_on=start
+    )
+
+    assert booking.starts_on == start
+
+
+async def test_amount_overflow_on_insert_maps_to_400(db_session, clock, notifier, monkeypatch):
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+
+    class NumericOverflow(Exception):
+        sqlstate = "22003"
+
+    async def overflow(*args, **kwargs):
+        raise DBAPIError("INSERT INTO bookings", {}, NumericOverflow("numeric field overflow"))
+
+    monkeypatch.setattr(db_session, "flush", overflow)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        await _request(db_session, renter, asset, clock, notifier)
+
+    assert "out of range" in caught.value.detail_message

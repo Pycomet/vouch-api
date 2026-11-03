@@ -106,10 +106,16 @@ async def create_asset(
     weekly_rate: Decimal | None = None,
     fulfilment: dict | None = None,
     listing_status: ListingStatus = ListingStatus.active,
+    make: str = "TestMake",
+    model: str | None = None,
+    aliases: list[str] | None = None,
+    name: str | None = None,
 ) -> Asset:
     """An active asset in a launched city, with its own catalogue item.
 
     Creates a verified vendor when ``vendor`` is not given (``asset.vendor_id``).
+    ``make``, ``model`` and ``aliases`` name the catalogue item (the model gets a
+    random suffix when not given); ``name`` is the asset's display override.
     """
     if vendor is None:
         vendor = await create_user(session, role=RenterRole.vendor, kyc_verified=True)
@@ -119,14 +125,16 @@ async def create_asset(
     city = await launched_city(session)
     item = CatalogueItem(
         category_id=category.id,
-        make="TestMake",
-        model=f"Model {uuid.uuid4().hex[:12]}",
+        make=make,
+        model=model or f"Model {uuid.uuid4().hex[:12]}",
+        aliases=aliases or [],
         replacement_value_band=band,
     )
     session.add(item)
     await session.flush()
     asset = Asset(
         vendor_id=vendor.id,
+        name=name,
         catalogue_item_id=item.id,
         category_id=category.id,
         city_id=city.id,
@@ -236,6 +244,8 @@ def money_snapshot(
     damage_contribution: str = "0.00",
     delivery_fee: str = "0.00",
     commission_rate: str = "0.15",
+    cancellation_fee_rate: str = "0.10",
+    cancellation_fee_vendor_share: str = "0.50",
 ) -> dict[str, str]:
     """A ``price_snapshot`` with the money keys the booking service reads."""
     return {
@@ -245,6 +255,8 @@ def money_snapshot(
         "deposit": deposit,
         "commission_rate": commission_rate,
         "damage_contribution": damage_contribution,
+        "cancellation_fee_rate": cancellation_fee_rate,
+        "cancellation_fee_vendor_share": cancellation_fee_vendor_share,
         "currency": "NGN",
     }
 

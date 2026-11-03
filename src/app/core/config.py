@@ -9,10 +9,14 @@ from functools import lru_cache
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AnyHttpUrl, Field, field_validator, model_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _CITY_SLUG = re.compile(r"^[a-z][a-z-]*$")
+# The ``.env.example`` value; refused outside development and test.
+JWT_SECRET_PLACEHOLDER = "change-me"
+# HS256 keys shorter than the hash output (32 bytes) are refused outside development and test.
+JWT_SECRET_MIN_BYTES = 32
 
 
 class Environment(StrEnum):
@@ -20,6 +24,10 @@ class Environment(StrEnum):
     TEST = "test"
     STAGING = "staging"
     PRODUCTION = "production"
+
+
+# Environments where the JWT secret rules are not enforced.
+_UNGUARDED_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
 
 
 class Settings(BaseSettings):
@@ -47,7 +55,19 @@ class Settings(BaseSettings):
     # Placeholders pending legal advice.
     commission_rate: Decimal = Decimal("0.15")
     damage_contribution_rate: Decimal = Decimal("0.05")
+    # Renter cancellation of a paid booking (A13), also placeholders pending legal
+    # advice: the fee is this fraction of the rental, and the vendor's share of the
+    # fee is the second fraction (Vouch keeps the rest). Frozen into price_snapshot.
+    renter_cancellation_fee_rate: Decimal = Decimal("0.10")
+    cancellation_fee_vendor_share: Decimal = Decimal("0.50")
     business_timezone: str = "Africa/Lagos"
+    # Booking request limits: the longest rental (days, inclusive) and how far
+    # ahead (days after today in the business zone) a rental may start.
+    max_rental_days: int = Field(default=90, ge=1)
+    booking_horizon_days: int = Field(default=365, ge=1)
+    # HS256 signing key for access tokens; checked outside development and test.
+    jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
+    jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
 
     @field_validator("launched_cities", mode="before")
     @classmethod
@@ -66,7 +86,12 @@ class Settings(BaseSettings):
                 raise ValueError(f"invalid city slug: {city!r}")
         return value
 
-    @field_validator("commission_rate", "damage_contribution_rate")
+    @field_validator(
+        "commission_rate",
+        "damage_contribution_rate",
+        "renter_cancellation_fee_rate",
+        "cancellation_fee_vendor_share",
+    )
     @classmethod
     def validate_rate(cls, value: Decimal) -> Decimal:
         if not Decimal(0) <= value < Decimal(1):
@@ -86,6 +111,17 @@ class Settings(BaseSettings):
     def enforce_production_safety(self) -> Settings:
         if self.environment == Environment.PRODUCTION and self.debug:
             raise ValueError("debug must be disabled in production")
+        # The signing key is checked everywhere except local development and tests,
+        # so a staging deployment cannot run on the placeholder or a weak key either.
+        if self.environment not in _UNGUARDED_ENVIRONMENTS:
+            env = self.environment.value
+            secret = self.jwt_secret.get_secret_value()
+            if secret == JWT_SECRET_PLACEHOLDER:
+                raise ValueError(f"jwt_secret must be set in {env}")
+            if len(secret.strip().encode("utf-8")) < JWT_SECRET_MIN_BYTES:
+                raise ValueError(
+                    f"jwt_secret must be at least {JWT_SECRET_MIN_BYTES} bytes in {env}"
+                )
         return self
 
     @property

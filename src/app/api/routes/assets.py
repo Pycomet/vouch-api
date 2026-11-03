@@ -34,6 +34,14 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_launched_cities
+from app.api.examples import (
+    CITY_NOT_LAUNCHED,
+    INVALID_CURSOR,
+    PAGE_EXAMPLE,
+    PUBLIC_ASSET_EXAMPLE,
+    Err,
+    documented,
+)
 from app.db.session import get_session
 from app.schemas.assets import DEFAULT_LIMIT, MAX_LIMIT, PublicAsset
 from app.schemas.errors import InvalidRequestError
@@ -43,7 +51,25 @@ from app.services.inventory import get_public_asset, search_public_assets
 router = APIRouter(prefix="/assets", tags=["inventory"])
 
 
-@router.get("", response_model=Page[PublicAsset], summary="Search public inventory")
+@router.get(
+    "",
+    response_model=Page[PublicAsset],
+    summary="Search public inventory",
+    responses=documented(
+        200,
+        PAGE_EXAMPLE,
+        CITY_NOT_LAUNCHED,
+        Err(
+            400,
+            "invalid_request",
+            "'starts_on' must not be after 'ends_on'.",
+            {"starts_on": "2026-11-15", "ends_on": "2026-11-13"},
+            description="Dates missing or reversed.",
+        ),
+        INVALID_CURSOR,
+        422,
+    ),
+)
 async def list_assets(
     category: str | None = Query(None, description="Filter by category slug."),
     starts_on: datetime.date | None = Query(
@@ -77,15 +103,19 @@ async def list_assets(
     ``starts_on`` and ``ends_on``; supplying only one returns 400.
     """
     # --- Validate date pair ---
+    # Details name only the dates that were given (no "None" strings).
+    given = {
+        key: day.isoformat() for key, day in (("starts_on", starts_on), ("ends_on", ends_on)) if day
+    }
     if (starts_on is None) != (ends_on is None):
         raise InvalidRequestError(
             message="Both 'starts_on' and 'ends_on' are required together for date filtering.",
-            details={"starts_on": str(starts_on), "ends_on": str(ends_on)},
+            details=given,
         )
     if starts_on is not None and ends_on is not None and starts_on > ends_on:
         raise InvalidRequestError(
             message="'starts_on' must not be after 'ends_on'.",
-            details={"starts_on": str(starts_on), "ends_on": str(ends_on)},
+            details=given,
         )
 
     # --- Validate cursor early so a bad cursor returns 400 before DB access ---
@@ -117,7 +147,17 @@ async def list_assets(
     "/{asset_id}",
     response_model=PublicAsset,
     summary="Get a public asset detail",
-    responses={404: {"description": "Asset not found or not publicly available."}},
+    responses=documented(
+        200,
+        PUBLIC_ASSET_EXAMPLE,
+        Err(
+            404,
+            "resource_not_found",
+            "The requested resource was not found.",
+            description="Asset not found or not publicly available.",
+        ),
+        422,
+    ),
 )
 async def get_asset(
     asset_id: uuid.UUID,

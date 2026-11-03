@@ -11,7 +11,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 
-from tests.postgres.conftest import asyncpg_url
+from tests.postgres.conftest import REVISION_0002, asyncpg_url
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("VOUCH_TEST_DATABASE_URL"),
@@ -268,7 +268,7 @@ def test_downgrade_removes_ledger_audit_webhooks(migrated_db: str, alembic_cfg: 
     assert parts <= asyncio.run(_names(TABLES))
     assert asyncio.run(_names(FUNCTIONS)) == {"reject_mutation", "assert_txn_group_balanced"}
 
-    command.downgrade(alembic_cfg, "-1")
+    command.downgrade(alembic_cfg, REVISION_0002)  # undo 0003
     assert not parts & asyncio.run(_names(TABLES))
     assert not asyncio.run(_names(FUNCTIONS))
 
