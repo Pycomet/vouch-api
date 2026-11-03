@@ -1126,3 +1126,35 @@ async def test_mismatch_and_late_refund_rows_add_up(
 
     for booking_id in (mismatched, late):
         await _assert_linkage(db_session, booking_id)
+
+
+async def test_payout_before_completion_is_posted_and_flagged(
+    client, db_session, clock, notifier, provider
+) -> None:
+    """The money left, so it is ledgered; but a booking not yet completed should
+    not be paid out, so ops is alerted and the audit row says so."""
+    booking_id = await _confirmed(client, db_session, clock, notifier, provider)
+    payable = RENTAL + DELIVERY - COMMISSION
+
+    response = await _send(
+        client,
+        provider,
+        _payout(provider, booking_id, payable, recipient_code="RCP_vendor"),
+    )
+
+    assert response.json() == {"status": "processed", "processing_error": None}
+    assert await _memos(db_session, booking_id) == ["payment_captured", "payout"]
+    booking = await _booking(db_session, booking_id)
+    [alert] = [call for call in notifier.calls if call.template == "ops.payout_unexpected"]
+    assert alert.user_id is None
+    assert alert.data == {
+        "booking_id": str(booking_id),
+        "renter_id": str(booking.renter_id),
+        "booking_status": "confirmed",
+        "amount": str(payable),
+        "provider_event_id": "evt_payout_completed_trf_1",
+    }
+    [payout] = await _payments(db_session, booking_id, PaymentType.payout)
+    [audit] = await _audits(db_session, payout.id, "payout.paid")
+    assert audit.after["booking_status"] == "confirmed"
+    assert audit.after["note"] == "booking_not_completed"

@@ -67,6 +67,9 @@ captured row is left untouched, and ``processing_error`` is
 ``payout_completed`` (the vendor's transfer landed) posts ``payout`` (dr
 vendor_payable / cr platform_cash) for the booking and records the ``payout``
 payment row as paid. The amount may not exceed the booking's vendor_payable.
+A payout for a booking that is not ``completed`` is still posted (the money has
+left), but ops is alerted (``ops.payout_unexpected``) and the audit row carries
+``note = "booking_not_completed"``.
 
 The booking row is locked (``FOR UPDATE``) before anything is decided, so a
 payment and a renter's withdraw of the same booking are serialised: whichever
@@ -611,18 +614,29 @@ async def _payout_completed(ctx: _Context, event: PaymentEvent) -> str | None:
     payout.paid_at = ctx.now
     await ctx.session.flush()
     await _post(ctx, booking, payout_postings(event.amount), "payout", payout.id)
-    await _audit_payment(
-        ctx,
-        payout,
-        "payout.paid",
-        {"vendor_payable": payable},
-        {
-            "booking_id": booking.id,
-            "amount": event.amount,
-            "recipient_code": recipient,
-            "vendor_payable": payable - event.amount,
-        },
-    )
+    after: dict[str, Any] = {
+        "booking_id": booking.id,
+        "booking_status": booking.status,
+        "amount": event.amount,
+        "recipient_code": recipient,
+        "vendor_payable": payable - event.amount,
+    }
+    early = booking.status != BookingStatus.completed
+    if early:
+        after["note"] = "booking_not_completed"
+    await _audit_payment(ctx, payout, "payout.paid", {"vendor_payable": payable}, after)
+    if early:
+        await ctx.notifier.send(
+            None,
+            "ops.payout_unexpected",
+            {
+                "booking_id": str(booking.id),
+                "renter_id": str(booking.renter_id),
+                "booking_status": str(booking.status.value),
+                "amount": str(event.amount),
+                "provider_event_id": event.provider_event_id,
+            },
+        )
     return None
 
 
