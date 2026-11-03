@@ -1,427 +1,211 @@
 # Vouch API Contract
 
-## 1. Status and compatibility
+## 1. Status and the authoritative schema
 
-The API base is `/api/v1`. The health and public inventory endpoints are currently implemented. Every identity, booking, payment, handover, admin, and webhook endpoint below is **planned** and must not be represented as available until implemented and published in OpenAPI.
+The API base is `/api/v1`. Every endpoint in this document is **implemented** (Milestone 2). Items that are still future work are listed in §9, *Not in M2*.
 
-Current endpoints:
+The **authoritative request and response schemas are the OpenAPI document** the app serves at `/docs` (Swagger UI), `/redoc` and `/openapi.json`. These are turned off when `VOUCH_ENVIRONMENT=production`. Every route there carries examples, and `tests/test_openapi_examples.py` keeps them valid. This document summarises the contract: who may call what, the shapes, and the codes. The schema is in [`docs/SCHEMA.md`](SCHEMA.md). The spec is [`docs/specs/M2.md`](specs/M2.md), with amendments [`docs/specs/M2-amendments.md`](specs/M2-amendments.md) (A1–A18, which win where they differ).
 
-| Method | Path | Auth | Behavior |
-|---|---|---|---|
-| `GET` | `/api/v1/health/live` | None | Process liveness; `200` with service/version |
-| `GET` | `/api/v1/health/ready` | None | Dependency readiness; `200` when DB ready, `503` otherwise |
-| `GET` | `/api/v1/assets` | None | Search active Lagos inventory; supports category, date-range, daily-rate, limit, and cursor filters |
-| `GET` | `/api/v1/assets/{asset_id}` | None | Public detail of a single active Lagos listing; `404` for non-public or unknown assets |
+## 2. Conventions
 
-The FastAPI application currently exposes Swagger/ReDoc/OpenAPI outside production only.
+- **JSON** request and response bodies. Request bodies refuse unknown fields (422).
+- **Ids** are UUID strings. **Dates** are `YYYY-MM-DD` and inclusive at both ends. **Timestamps** are RFC 3339 with an offset (UTC).
+- **Money** is a string with two decimals, such as `"150000.00"`, in `NGN`. Request bodies accept money only as such a string: at most 10 digits before the point and 2 after. JSON numbers, exponents and signs are 422, so no amount passes through a binary float.
+- **Request ids.** A caller may send `X-Request-ID` (1–128 printable ASCII characters); otherwise the server makes one. It is echoed on every response, appears in every error body, and is stored on every audit row the request writes. CORS exposes `X-Request-ID` and `Retry-After`.
+- **Pagination** (`/assets`, `/catalogue/search`): `limit` (1–100, default 20) and an opaque `cursor`. The response is `{"items": [...], "pagination": {"limit", "next_cursor"}}`.
+- **Body size.** Every request body is capped at `VOUCH_MAX_REQUEST_BYTES` (default 8 MiB). Above it the answer is 413 `payload_too_large`, before anything is parsed.
+- **Cities.** Launched cities come from `VOUCH_LAUNCHED_CITIES` (default `abuja`; Abuja launches first). A city filter outside that list is 400 `city_not_launched`. Unknown cities get the same answer. An asset in a city that is not launched is a 404.
 
-## 2. Conventions for planned endpoints
+## 3. Authentication and authorization
 
-### 2.1 Transport and representation
+**Phone OTP, then a JWT.** `POST /auth/otp/request` sends a 6-digit code. `POST /auth/otp/verify` exchanges it for an access token. The token is HS256, signed with `VOUCH_JWT_SECRET`, has claims `sub` (user id), `role`, `iat` and `exp`, and lives for `VOUCH_JWT_TTL_MINUTES` (default 7 days). The first successful verify for a phone creates the user as a `renter`. The token's role is always the stored `users.role`, never anything the client sent. No token is ever issued for the `system` role: timers and webhooks act as `system` inside the server.
 
-- HTTPS only in production; JSON request/response bodies except direct-to-object-storage uploads.
-- Auth mechanism is unresolved; protected examples use `Authorization: Bearer <token>` as a contract placeholder, not a provider selection.
-- UUIDs are strings; dates are `YYYY-MM-DD`; timestamps are RFC 3339 UTC; amounts are decimal strings such as `"25000.00"`; currency is `NGN`.
-- Responses include `X-Request-ID`; callers may supply `X-Request-ID`, but the server validates/generates it.
-- Collection pagination uses opaque cursors: `?limit=20&cursor=...`, max 100.
-- Serial numbers, internal notes, provider raw payloads, evidence storage keys, KYC data, commission internals, and private contact data are omitted unless the authorized role requires them.
+**On every protected request** the server reads `Authorization: Bearer <token>`, verifies it, and then **reloads the user from the database on the request's own session**. A missing, inactive or soft-deleted user, or one whose stored role is no longer the token's role, gets the same 401 `unauthenticated` as a bad token (with `WWW-Authenticate: Bearer`). The message never says which check failed. A restricted renter still authenticates; the booking guards refuse their requests (`renter_restricted`).
 
-### 2.2 Error envelope
+**Roles** are `renter`, `vendor` and `admin`. A valid token with the wrong role gets 403 `forbidden`. On routes about one booking, the checks run in this order, before the body is validated:
+
+1. **Visibility.** The caller must be the booking's renter (renter role), its vendor (vendor role) or an admin. Anyone else gets 404 `resource_not_found`, exactly as for an unknown id.
+2. **Role.** A party whose role may not take this action gets 403 `forbidden`.
+3. **Transition.** An event the booking cannot take from its status gets 409 `invalid_transition`. A failed guard gets 409 with the guard's own code (§6).
+
+The client never sets a role, tier, price, commission, payment status or payout eligibility.
+
+## 4. Endpoints
+
+| Method | Path | Who | Request | Success | Errors |
+|---|---|---|---|---|---|
+| GET | `/health/live` | anyone | — | 200 `{status, service, version}` | — |
+| GET | `/health/ready` | anyone | — | 200 `{status: "ok", service, version, checks: {database: "ok"}}` | 503, same shape, `"unavailable"` |
+| POST | `/auth/otp/request` | anyone | `{phone}` | 202 `{"status": "sent"}`, always, known phone or not | 422, 429 `rate_limited` (+`Retry-After`), 503 `otp_unavailable` |
+| POST | `/auth/otp/verify` | anyone | `{phone, code, full_name?}` | 200 `{access_token, token_type: "bearer", expires_in}` | 401 `unauthenticated` (every failure), 422 |
+| POST | `/me/kyc` | renter | `{id_type, id_number, selfie_b64, address_doc_b64}` | 200 `{tier, status}` | 401, 403, 422, 503 `kyc_unavailable` |
+| GET | `/assets` | anyone | query: `city`, `category`, `starts_on`, `ends_on`, `min_daily_rate`, `max_daily_rate`, `limit`, `cursor` | 200 page of `PublicAsset` | 400 `invalid_request` / `city_not_launched` / `invalid_cursor`, 422 |
+| GET | `/assets/{asset_id}` | anyone | — | 200 `PublicAsset` | 404, 422 |
+| GET | `/catalogue/search` | anyone | query: `q`, `city`, `from`, `to`, `limit`, `cursor` | 200 page of `PublicAsset` + `equivalents` | 400 `invalid_request` / `city_not_launched` / `invalid_cursor`, 422 |
+| POST | `/bookings` | renter | `{asset_id, starts_on, ends_on, fulfilment, damage_contribution}` | 201 `Booking` (`requested`) | 400, 401, 403, 404, 409 guards, 422 |
+| GET | `/bookings/{id}` | the booking's renter or vendor, or an admin | — | 200 `Booking` | 401, 403, 404, 422 |
+| POST | `/bookings/{id}/accept` | vendor | — | 200 `Booking` (`accepted`) | 401, 403, 404, 409, 422, 502 `payment_provider_error`, 503 `payment_unavailable` |
+| POST | `/bookings/{id}/decline` | vendor | `{reason?}` | 200 `Booking` (`declined`) | 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/approve` | vendor | — | 200 `Booking` (`vendor_approved_at` set) | 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/cancel` | renter or vendor | `{reason?}` (vendor: required) | 200 `Booking` (`cancelled_by_renter` / `cancelled_by_vendor`) | 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/no-show` | renter | `{reason?}` (≤ 500 chars) | 200 `Booking` (`cancelled_by_vendor`) | 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/handover` | renter or vendor | `{checklist, evidence_urls, sign}` | 200 `Booking` (`in_progress` once both have signed) | 400, 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/return` | renter or vendor | `{checklist, evidence_urls, sign}` | 200 `Booking` (`returned` once both have signed) | 400, 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/claim` | vendor | `{amount, description, evidence_urls}` | 200 `Booking` (`disputed`) | 400, 401, 403, 404, 409, 422 |
+| POST | `/bookings/{id}/resolve` | admin | `{decision, reason, amount?}` | 200 `Booking` (`completed`) | 400, 401, 403, 404, 409, 422 |
+| GET | `/me/home` | renter | — | 200 `{active, past}` | 401, 403 |
+| GET | `/vendor/home` | vendor | — | 200 `{requests, today: {handovers, returns}, next_payout, utilisation_7d}` | 401, 403 |
+| POST | `/webhooks/{provider}` | the payment provider (no token; `X-Vouch-Signature`) | the provider's raw event | 200 `{status: "processed" \| "duplicate", processing_error}` | 401 `invalid_signature`, 404 (provider is not the configured one), 413, 422 |
+
+### 4.1 Auth and KYC
+
+- `phone` accepts `0XXXXXXXXXX`, `234XXXXXXXXXX` or `+234XXXXXXXXXX` and is normalized to `+234XXXXXXXXXX`. Anything else is 422. `code` is six digits.
+- A code lives for 10 minutes and allows 5 wrong guesses. A newer code replaces the older ones. More than **5 requests per phone in a rolling hour** get 429 with `Retry-After` (whole seconds). Every failed verify (no challenge, a wrong, expired, used or exhausted code, or an inactive or deleted account) is the same 401. The verify route commits even on failure, so every guess counts.
+- `full_name` is used only when the verify creates the account.
+- `POST /me/kyc`: `id_type` is `nin`, `bvn`, `passport` or `drivers_licence`, and `id_number` matches `^[A-Za-z0-9-]{6,24}$`. The two files are base64, at most 2 MB each once decoded. Bad base64, an empty file or an oversize file is 422, and 422 bodies never echo the input. Both checks must pass: then the answer is `verified` at tier 1, otherwise `failed` at tier 0, and the renter may try again. Posting again after a success is an idempotent 200. The documents and the id number are never stored or logged.
+
+### 4.2 Inventory
+
+`PublicAsset` is `{id, name, display_name, make, model, description, category, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, city, is_available, minimum_trust_tier, created_at, updated_at}`. It never includes the serial number, vendor identity, condition notes or review data. Only active, available, non-deleted listings of active vendors in launched cities are visible.
+
+- `/assets`: `starts_on` and `ends_on` must be given together, with `starts_on <= ends_on` (400 otherwise). With them, units that have a live booking or a blocked window overlapping the range are left out.
+- `/catalogue/search`: `q` is a full-text match on make, model and aliases. `from` and `to` work like the `/assets` dates. If nothing is free and `q` matched catalogue items, the search runs again over those items' categories without `q`, and the response says `"equivalents": true`.
+
+### 4.3 Bookings
+
+**`Booking`** is `{id, status, asset_id, renter_id, vendor_id, starts_on, ends_on, fulfilment_choice, hold_expires_at, deposit_due_at, claim_window_ends_at, vendor_approved_at, price, money_line, payment_instructions?}`.
+
+- `price` is `{rental_total, delivery_fee, deposit, damage_contribution, currency}`, frozen at request time.
+- `payment_instructions` is `{bank, account_number, reference, amount, due_by}`. It is shown only to the booking's renter, only while the booking is `accepted` and unpaid. `amount` is the whole upfront payment: deposit + damage contribution + rental + delivery fee (A14). `due_by` is `deposit_due_at`, 12 hours after acceptance.
+
+Behaviour, in short (the full transition table, with every guard, is in `docs/SCHEMA.md` §5):
+
+- **Request.** Holds the unit for 4 hours (`hold_expires_at`) while the vendor answers. A tier-3 item needs `/approve` before `/accept`.
+- **Accept.** Opens the renter's virtual account for the whole amount. Without a configured payment provider the answer is 503 and nothing changes. If the provider call fails the answer is 502 and nothing changes.
+- **Payment.** The provider's `payment_captured` webhook confirms the booking (`accepted` → `deposit_paid` → `confirmed`). The renter pays **everything upfront**; nothing is paid at handover. An unpaid acceptance expires at `deposit_due_at`.
+- **Cancel.** A renter may **withdraw for free** while the booking is `requested`, or `accepted` and unpaid (A13). After payment, a renter cancels until 00:00 (business timezone) on `starts_on`, and gets back everything paid minus a cancellation fee: `rental × VOUCH_RENTER_CANCELLATION_FEE_RATE`, shared with the vendor. A vendor cancellation (of an `accepted` or paid booking) needs a reason, refunds the renter in full, and records a reliability penalty. Nobody can cancel once both parties have signed the pickup.
+- **No-show** (A17). From 00:00 on `starts_on`, while there is no completed pickup and the vendor has not signed its side of it, the renter may report a no-show. The booking becomes `cancelled_by_vendor`, the renter gets a full refund with no fee, and the vendor gets a reliability penalty.
+- **Handover / return.** Each party submits its own checklist (at most 50 flat entries) and evidence URLs (1–20 per call, at most 40 per record), optionally signing. A signed side is final. When both have signed, the booking moves on. A return opens a 24-hour claim window.
+- **Claim.** Inside the window, the vendor claims against the deposit. The deposit and the payout freeze (`disputed`). Ops is alerted.
+- **Resolve.** An admin decides `release`, `deduct` (with `amount`, capped at the deposit; `amount` is required for deduct and refused otherwise, 422) or `forfeit`. The decision needs a reason. The booking is then `completed`.
+- Without a claim, the timer completes a returned booking once the window closes, and the deposit hold is released.
+
+### 4.4 The money line
+
+Every booking response, and every home-screen card, carries `money_line`. It is computed on each read from the ledger, the refund rows, the audit trail and the booking status, and never stored:
 
 ```json
-{
-  "error": {
-    "code": "booking_state_conflict",
-    "message": "Booking cannot be activated from its current state.",
-    "details": {},
-    "request_id": "req_..."
-  }
+"money_line": {
+  "deposit":      {"amount": "150000.00", "status": "held", "held_by": "platform"},
+  "contribution": {"amount": "7500.00",   "status": "received"},
+  "rental":       {"amount": "150000.00", "status": "received"},
+  "next":         {"label": "Handover Fri 13 Nov", "amount_due": "0.00"}
 }
 ```
 
-Expected statuses: `400` malformed/domain validation, `401` unauthenticated, `403` unauthorized or trust-tier gate, `404` hidden/not found, `409` state/availability/idempotency conflict, `422` schema validation, `429` throttled, and `503` dependency unavailable. Errors must not leak provider secrets, raw KYC reasons, or private evidence.
-
-### 2.3 Idempotency and concurrency
-
-`Idempotency-Key` is required on planned booking creation, payment initialization, refund, payout, and other money-moving command endpoints. The key is scoped to authenticated principal + operation; replay with the same normalized payload returns the stored result, while reuse with a different payload returns `409 idempotency_key_reused`.
-
-State-changing resources return an `ETag` or version. Commands that can race use `If-Match`; stale writes return `409 resource_version_conflict`. Database transactions, booking row locks/version checks, and the exclusion constraint protect booking confirmation.
-
-### 2.4 Authorization matrix
-
-| Resource/action | Renter | Vendor | Admin/ops |
-|---|---|---|---|
-| Public asset search/detail | Yes | Yes | Yes |
-| Private user/KYC | Self | Self | Authorized operations only |
-| Create booking/pay/sign renter side | Self | No | Controlled override |
-| Approve booking/manage owned asset/sign vendor side | No | Owner vendor | Controlled override |
-| View booking/evidence | Booking party | Booking's vendor | Authorized operations |
-| Resolve dispute/refund/payout | No | No | Segregated authorized roles |
-
-Every override requires a reason and audit event. Client-supplied role, tier, ownership, prices, commission, payment status, or payout eligibility are ignored.
-
-## 3. Resource shapes
-
-### 3.1 Public asset
-
-```json
-{
-  "id": "uuid",
-  "name": "Sony FX3",
-  "description": "Camera body with cage",
-  "category": "camera",
-  "daily_rate": "75000.00",
-  "deposit_amount": "200000.00",
-  "currency": "NGN",
-  "city": "lagos",
-  "is_available": true,
-  "minimum_trust_tier": 1
-}
-```
-
-`minimum_trust_tier` is planned; current assets do not persist it. Public responses never include `serial_number`.
-
-### 3.2 Booking
-
-```json
-{
-  "id": "uuid",
-  "asset_id": "uuid",
-  "renter_id": "uuid",
-  "starts_on": "2026-10-10",
-  "ends_on": "2026-10-12",
-  "status": "pending",
-  "total_rental_fee": "225000.00",
-  "deposit_amount": "200000.00",
-  "currency": "NGN",
-  "required_trust_tier": 1,
-  "deposit_status": "pending",
-  "balance_status": "pending",
-  "pickup_status": null,
-  "return_status": null,
-  "payout_status": "pending",
-  "version": 1,
-  "created_at": "2026-09-26T12:00:00Z",
-  "updated_at": "2026-09-26T12:00:00Z"
-}
-```
-
-Several aggregate fields are planned projections and do not currently exist as columns.
-
-### 3.3 Payment
-
-```json
-{
-  "id": "uuid",
-  "booking_id": "uuid",
-  "type": "deposit",
-  "status": "pending",
-  "amount": "200000.00",
-  "currency": "NGN",
-  "provider": "paystack",
-  "provider_reference": "redacted-or-safe-reference",
-  "payment_url": "short-lived-provider-url",
-  "virtual_account": null,
-  "created_at": "2026-09-26T12:00:00Z"
-}
-```
-
-Provider initialization details are returned only to the booking renter. Responses describe the arrangement only as a deposit hold.
-
-### 3.4 Handover
-
-```json
-{
-  "id": "uuid",
-  "booking_id": "uuid",
-  "direction": "pickup",
-  "status": "draft",
-  "condition_checklist": {
-    "schema_version": 1,
-    "items": [
-      {"key": "body", "condition": "good", "notes": "Minor mark on cage"}
-    ]
-  },
-  "vendor_signed_at": null,
-  "renter_signed_at": null,
-  "evidence": [],
-  "notes": null,
-  "version": 1
-}
-```
-
-Permanent object keys and exact coordinates are not public. Authorized evidence reads return short-lived URLs.
-
-## 4. Authentication and account APIs — planned
-
-The identity/session implementation is undecided. The stable resource contract should expose:
-
-| Method | Path | Purpose |
+| Part | Present | `status` values |
 |---|---|---|
-| `POST` | `/auth/challenges` | Send a phone verification challenge; rate-limited |
-| `POST` | `/auth/challenges/verify` | Verify challenge and establish/issue session |
-| `POST` | `/auth/refresh` | Rotate session/token if token auth is selected |
-| `POST` | `/auth/logout` | Revoke current session |
-| `GET` | `/me` | Return current user, role, active state, and safe KYC summary |
-| `PATCH` | `/me` | Update allowed profile fields |
+| `deposit` (D) | always | `due` before payment; `held` while the deposit hold is open; `released`, `deducted` or `forfeited` once it ends (`released` after a paid cancellation); `cancelled` when the booking closed before any payment |
+| `contribution` (C) | only when C > 0 | `due`, `received`, `refunded`, `cancelled` |
+| `rental` (R + F) | always | `due`, `received` (once the upfront payment is captured), `refunded` (paid cancellation), `paid_out` (payouts cover the vendor's whole payable), `cancelled` |
+| `cancellation_fee` | only after a paid renter cancellation | `{amount, vendor_part, platform_part}` |
+| `refund` | only on a booking cancelled after payment | `{amount}` = everything paid less any cancellation fee. `refund + cancellation_fee` always equals everything paid. |
+| `returned_payments` | only when there are some | A list of `{amount, reason}`: money that reached the booking's account but was never applied, and is returned in full. `reason` is `late_payment`, `amount_mismatch`, `duplicate_payment` or the refusing check's code. It never changes the other parts' status. |
+| `next` | always | `{label, amount_due}`: `Awaiting vendor response`; `Payment due <time>` with `amount_due` = D + C + R + F; `Handover <day>`; `Return by <day>`; `Claim window closes <time>`; `Under review`; `Closed` |
 
-Creating or verifying a challenge is idempotent within a short server window and must not reveal whether unrelated phone numbers exist.
+A booking that ends `declined`, `expired`, `cancelled_by_renter` or `cancelled_by_vendor` with no payment ever captured shows `cancelled` for each part, and `next` is `Closed` / `"0.00"` (A18). A no-show shows deposit `released`, rental and contribution `refunded`, and a refund of the whole amount paid. Parts that do not apply are left out of the JSON, not sent as `null`.
 
-## 5. KYC APIs — planned
+### 4.5 Home screens
 
-Smile ID versus Dojah remains **unresolved**. The API exposes provider-neutral outcomes.
+Each card is `{id, status, asset_id, asset_name, starts_on, ends_on, hold_expires_at, money_line}`.
 
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `GET` | `/kyc/me` | User | Current status, tier, required checks; no raw provider payload |
-| `POST` | `/kyc/sessions` | User | Initiate/retry provider flow for requested eligible tier |
-| `GET` | `/kyc/sessions/{id}` | Owner | Safe status of attempt |
-| `POST` | `/webhooks/kyc/{provider}` | Provider | Signed callback/event ingestion |
-| `POST` | `/admin/kyc/{profile_id}/review` | Ops | Audited approve/reject/retry decision where policy allows |
+- `GET /me/home`: `active` is the live (or disputed) booking that starts soonest, or `null`. `past` holds closed bookings, newest first, at most 20.
+- `GET /vendor/home`:
+  - `requests`: unanswered requests whose hold has not lapsed, ordered by `hold_expires_at` ascending;
+  - `today.handovers`: paid bookings starting today; `today.returns`: rentals ending today;
+  - `next_payout`: what the vendor's closed bookings still owe the vendor, net of payouts;
+  - `utilisation_7d`: booked asset-days over today and the next six days, divided by active listings × 7, as a two-decimal string.
 
-`POST /kyc/sessions` request:
+### 4.6 Webhooks
 
-```json
-{"target_tier": 1, "return_url": "https://approved-origin.example/kyc/return"}
-```
-
-The server derives required checks: tier 1 is national ID + liveness; tier 2 adds address. Return URLs must match an allowlist. A successful browser return does not verify KYC; only verified provider results and authorized review can do so.
-
-## 6. Asset and availability APIs — planned
-
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `GET` | `/assets` | Public | Search active, non-deleted creative gear |
-| `GET` | `/assets/{asset_id}` | Public | Public detail and safe availability summary |
-| `POST` | `/vendor/assets` | Vendor | Create draft creative-gear listing |
-| `GET` | `/vendor/assets` | Vendor | List own listings, including non-public fields |
-| `GET` | `/vendor/assets/{asset_id}` | Owner | Own listing detail, including restricted serial number |
-| `PATCH` | `/vendor/assets/{asset_id}` | Owner | Edit allowed listing fields; reviewed fields may return listing to review |
-| `DELETE` | `/vendor/assets/{asset_id}` | Owner/ops | Soft-delete when policy permits; cannot erase booking history |
-| `PUT` | `/vendor/assets/{asset_id}/availability` | Owner | Replace/version availability blocks |
-| `POST` | `/admin/assets/{asset_id}/review` | Ops | Approve/reject/pause with reason |
-
-Search parameters: `city=lagos`, `category=camera`, `starts_on`, `ends_on`, `min_daily_rate`, `max_daily_rate`, cursor and limit. v1 serves Lagos until the Abuja gate is explicitly enabled, even though `abuja` exists in the current enum.
-
-Create request uses server validation and decimal strings:
+`POST /webhooks/{provider}`. `{provider}` must be the configured payment provider (404 otherwise). There is no bearer token: the body must carry `X-Vouch-Signature`, the HMAC-SHA256 (hex) of the raw body. The fake provider signs with `VOUCH_FAKE_PAYMENT_WEBHOOK_SECRET`. The fake's event shape is:
 
 ```json
-{
-  "name": "Sony FX3",
-  "description": "Camera body with cage",
-  "category": "camera",
-  "serial_number": "restricted-value",
-  "daily_rate": "75000.00",
-  "deposit_amount": "200000.00",
-  "city": "lagos",
-  "condition_notes": "Operational; inspected"
-}
+{"id": "evt_…", "type": "payment_captured",
+ "data": {"booking_id": "uuid", "reference": "fake-booking-…", "amount": "312500.00"}}
 ```
 
-## 7. Booking APIs — planned
+`payout_completed` events also carry `data.recipient_code`.
 
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `POST` | `/bookings` | Verified renter | Create `pending` booking with server-side quote snapshot |
-| `GET` | `/bookings` | User | List bookings visible to current party |
-| `GET` | `/bookings/{id}` | Party/ops | Booking aggregate and allowed next actions |
-| `POST` | `/bookings/{id}/approve` | Owning vendor/ops | Approve request; Phase 0 remains concierge-gated |
-| `POST` | `/bookings/{id}/reject` | Owning vendor/ops | Cancel/reject pending request with reason |
-| `POST` | `/bookings/{id}/cancel` | Authorized party/ops | Apply approved cancellation policy |
-| `POST` | `/bookings/{id}/disputes` | Booking party/ops | Open dispute and block affected money movement |
-| `GET` | `/bookings/{id}/timeline` | Party/ops | Redacted lifecycle and evidence timeline |
+- A bad or missing signature is recorded (`signature_ok = false`, keyed by the body's hash) and answered 401 `invalid_signature`. Nothing else happens.
+- An event seen before (same provider and event id) is answered 200 `{"status": "duplicate"}`, and nothing else happens.
+- Otherwise the event is recorded and applied, and answered 200 `{"status": "processed"}`. `processing_error` is set when a genuine event cannot be applied (for example `unsupported_event`, `payment_not_found`, `amount_mismatch`, `payout_exceeds_payable`). The 200 stops the provider retrying an event that can never succeed. Money that arrives but cannot be applied is recorded and returned to the renter (see `money_line.returned_payments`).
 
-`POST /bookings` requires `Idempotency-Key`:
+The route commits in every case, including the 401. The full semantics are in `docs/SCHEMA.md` §10.
+
+## 5. Error envelope
+
+Every error except a 422 uses this envelope:
 
 ```json
-{
-  "asset_id": "uuid",
-  "starts_on": "2026-10-10",
-  "ends_on": "2026-10-12"
-}
+{"error": {"code": "hold_expired", "message": "The request hold has expired.",
+           "details": {"hold_expires_at": "2026-11-02T13:00:00+00:00"},
+           "request_id": "req_…"}}
 ```
 
-The server verifies asset scope/city/status, trust tier, date availability, price, and deposit. It ignores any client price. Creating `pending` does not reserve against the current database exclusion constraint; confirmation is transactional and may return `409 asset_unavailable` if another booking wins.
+A 422 is FastAPI's validation body, `{"detail": [{"type", "loc", "msg", "ctx"?}]}`. The rejected `input` is removed, so submitted data is never echoed.
 
-### Booking state commands
+## 6. Error codes
 
-| Transition | Required conditions |
-|---|---|
-| `pending → confirmed` | Vendor/concierge approval plus provider-verified deposit collection |
-| `confirmed → active` | Provider-verified balance plus completed co-signed pickup |
-| `active → completed` | Completed co-signed return and no open dispute |
-| `active → disputed` | Authorized claim with reason/evidence |
-| `disputed → completed` | Authorized, audited resolution with financial instructions |
-
-Responses expose `allowed_actions`; the server remains authoritative.
-
-## 8. Payment APIs — planned, Paystack first
-
-Paystack is the first integration. Exact support for deposit custody/hold/release, per-booking accounts, splits/transfers, and refunds is **unresolved pending provider validation and Nigerian legal review**. The contract describes Vouch's needed behavior, not a claim that Paystack currently provides a custodial holding product.
-
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `POST` | `/bookings/{id}/payments/deposit` | Renter | Initialize/retrieve upfront deposit payment |
-| `POST` | `/bookings/{id}/payments/balance-account` | Renter/ops | Provision/retrieve per-booking balance account/reference |
-| `GET` | `/bookings/{id}/payments` | Party/ops | Safe transaction and reconciliation summary |
-| `POST` | `/admin/bookings/{id}/refunds` | Authorized ops | Create full/partial refund instruction with reason |
-| `POST` | `/admin/bookings/{id}/payouts` | Authorized ops/system gate | Initiate eligible vendor net payout |
-| `POST` | `/webhooks/paystack` | Paystack | Signed, idempotent event ingestion |
-
-Payment initialization and admin money movement require `Idempotency-Key`. The server calculates all amounts. Vendor payout response itemizes gross rental proceeds, vendor-side commission, approved adjustments/tax, and net amount; the commission does not get silently added to renter price.
-
-### Deposit initialization response
-
-```json
-{
-  "payment": {
-    "id": "uuid",
-    "type": "deposit",
-    "status": "pending",
-    "amount": "200000.00",
-    "currency": "NGN",
-    "provider": "paystack"
-  },
-  "authorization_url": "https://provider-hosted.example/...",
-  "expires_at": "2026-09-26T12:30:00Z"
-}
-```
-
-### Balance-account response
-
-```json
-{
-  "payment_id": "uuid",
-  "booking_id": "uuid",
-  "amount_due": "225000.00",
-  "currency": "NGN",
-  "account": {
-    "bank_name": "provider-supplied",
-    "account_name": "provider-supplied",
-    "account_number": "masked-or-authorized-value",
-    "reference": "booking-specific-reference",
-    "expires_at": "2026-10-10T14:00:00Z"
-  }
-}
-```
-
-Pickup cannot complete from a transfer screenshot or client callback; provider-verified settled status is required.
-
-## 9. Handover and evidence APIs — planned
-
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `POST` | `/bookings/{id}/handovers` | Booking party/ops | Create the unique pickup or return draft |
-| `GET` | `/bookings/{id}/handovers/{direction}` | Party/ops | Read authorized handover |
-| `PATCH` | `/bookings/{id}/handovers/{direction}` | Party while draft | Update checklist/notes before completion |
-| `POST` | `/bookings/{id}/handovers/{direction}/evidence/uploads` | Party | Obtain restricted direct-upload target |
-| `POST` | `/bookings/{id}/handovers/{direction}/evidence` | Uploader | Finalize metadata/hash after upload and scan |
-| `POST` | `/bookings/{id}/handovers/{direction}/sign` | Correct party | Sign current handover version |
-
-Create request:
-
-```json
-{
-  "direction": "return",
-  "condition_checklist": {
-    "schema_version": 1,
-    "items": [{"key": "body", "condition": "good", "notes": "No new damage"}]
-  },
-  "notes": null
-}
-```
-
-Signing requires `If-Match`, explicit affirmation, and authenticated signer context:
-
-```json
-{"affirmed": true}
-```
-
-The server derives vendor/renter side from the authenticated user's relationship to the booking. It records signer ID and server timestamp. Completion occurs only when both signatures apply to the same current version and required scanned evidence exists. Any material change after one signature invalidates that signature and requires re-signing. A completed record is immutable; corrections append a dispute/audit record.
-
-Pickup completion additionally requires verified balance status. Return completion can make payout eligible only if no dispute or reconciliation hold exists.
-
-## 10. Dispute APIs — planned
-
-| Method | Path | Actor | Purpose |
-|---|---|---|---|
-| `POST` | `/bookings/{id}/disputes` | Booking party/ops | Open claim with controlled reason and evidence references |
-| `GET` | `/bookings/{id}/disputes` | Party/ops | Read role-appropriate status |
-| `POST` | `/admin/disputes/{id}/resolve` | Authorized ops | Record reasoned disposition and financial instructions |
-
-Resolution requires privileged re-authentication/segregated role as operations mature, an idempotency key, reason, evidence summary, and explicit deposit/payout instructions. It does not directly claim that the platform owns or holds funds.
-
-## 11. Admin/concierge APIs — planned
-
-Phase 0 uses these gates before automation:
-
-| Method | Path | Purpose |
+| Status | `code` | Meaning |
 |---|---|---|
-| `GET` | `/admin/queues/listings` | Listings awaiting review |
-| `GET` | `/admin/queues/bookings` | Approval/deposit/pickup/return exceptions |
-| `GET` | `/admin/queues/reconciliation` | Provider/domain mismatches |
-| `GET` | `/admin/queues/payouts` | Eligible, held, failed payouts |
-| `POST` | `/admin/bookings/{id}/hold` | Place reasoned payout/deposit hold |
-| `POST` | `/admin/bookings/{id}/release-hold` | Remove hold with reason |
-| `POST` | `/admin/reconciliation/{id}/resolve` | Document reconciled outcome |
-| `GET` | `/admin/audit-events` | Search authorized audit history |
+| 400 | `invalid_request` | The input is well-formed but not acceptable: bad date range, a start in the past, too long or too far ahead, fulfilment not offered, a claim without amount, description or evidence, too much evidence, a bad resolve decision |
+| 400 | `city_not_launched` | The `city` filter is not a launched city (unknown cities included) |
+| 400 | `invalid_cursor` | The pagination cursor cannot be decoded |
+| 401 | `unauthenticated` | Missing, bad or expired token; the token's user is missing, inactive, deleted or has another role; any failed OTP verify. Sent with `WWW-Authenticate: Bearer`. |
+| 401 | `invalid_signature` | The webhook's `X-Vouch-Signature` is missing or wrong |
+| 403 | `forbidden` | Authenticated, but this role may not use the route or action |
+| 404 | `resource_not_found` | Unknown or hidden: an asset that is not public, a booking the caller is not party to, an unknown webhook provider |
+| 409 | `invalid_transition` | The booking cannot take this event from its status, or this actor may not send it. `details: {from, event}` |
+| 409 | `tier_insufficient` | The renter's effective trust tier is below the item's minimum. `details: {required, effective}` |
+| 409 | `vendor_approval_required` | A tier-3 item: the vendor must approve the renter before accepting |
+| 409 | `approval_not_required` | `/approve` on an item that does not need it |
+| 409 | `dates_blocked` | The vendor has blocked some of the dates |
+| 409 | `dates_unavailable` | Another live booking holds overlapping dates |
+| 409 | `renter_restricted` | The renter's account is restricted, inactive or deleted |
+| 409 | `self_booking` | The renter is the item's own vendor |
+| 409 | `hold_expired` | The 4-hour request hold has passed. `details: {hold_expires_at}` |
+| 409 | `amount_mismatch` | The payment is not the amount the booking expects |
+| 409 | `cancel_window_closed` | A renter cancellation after 00:00 on `starts_on`. `details: {cancel_before}` |
+| 409 | `handover_signed` | Both parties have signed the pickup; the booking can no longer be cancelled or reported as a no-show |
+| 409 | `handover_incomplete` | Both parties have not signed the handover yet |
+| 409 | `handover_already_signed` | The caller's side of this handover record is already signed |
+| 409 | `claim_window_closed` | The 24-hour claim window has passed |
+| 409 | `reason_required` | A vendor cancellation, a resolve or a mark-lost needs a reason |
+| 409 | `no_show_too_early` | A no-show reported before 00:00 on `starts_on`. `details: {report_from}` |
+| 409 | `vendor_signed_handover` | The vendor has signed the pickup, so a no-show cannot be reported |
+| 413 | `payload_too_large` | The request body is over `VOUCH_MAX_REQUEST_BYTES` |
+| 422 | (FastAPI `detail` list) | The request fails schema validation (types, lengths, unknown fields, money not a string, bad phone or base64) |
+| 429 | `rate_limited` | Too many OTP requests for the phone; `Retry-After` gives the wait in seconds |
+| 502 | `payment_provider_error` | The payment provider could not open the renter's account on accept; nothing changed, so retry |
+| 503 | `otp_unavailable` | No OTP sender is configured |
+| 503 | `kyc_unavailable` | No KYC provider is configured |
+| 503 | `payment_unavailable` | No payment provider is configured, so a booking cannot be accepted |
 
-Every admin command writes an audit event; manual money movement requires two-person approval in Phase 0. The precise RBAC split is planned and must be implemented before live funds.
+`GET /health/ready` answers 503 with its own readiness body, not the envelope. An unexpected server error is a plain 500.
 
-## 12. Webhook contract
+## 7. Providers in each environment
 
-### 12.1 Common processing rules
+M2 ships **fakes only** for the OTP sender, the KYC provider and the payment provider (`VOUCH_OTP_SENDER`, `VOUCH_KYC_PROVIDER` and `VOUCH_PAYMENT_PROVIDER` = `fake`). In `development` and `test`, the fakes are used when these settings are unset. In `staging` and `production` the fakes are refused at start-up, and nothing else exists yet, so those environments answer **503** for OTP requests (`otp_unavailable`), KYC (`kyc_unavailable`) and accepting a booking (`payment_unavailable`), until real adapters land.
 
-1. Receive the raw body over HTTPS with a strict size limit.
-2. Verify the provider's signature using its documented algorithm and secret before parsing trusted fields.
-3. Derive a stable deduplication key from provider event ID; if unavailable, use a documented provider/object/event key.
-4. Insert/read `webhook_events` under a uniqueness constraint.
-5. Apply allowed state transitions transactionally; never trust event ordering.
-6. Return `2xx` for already successfully processed duplicates and recognized irrelevant events.
-7. Return the provider-required retryable failure status only when processing was not durably accepted; invalid signatures return `401`/`400` and are security-logged.
-8. Reconcile uncertain events through provider verification APIs/background jobs.
-9. Redact stored payloads and logs; use event/reference IDs for diagnostics.
+## 8. Wording
 
-A duplicate must produce **no duplicate payment, refund, payout, booking transition, notification, or audit decision effect**. Event handlers compare amount, currency, reference, booking, and expected state before applying effects.
+API fields and copy say **deposit hold** and **damage contribution**. The damage contribution is an optional Vouch-run charge held in the `protection_pool` account (A4). No third-party product backs it, and its rate and terms remain placeholders pending legal advice (A8).
 
-### 12.2 `POST /api/v1/webhooks/paystack`
+## 9. Not in M2
 
-No user auth; provider signature required. Event mapping is adapter-specific. Examples of normalized effects:
-
-- successful deposit collection can satisfy one confirmation gate;
-- successful booking-balance collection can satisfy one pickup gate;
-- successful refund updates the transaction/ledger but only according to approved refund instruction;
-- successful transfer marks payout paid only when reference, amount, recipient, and eligibility match;
-- reversals/failures create reconciliation exceptions and must not silently roll lifecycle states backward.
-
-### 12.3 `POST /api/v1/webhooks/kyc/{provider}`
-
-Only configured providers (`smile_id` or `dojah` after selection) are accepted. Signature/IP controls follow provider capabilities. A verified result updates an attempt and profile summary only when required checks and references match. Duplicate or stale results are recorded safely without lowering/raising tier contrary to policy. Raw biometric data is not retained by default.
-
-## 13. Lifecycle response semantics
-
-| Resource | Current enum/state | API requirement |
-|---|---|---|
-| Booking | `pending/confirmed/active/completed/cancelled/disputed` | Commands enforce the transition table; arbitrary status PATCH is forbidden |
-| KYC | `pending/submitted/verified/failed` | Provider-neutral summary; attempts planned |
-| Payment | `pending/authorized/captured/failed/refunded` | Provider webhook/reconciliation authoritative |
-| Deposit policy | `held/released/claimed` persisted on deposit payment rows | Transition commands require provider reconciliation and approved disposition |
-| Payout policy | `pending/eligible/paid` persisted on payout rows | Eligibility requires completed co-signed return and no dispute/reconciliation hold |
-| Handover | `draft/vendor_signed/renter_signed/completed` | Sign commands, not arbitrary status writes |
-
-## 14. Audit, retention, and privacy contract
-
-- APIs collect only fields necessary for the documented purpose and expose only role-appropriate data.
-- KYC provider references/results, handover evidence, location, and financial details are restricted data.
-- Evidence download uses short-lived signed URLs; API audit logs record authorized access.
-- Mutation responses carry request/correlation IDs. State transitions, admin reads of sensitive evidence, overrides, money movement, webhook effects, and retention actions produce audit events.
-- Data subject requests use a separately authenticated process; APIs must respect financial/fraud/dispute/legal retention and legal holds.
-- Exact retention periods, lawful bases, notices, and cross-border safeguards are **unresolved pending NDPA counsel/DPO review**.
-
-## 15. Rate limiting and abuse controls
-
-Stricter limits apply to OTP/challenges, KYC initiation, evidence uploads, booking creation, payment initialization, and webhook endpoints. Limits are keyed using safe combinations of account, device/session, phone hash, IP/network, and provider as appropriate. Public search receives general throttling. Responses use `429` and `Retry-After` without exposing fraud rules.
-
-## 16. Product and legal wording constraints
-
-No endpoint offers third-party cover or `coverage` in v1. The optional damage contribution (Milestone 2, renamed from `protection_waiver`) is the only damage product, and its terms remain subject to legal approval. Public and API copy says **deposit hold** and **damage contribution**. The final licensed funds flow, provider product names, refund/claim rights, commission/tax treatment, and contractual language remain unresolved until counsel/provider approval.
+- An HTTP route for marking a booking lost (`mark_lost` exists as an admin service transition).
+- Refund execution and payout initiation through the provider. Refund rows stay `pending` for ops, and only the provider's `payout_completed` webhook is handled.
+- Vendor listing management (create, edit, availability) and admin review endpoints. Listings and blocks are written by operations directly in M2.
+- `Idempotency-Key` on commands, `ETag` / `If-Match` versioning, booking lists and timelines, KYC webhooks, private evidence uploads, and a transactional outbox.
+- Real Paystack, KYC and SMS adapters, the web client and the WhatsApp adapter.
