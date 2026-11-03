@@ -14,6 +14,16 @@ Fixtures
 ``conn``
     An asyncpg connection to the test database. Request it after ``migrated_db`` or
     ``db_at_0002`` so it sees the prepared schema.
+``db_session``
+    An ``AsyncSession`` on a fresh ``head`` schema, inside one outer transaction
+    that is rolled back at teardown (the append-only tables cannot be truncated).
+    ``SET CONSTRAINTS ALL IMMEDIATE`` runs first, so the deferred ledger balance
+    trigger fires at the end of each INSERT statement instead of at a COMMIT that
+    never comes. ``session.commit()`` inside a test only releases a SAVEPOINT.
+    Row factories for it live in ``tests/postgres/factories.py``.
+``session_factory``
+    An ``async_sessionmaker`` on a fresh ``head`` schema whose sessions really
+    commit, for code that owns its transactions (timers, races).
 
 Every fixture that moves the schema leaves the database at ``head`` when it finishes,
 so later test files still work.
@@ -32,6 +42,8 @@ import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 
@@ -164,3 +176,38 @@ async def conn() -> AsyncIterator[asyncpg.Connection]:
         yield connection
     finally:
         await connection.close()
+
+
+@pytest.fixture
+async def db_session(migrated_db: str) -> AsyncIterator[AsyncSession]:
+    """A session whose work is rolled back at teardown, with constraints immediate."""
+    assert DATABASE_URL is not None
+    engine = create_async_engine(DATABASE_URL)
+    try:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            await connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+            session = AsyncSession(
+                bind=connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                yield session
+            finally:
+                await session.close()
+                if outer.is_active:
+                    await outer.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def session_factory(migrated_db: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Sessions that really commit, on a fresh ``head`` schema."""
+    assert DATABASE_URL is not None
+    engine = create_async_engine(DATABASE_URL)
+    try:
+        yield async_sessionmaker(bind=engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()

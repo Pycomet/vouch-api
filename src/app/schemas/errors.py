@@ -107,3 +107,54 @@ class CursorDecodeError(InvalidRequestError):
 
     code = "invalid_cursor"
     message = "The pagination cursor is invalid or has expired."
+
+
+class InvalidTransition(VouchAPIError):
+    """Raised when a booking event is not allowed from its current status.
+
+    Also raised when the actor's role may not send the event, or the actor is not
+    a party to the booking. Returns 409 ``invalid_transition`` with details
+    ``{"from": <status>, "event": <event>}``.
+    """
+
+    status_code = 409
+    code = "invalid_transition"
+    message = "This booking cannot make that transition."
+
+    def __init__(self, from_status: str | None, event: str) -> None:
+        super().__init__(details={"from": from_status, "event": event})
+
+
+_GUARD_MESSAGES = {
+    "tier_insufficient": "Your trust tier does not allow booking this item.",
+    "vendor_approval_required": "The vendor must approve this renter before accepting.",
+    "dates_blocked": "The vendor has blocked some of these dates.",
+    "dates_unavailable": "These dates are no longer available.",
+    "renter_restricted": "This account cannot make bookings right now.",
+    "hold_expired": "The request hold has expired.",
+    "amount_mismatch": "The amount does not match the booking.",
+    "self_booking": "You cannot book your own item.",
+    "cancel_window_closed": "This booking can no longer be cancelled.",
+    "claim_window_closed": "The claim window has closed.",
+    "reason_required": "A reason is required.",
+    "handover_incomplete": "Both parties have not signed the handover yet.",
+    "handover_signed": "The item has been handed over; the booking can no longer be cancelled.",
+}
+
+
+class BookingGuardFailed(VouchAPIError):
+    """Raised when a legal booking transition fails one of its guards.
+
+    Returns 409 with the guard's own code (``tier_insufficient``,
+    ``dates_unavailable``, ``hold_expired``, ...).
+    """
+
+    status_code = 409
+    code = "booking_guard_failed"
+    message = "The booking cannot proceed."
+
+    def __init__(self, code: str, details: dict | None = None) -> None:
+        if code not in _GUARD_MESSAGES:
+            raise ValueError(f"unknown booking guard code: {code!r}")
+        super().__init__(_GUARD_MESSAGES[code], details)
+        self.code = code

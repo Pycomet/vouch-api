@@ -23,6 +23,12 @@ def _safe_request_id(header_value: str | None) -> str:
     return str(uuid4())
 
 
+def get_logger(name: str) -> logging.Logger:
+    """A project logger under the ``vouch`` namespace (``vouch.<name>``)."""
+
+    return logging.getLogger(f"vouch.{name}")
+
+
 def configure_logging(debug: bool = False) -> None:
     """Configure a predictable process-wide logging baseline."""
 
