@@ -77,6 +77,17 @@ def test_cors_allows_only_configured_web_origin(client: TestClient) -> None:
     assert response.headers["access-control-allow-credentials"] == "true"
 
 
+def test_cors_exposes_the_request_id_and_retry_after(client: TestClient) -> None:
+    """A web client must read Retry-After (OTP 429) as well as X-Request-ID."""
+    response = client.get("/api/v1/health/live", headers={"Origin": "https://app.vouch.test"})
+
+    exposed = {
+        name.strip().lower()
+        for name in response.headers["access-control-expose-headers"].split(",")
+    }
+    assert {"x-request-id", "retry-after"} <= exposed
+
+
 def test_production_hides_interactive_api_documentation() -> None:
     settings = Settings(
         _env_file=None,

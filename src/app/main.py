@@ -103,7 +103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-        expose_headers=["X-Request-ID"],
+        expose_headers=["X-Request-ID", "Retry-After"],
     )
     application.add_exception_handler(VouchAPIError, _error_response)  # type: ignore[arg-type]
     application.add_exception_handler(RequestValidationError, _validation_response)  # type: ignore[arg-type]
