@@ -368,3 +368,60 @@ async def test_complete_with_no_deposit_writes_no_row(db_session, clock, notifie
     reloaded = await db_session.get(Booking, booking.id, populate_existing=True)
     assert reloaded.status == BookingStatus.completed
     assert await _refunds(db_session, booking.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Every refund row's ledger groups add up to the row (fold-in)
+# ---------------------------------------------------------------------------
+
+
+async def _linked_cash(session: AsyncSession, payment_id: uuid.UUID) -> Decimal:
+    """Platform cash credited minus debited by the groups linked to ``payment_id``."""
+    rows = await session.execute(
+        select(LedgerEntry.direction, LedgerEntry.amount).where(
+            LedgerEntry.payment_id == payment_id,
+            LedgerEntry.account == LedgerAccount.platform_cash,
+        )
+    )
+    return sum(
+        (amount if direction == "cr" else -amount for direction, amount in rows.all()), D("0")
+    )
+
+
+async def _cancel_paid(session, clock, notifier, actor_of, **payload) -> Booking:
+    booking = await _booking(session, BookingStatus.accepted)
+    payment = await create_payment(session, booking, type=PaymentType.booking, amount=TOTAL)
+    await _transition(
+        session,
+        booking,
+        Actor.system(),
+        BookingEvent.payment_captured,
+        clock,
+        notifier,
+        amount=TOTAL,
+        payment_id=payment.id,
+    )
+    await _transition(
+        session, booking, actor_of(booking), BookingEvent.cancel, clock, notifier, **payload
+    )
+    return booking
+
+
+async def test_renter_cancel_links_the_fee_group_to_the_refund(db_session, clock, notifier) -> None:
+    booking = await _cancel_paid(db_session, clock, notifier, _renter)
+
+    [refund] = await _refunds(db_session, booking.id)
+    assert await _group_payment_ids(db_session, booking.id, "cancellation_fee") == {refund.id}
+    # Everything paid went back, less the fee kept: exactly the refund row.
+    assert refund.amount < TOTAL
+    assert await _linked_cash(db_session, refund.id) == refund.amount
+
+
+async def test_vendor_cancel_refund_groups_add_up_to_the_refund(
+    db_session, clock, notifier
+) -> None:
+    booking = await _cancel_paid(db_session, clock, notifier, _vendor, reason="Kit broken")
+
+    [refund] = await _refunds(db_session, booking.id)
+    assert refund.amount == TOTAL
+    assert await _linked_cash(db_session, refund.id) == refund.amount

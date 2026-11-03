@@ -801,7 +801,15 @@ async def _cancel_paid(ctx: _Context) -> _Outcome:
         vendor_part, platform_part = cancellation_fee_split(
             fee, Decimal(booking.price_snapshot["cancellation_fee_vendor_share"])
         )
-        await _post(ctx, cancellation_fee_postings(vendor_part, platform_part), "cancellation_fee")
+        # The fee is kept out of the refund row's money: link it there, so the cash
+        # that row's groups move out (everything paid, less the fee) is its amount.
+        refund_row = after["refund_payment"]
+        await _post(
+            ctx,
+            cancellation_fee_postings(vendor_part, platform_part),
+            "cancellation_fee",
+            None if refund_row is None else refund_row["id"],
+        )
         after["cancellation_fee"] = {
             "amount": fee,
             "vendor_part": vendor_part,

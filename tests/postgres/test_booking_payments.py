@@ -340,7 +340,8 @@ async def test_refund_ledger_groups_point_at_the_refund_row(db_session, clock, n
     by_memo = dict(rows.all())
     for memo in ("cancel_deposit_refund", "cancel_contribution_refund", "cancel_rental_refund"):
         assert by_memo[memo] == refund.id
-    assert by_memo["cancellation_fee"] is None
+    # The fee is kept out of that refund, so its group links to the refund row too.
+    assert by_memo["cancellation_fee"] == refund.id
 
 
 async def test_vendor_cancel_records_a_full_refund(db_session, clock, notifier) -> None:

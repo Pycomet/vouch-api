@@ -1030,3 +1030,77 @@ async def test_refused_capture_refund_tells_the_renter_and_ops(
     _assert_told(notifier, booking, D("1000.00"), "amount_mismatch", event_id, "request_again")
     # The refused transition sent nothing of its own.
     assert notifier.templates() == ["payment.refunded", "ops.payment_refunded"]
+
+
+# ---------------------------------------------------------------------------
+# Ledger <-> payment row linkage (fold-in)
+# ---------------------------------------------------------------------------
+
+
+async def _linked_cash(session, payment_id, memos=None) -> tuple[Decimal, Decimal]:
+    """(credits, debits) of platform cash in the groups linked to ``payment_id``."""
+    query = select(LedgerEntry.direction, func.sum(LedgerEntry.amount)).where(
+        LedgerEntry.payment_id == payment_id,
+        LedgerEntry.account == LedgerAccount.platform_cash,
+    )
+    if memos is not None:
+        query = query.where(LedgerEntry.memo.in_(memos))
+    rows = dict((await session.execute(query.group_by(LedgerEntry.direction))).all())
+    return D(rows.get("cr", 0)), D(rows.get("dr", 0))
+
+
+async def _assert_linkage(session, booking_id) -> None:
+    """The invariant: each captured ``booking`` row is debited (cash in) exactly what
+    arrived on it; each refund row is credited (cash out) exactly its amount. A
+    second payment's own receipt (``unapplied_payment``) belongs to its refund row,
+    since no other row recorded that money, so it is not counted as cash out."""
+    for paid in await _payments(session, booking_id, PaymentType.booking):
+        _, debits = await _linked_cash(session, paid.id)
+        assert debits == paid.amount, paid.id
+    for refund in await _payments(session, booking_id, PaymentType.refund):
+        credits, debits = await _linked_cash(session, refund.id)
+        receipt_cr, receipt_dr = await _linked_cash(session, refund.id, ["unapplied_payment"])
+        assert receipt_cr == 0
+        assert credits - (debits - receipt_dr) == refund.amount, refund.metadata_
+        if refund.metadata_["reason"] == "duplicate_payment":
+            assert receipt_dr == refund.amount
+        else:
+            assert receipt_dr == 0
+
+
+async def test_duplicate_receipt_links_to_its_refund_row(
+    client, db_session, clock, notifier, provider
+) -> None:
+    booking_id, reference = await _accepted(db_session, clock, notifier, provider)
+    await _send(client, provider, _event(provider, booking_id, reference))
+    await _send(
+        client,
+        provider,
+        _event(provider, booking_id, reference, D("50000.00"), provider_event_id="evt_again"),
+    )
+
+    [paid] = await _payments(db_session, booking_id, PaymentType.booking)
+    [refund] = await _payments(db_session, booking_id, PaymentType.refund)
+    links = await db_session.execute(
+        select(LedgerEntry.memo, LedgerEntry.payment_id).where(LedgerEntry.booking_id == booking_id)
+    )
+    assert dict(links.all()) == {
+        "payment_captured": paid.id,
+        "unapplied_payment": refund.id,
+        "unapplied_payment_refund": refund.id,
+    }
+    await _assert_linkage(db_session, booking_id)
+
+
+async def test_mismatch_and_late_refund_rows_add_up(
+    client, db_session, clock, notifier, provider
+) -> None:
+    mismatched, reference = await _accepted(db_session, clock, notifier, provider)
+    await _send(client, provider, _event(provider, mismatched, reference, D("10.00")))
+    late, late_reference = await _accepted(db_session, clock, notifier, provider)
+    await _withdraw(db_session, late, clock, notifier)
+    await db_session.commit()
+    await _send(client, provider, _event(provider, late, late_reference))
+
+    for booking_id in (mismatched, late):
+        await _assert_linkage(db_session, booking_id)

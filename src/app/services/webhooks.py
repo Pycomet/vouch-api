@@ -454,19 +454,31 @@ async def _refund_late(
 
 
 async def _hold_and_return(
-    ctx: _Context, booking: Booking, received_on: Payment, amount: Decimal, reason: str
+    ctx: _Context,
+    booking: Booking,
+    received_on: Payment,
+    amount: Decimal,
+    reason: str,
+    *,
+    receipt_on_refund: bool = False,
 ) -> Payment:
     """Ledger money that pays for nothing, then give it back (the controller ruling:
     money never moves without a ledger entry).
 
-    ``unapplied_payment`` (linked to the payment it arrived on), a pending refund
-    row for ``amount``, then ``unapplied_payment_refund`` (linked to the refund).
-    Every booking account nets to 0. Returns the refund row.
+    A pending refund row for ``amount`` (``refund_of`` ``received_on``), then
+    ``unapplied_payment`` and ``unapplied_payment_refund`` (linked to the refund).
+    The receipt is linked to the row that recorded the money: ``received_on`` when
+    that row now holds what arrived (a wrong amount), else, with
+    ``receipt_on_refund`` (a second payment into a captured account, which no row
+    of its own records), the refund row. So each captured ``booking`` row is
+    debited in cash exactly its amount, and each refund row credited exactly its
+    amount. Every booking account nets to 0. Returns the refund row.
     """
-    held = unapplied_payment_postings(amount)
-    await _post(ctx, booking, held, "unapplied_payment", received_on.id)
     refund = await record_refund(ctx.session, received_on, amount, reason=reason)
     assert refund is not None  # the event amount is > 0 (parse_event)
+    held = unapplied_payment_postings(amount)
+    receipt_id = refund.id if receipt_on_refund else received_on.id
+    await _post(ctx, booking, held, "unapplied_payment", receipt_id)
     await _post(ctx, booking, reversal_postings(held), "unapplied_payment_refund", refund.id)
     return refund
 
@@ -516,9 +528,12 @@ async def _refund_duplicate(
     """A second payment into an account already captured: held and returned.
 
     The captured row is left as it is; the refund row records the money received
-    (``refund_of`` the captured row, the event id in ``metadata``).
+    (``refund_of`` the captured row, the event id in ``metadata``), and both its
+    ledger groups link to it.
     """
-    refund = await _hold_and_return(ctx, booking, payment, event.amount, "duplicate_payment")
+    refund = await _hold_and_return(
+        ctx, booking, payment, event.amount, "duplicate_payment", receipt_on_refund=True
+    )
     refund.metadata_ = {**(refund.metadata_ or {}), "provider_event_id": event.provider_event_id}
     await ctx.session.flush()
     await _audit_payment(
