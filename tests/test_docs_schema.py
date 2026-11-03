@@ -50,6 +50,26 @@ def test_schema_doc_lists_every_table() -> None:
     assert tables == entities
 
 
+def _error_codes() -> set[str]:
+    from app.schemas import errors
+
+    codes: set[str] = set()
+    pending = [errors.VouchAPIError]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        codes.add(cls.code)
+    codes.update(errors._GUARD_MESSAGES)
+    # The base classes' defaults: never sent (a guard always has its own code).
+    return codes - {errors.VouchAPIError.code, errors.BookingGuardFailed.code}
+
+
+def test_api_contract_lists_every_error_code() -> None:
+    contract = (ROOT / "docs" / "API_CONTRACT.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"^\| \d{3} \| `([a-z_]+)` \|", contract, flags=re.MULTILINE))
+    assert _error_codes() - documented == set()
+
+
 def test_erd_has_every_table_and_foreign_key() -> None:
     text = ERD_SOURCE.read_text(encoding="utf-8")
     entities = set(re.findall(r"^    ([a-z_]+) \{$", text, flags=re.MULTILINE))
