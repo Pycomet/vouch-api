@@ -32,7 +32,7 @@ from sqlalchemy import func, select
 from app.api.deps import get_clock, get_notifier
 from app.core.clock import FrozenClock
 from app.core.config import Environment, Settings
-from app.db.models import Booking, LedgerAccount, LedgerEntry, Payment
+from app.db.models import AuditEvent, Booking, LedgerAccount, LedgerEntry, Payment
 from app.db.models.payment import PaymentStatus, PaymentType
 from app.db.models.user import RenterRole
 from app.main import create_app
@@ -113,6 +113,17 @@ async def _whole_ledger_balanced(session_factory) -> bool:
         )
         sums = {direction: D(total) for direction, total in rows.all()}
     return sums["dr"] == sums["cr"] and sums["dr"] > 0
+
+
+async def _shown(http: AsyncClient, booking_id: uuid.UUID, headers) -> dict:
+    """The renter's GET /bookings/{id}."""
+    response = await http.get(f"{API}/bookings/{booking_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _statuses(line: dict) -> tuple[str, str, str]:
+    return (line["deposit"]["status"], line["contribution"]["status"], line["rental"]["status"])
 
 
 async def _login(http: AsyncClient, sender: FakeOtpSender, phone: str, **extra) -> dict[str, str]:
@@ -219,8 +230,14 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
         accepted = await http.post(f"{API}/bookings/{booking_id}/accept", headers=vendor_headers)
         assert accepted.status_code == 200, accepted.text
         assert accepted.json()["status"] == "accepted"
-        shown = (await http.get(f"{API}/bookings/{booking_id}", headers=renter)).json()
+        shown = await _shown(http, booking_id, renter)
         instructions = shown["payment_instructions"]
+        assert instructions is not None
+        line = shown["money_line"]
+        assert _statuses(line) == ("due", "due", "due")
+        assert line["next"]["label"].startswith("Payment due ")
+        assert D(line["next"]["amount_due"]) == D(instructions["amount"])
+        assert "returned_payments" not in line
 
         async with session_factory() as session:
             snapshot = (await session.get(Booking, booking_id)).price_snapshot
@@ -248,8 +265,15 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
             ),
         )
         assert paid == {"status": "processed", "processing_error": None}
-        status = (await http.get(f"{API}/bookings/{booking_id}", headers=renter)).json()["status"]
-        assert status == "confirmed"
+        shown = await _shown(http, booking_id, renter)
+        assert shown["status"] == "confirmed"
+        assert shown["payment_instructions"] is None
+        line = shown["money_line"]
+        assert _statuses(line) == ("held", "received", "received")
+        assert line["next"] == {
+            "label": f"Handover {FIRST_START:%a} {FIRST_START.day} {FIRST_START:%b}",
+            "amount_due": "0.00",
+        }
         balances = await _balances(session_factory, booking_id)
         assert balances[LedgerAccount.renter_deposit_liability] == d
         assert balances[LedgerAccount.protection_pool] == c
@@ -261,6 +285,9 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
         clock.advance(datetime.combine(FIRST_START, time(9), DEFAULT_NOW.tzinfo) - clock.now())
         await _sign(http, booking_id, "handover", vendor_headers)
         assert (await _sign(http, booking_id, "handover", renter))["status"] == "in_progress"
+        line = (await _shown(http, booking_id, renter))["money_line"]
+        assert _statuses(line) == ("held", "received", "received")
+        assert line["next"]["label"].startswith("Return by ")
         assert (await _balances(session_factory, booking_id))[
             LedgerAccount.renter_deposit_liability
         ] == d
@@ -270,6 +297,9 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
         clock.advance(timedelta(days=2))
         await _sign(http, booking_id, "return", renter)
         assert (await _sign(http, booking_id, "return", vendor_headers))["status"] == "returned"
+        line = (await _shown(http, booking_id, renter))["money_line"]
+        assert _statuses(line) == ("held", "received", "received")
+        assert line["next"]["label"].startswith("Claim window closes ")
         returned = await _balances(session_factory, booking_id)
         assert returned[LedgerAccount.renter_deposit_liability] == d  # held until completion
         assert await _whole_ledger_balanced(session_factory)
@@ -280,8 +310,12 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
             session_factory, clock=clock, notifier=notifier, settings=settings
         )
         assert report.completed == 1 and report.failed == 0
-        status = (await http.get(f"{API}/bookings/{booking_id}", headers=renter)).json()["status"]
-        assert status == "completed"
+        shown = await _shown(http, booking_id, renter)
+        assert shown["status"] == "completed"
+        assert shown["payment_instructions"] is None
+        line = shown["money_line"]
+        assert _statuses(line) == ("released", "received", "received")
+        assert line["next"] == {"label": "Closed", "amount_due": "0.00"}
         balances = await _balances(session_factory, booking_id)
         assert balances[LedgerAccount.renter_deposit_liability] == D("0.00")
         # Completing releases only the deposit: the pool and the commission stay.
@@ -305,6 +339,9 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
             ),
         )
         assert payout == {"status": "processed", "processing_error": None}
+        line = (await _shown(http, booking_id, renter))["money_line"]
+        assert _statuses(line) == ("released", "received", "paid_out")
+        assert "refund" not in line and "returned_payments" not in line
 
     balances = await _balances(session_factory, booking_id)
     assert balances[LedgerAccount.vendor_payable] == D("0.00")
@@ -313,18 +350,46 @@ async def test_full_happy_path_no_network(session_factory, no_network) -> None:
     assert balances[LedgerAccount.platform_cash] == -(k + c)
     assert await _whole_ledger_balanced(session_factory)
     async with session_factory() as session:
-        rows = (
+        payment_rows = (
             await session.execute(
-                select(Payment.type, Payment.status, Payment.amount)
+                select(Payment.id, Payment.type, Payment.status, Payment.amount)
                 .where(Payment.booking_id == booking_id)
                 .order_by(Payment.created_at, Payment.id)
             )
         ).all()
-    assert rows == [
+    assert [(row.type, row.status, row.amount) for row in payment_rows] == [
         (PaymentType.booking, PaymentStatus.captured, d + c + r + f),
         (PaymentType.refund, PaymentStatus.pending, d),
         (PaymentType.payout, PaymentStatus.captured, r + f - k),
     ]
+    # Every step left its audit row, and nothing was flagged to ops.
+    async with session_factory() as session:
+        actions = set(
+            await session.scalars(
+                select(AuditEvent.action).where(
+                    AuditEvent.entity_id.in_([booking_id, *(row.id for row in payment_rows)])
+                )
+            )
+        )
+        kyc_actions = set(
+            await session.scalars(
+                select(AuditEvent.action).where(AuditEvent.entity == "kyc_profile")
+            )
+        )
+    assert {
+        "booking.requested",
+        "booking.accepted",
+        "booking.deposit_paid",
+        "booking.confirmed",
+        "booking.in_progress",
+        "booking.returned",
+        "booking.completed",
+        "deposit.released",
+        "payout.paid",
+    } <= actions
+    assert "kyc.verified" in kyc_actions
+    assert not [t for t in notifier.templates() if t.startswith("ops.")]
+
     # The database was reached (locally), and nothing else was.
     assert no_network
     assert all(
