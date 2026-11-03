@@ -1,0 +1,236 @@
+erDiagram
+    assets {
+        uuid id PK
+        uuid vendor_id FK
+        uuid catalogue_item_id FK
+        varchar name "null"
+        text description "null"
+        smallint category_id FK
+        varchar serial_number "null"
+        numeric_12_2 daily_rate
+        numeric_12_2 deposit_amount
+        boolean is_available
+        smallint city_id FK
+        text condition_notes "null"
+        text condition_grade "null"
+        jsonb included_accessories
+        numeric_12_2 weekend_rate "null"
+        numeric_12_2 weekly_rate "null"
+        jsonb fulfilment
+        listingstatus listing_status
+        integer minimum_trust_tier
+        uuid review_actor_id FK "null"
+        timestamptz reviewed_at "null"
+        text review_reason "null"
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz deleted_at "null"
+    }
+    audit_events {
+        bigint id PK
+        uuid actor_id FK "null"
+        text actor_role
+        text entity
+        uuid entity_id
+        text action
+        jsonb before "null"
+        jsonb after "null"
+        text reason "null"
+        text request_id "null"
+        timestamptz created_at
+    }
+    availability_windows {
+        uuid id PK
+        uuid asset_id FK
+        date starts_at
+        date ends_at
+        boolean is_blocked
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    bookings {
+        uuid id PK
+        uuid asset_id FK
+        uuid renter_id FK
+        uuid vendor_id FK
+        date starts_on
+        date ends_on
+        bookingstatus status
+        numeric_12_2 total_rental_fee
+        numeric_12_2 deposit_amount
+        text platform_note "null"
+        timestamptz cancelled_at "null"
+        varchar cancellation_reason "null"
+        timestamptz hold_expires_at "null"
+        timestamptz deposit_due_at "null"
+        timestamptz claim_window_ends_at "null"
+        timestamptz vendor_approved_at "null"
+        timestamptz at_risk_at "null"
+        jsonb price_snapshot
+        text fulfilment_choice
+        numeric_12_2 claim_amount "null"
+        text claim_description "null"
+        jsonb claim_evidence "null"
+        timestamptz claimed_at "null"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    catalogue_items {
+        uuid id PK
+        smallint category_id FK
+        text make
+        text model
+        text mount "null"
+        jsonb specs
+        char_1 replacement_value_band
+        text_array aliases
+        boolean is_active
+        timestamptz created_at
+    }
+    categories {
+        smallint id PK
+        text slug UK
+        text name
+        jsonb checklist_template
+        boolean is_active
+    }
+    cities {
+        smallint id PK
+        text slug UK
+        text name
+        boolean is_active
+    }
+    handover_records {
+        uuid id PK
+        uuid booking_id FK
+        handoverdirection direction
+        handoverstatus status
+        jsonb condition_checklist
+        uuid vendor_signer_id FK "null"
+        uuid renter_signer_id FK "null"
+        timestamptz vendor_signed_at "null"
+        timestamptz renter_signed_at "null"
+        jsonb evidence_urls "null"
+        numeric_9_6 location_lat "null"
+        numeric_9_6 location_lng "null"
+        text notes "null"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    kyc_profiles {
+        uuid id PK
+        uuid user_id FK, UK
+        varchar provider
+        varchar provider_reference UK "null"
+        kycstatus status
+        integer tier
+        varchar national_id_type "null"
+        timestamptz verified_at "null"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    ledger_entries {
+        bigint id PK
+        uuid booking_id FK "null"
+        uuid payment_id FK "null"
+        text account
+        char_2 direction
+        numeric_12_2 amount
+        char_3 currency
+        uuid txn_group
+        text memo "null"
+        timestamptz created_at
+    }
+    otp_challenges {
+        uuid id PK
+        text phone
+        text code_hash
+        timestamptz expires_at
+        smallint attempts
+        timestamptz consumed_at "null"
+        timestamptz created_at
+    }
+    payments {
+        uuid id PK
+        uuid booking_id FK
+        paymenttype type
+        paymentstatus status
+        numeric_12_2 amount
+        varchar currency
+        varchar provider
+        varchar provider_reference UK "null"
+        varchar provider_virtual_account "null"
+        varchar vendor_recipient_code "null"
+        varchar vendor_subaccount_code "null"
+        numeric_12_2 platform_fee "null"
+        varchar settlement_reference "null"
+        depositstatus deposit_status "null"
+        payoutstatus payout_status "null"
+        timestamptz authorized_at "null"
+        timestamptz captured_at "null"
+        timestamptz failed_at "null"
+        timestamptz deposit_held_at "null"
+        timestamptz deposit_released_at "null"
+        timestamptz deposit_claimed_at "null"
+        timestamptz payout_eligible_at "null"
+        timestamptz paid_at "null"
+        timestamptz settled_at "null"
+        jsonb metadata "null"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    users {
+        uuid id PK
+        varchar phone UK
+        varchar full_name "null"
+        varchar email UK "null"
+        renterrole role
+        boolean is_active
+        timestamptz phone_verified_at "null"
+        timestamptz restricted_at "null"
+        text restricted_reason "null"
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz deleted_at "null"
+    }
+    vendor_references {
+        uuid id PK
+        uuid renter_id FK
+        uuid vendor_id FK
+        uuid booking_id FK
+        timestamptz created_at
+    }
+    webhook_events {
+        bigint id PK
+        text provider
+        text provider_event_id
+        jsonb payload
+        boolean signature_ok
+        timestamptz received_at
+        timestamptz processed_at "null"
+        text processing_error "null"
+    }
+    assets ||--o{ availability_windows : "asset_id"
+    assets ||--o{ bookings : "asset_id"
+    bookings |o--o{ handover_records : "booking_id, renter_signer_id"
+    bookings |o--o{ handover_records : "booking_id, vendor_signer_id"
+    bookings |o--o{ ledger_entries : "booking_id"
+    bookings ||--o{ handover_records : "booking_id"
+    bookings ||--o{ payments : "booking_id"
+    bookings ||--o{ vendor_references : "booking_id, renter_id"
+    bookings ||--o{ vendor_references : "booking_id, vendor_id"
+    catalogue_items ||--o{ assets : "catalogue_item_id"
+    categories ||--o{ assets : "category_id"
+    categories ||--o{ catalogue_items : "category_id"
+    cities ||--o{ assets : "city_id"
+    payments |o--o{ ledger_entries : "payment_id"
+    users |o--o{ assets : "review_actor_id"
+    users |o--o{ audit_events : "actor_id"
+    users |o--o{ handover_records : "renter_signer_id"
+    users |o--o{ handover_records : "vendor_signer_id"
+    users ||--o{ assets : "vendor_id"
+    users ||--o{ bookings : "renter_id"
+    users ||--o{ bookings : "vendor_id"
+    users ||--o{ vendor_references : "renter_id"
+    users ||--o{ vendor_references : "vendor_id"
+    users ||--o| kyc_profiles : "user_id"
