@@ -7,7 +7,7 @@ This document describes the **current** schema: what migrations `0001` to `0005`
 Sources of truth, in order:
 
 1. `migrations/versions/0001_initial_schema.py` … `0005_otp_challenges.py` (what the database has);
-2. `src/app/db/models/` (the ORM; `tests/test_migrations*.py` checks it against the migrations, but that drift check does not catch foreign-key drift: see the `handover_records` drift note in §4);
+2. `src/app/db/models/` (the ORM; `tests/postgres/test_schema_drift.py` and the CI `alembic check` step compare it with a database migrated to head, and fail on any difference);
 3. the services that write the rows: `src/app/services/booking.py` (the `_TRANSITIONS` registry), `money.py` (ledger recipes), `payments.py`, `webhooks.py` and `money_line.py`.
 
 The spec is [`docs/specs/M2.md`](specs/M2.md). Where it differs from the code, [`docs/specs/M2-amendments.md`](specs/M2-amendments.md) (A1–A18) wins, and this document follows the amendments.
@@ -327,7 +327,6 @@ The pickup and return checklists, with each party's signature.
 - PK `handover_records_pkey (id)`; UNIQUE `uq_handover_records_booking_direction (booking_id, direction)` (at most one pickup and one return per booking); index `ix_handover_records_booking_id`.
 - FKs: `handover_records_booking_id_fkey (booking_id) → bookings(id)`, `handover_records_renter_signer_id_fkey (renter_signer_id) → users(id)`, and the composite `fk_handover_records_booking_vendor (booking_id, vendor_signer_id) → bookings(id, vendor_id)` and `fk_handover_records_booking_renter (booking_id, renter_signer_id) → bookings(id, renter_id)`. A signer must be that booking's own party.
 - CHECK `ck_handover_records_completed_requirements`: `completed` needs both signer ids, both signing times and a non-empty JSON array of evidence URLs.
-- Drift note: the ORM also declares a plain FK `vendor_signer_id → users(id)`, which the migrations never created (0001 creates only the renter one). The composite FK already ties `vendor_signer_id` to `bookings.vendor_id`, which references `users`. The ERD, generated from the ORM, shows the extra edge.
 - A side that has signed is final (`handover_already_signed`). When both sides have signed, the record is `completed` and the booking event `handover_completed` (pickup) or `return_completed` (return) fires in the same transaction.
 
 ### `payments`

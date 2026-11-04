@@ -76,14 +76,19 @@ def test_completed_handover_requires_signers_timestamps_and_evidence() -> None:
 
 
 def test_handover_signer_ids_reference_users() -> None:
+    """Each signer is tied to its booking party; only the renter also has a plain FK.
+
+    The migrations never created a plain ``vendor_signer_id -> users(id)`` FK, so
+    the model does not declare one (M3a §7.3, A19): the composite FK to
+    ``bookings(id, vendor_id)`` already ties the signer to a user.
+    """
     table = _table("handover_records")
-    expected_booking_target = {
-        "vendor_signer_id": "bookings.vendor_id",
-        "renter_signer_id": "bookings.renter_id",
+    expected = {
+        "vendor_signer_id": {"bookings.vendor_id"},
+        "renter_signer_id": {"users.id", "bookings.renter_id"},
     }
-    for column_name in ("vendor_signer_id", "renter_signer_id"):
-        targets = {fk.target_fullname for fk in table.c[column_name].foreign_keys}
-        assert targets == {"users.id", expected_booking_target[column_name]}
+    for column_name, targets in expected.items():
+        assert {fk.target_fullname for fk in table.c[column_name].foreign_keys} == targets
 
 
 def test_handover_signers_reference_booking_parties() -> None:

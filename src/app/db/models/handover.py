@@ -59,10 +59,10 @@ class HandoverRecord(TimestampMixin, Base):
         server_default=HandoverStatus.draft.value,
     )
     condition_checklist: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    vendor_signer_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=True,
-    )
+    # No plain FK to users here: the migrations never created one, and the
+    # composite fk_handover_records_booking_vendor (booking_id, vendor_signer_id)
+    # -> bookings(id, vendor_id) already ties the signer to a user (M3a A19).
+    vendor_signer_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     renter_signer_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id"),
         nullable=True,
@@ -84,12 +84,6 @@ class HandoverRecord(TimestampMixin, Base):
         "Booking",
         foreign_keys=[booking_id],
         back_populates="handover_records",
-        lazy="raise",
-    )
-    vendor_signer: Mapped[User | None] = relationship(  # type: ignore[name-defined]  # noqa: F821
-        "User",
-        foreign_keys=[vendor_signer_id],
-        back_populates="handovers_signed_as_vendor",
         lazy="raise",
     )
     renter_signer: Mapped[User | None] = relationship(  # type: ignore[name-defined]  # noqa: F821

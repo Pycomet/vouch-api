@@ -48,5 +48,15 @@ jobs:
       - name: Run lint
         run: ruff check .
 
+      - name: Migrate the database to head
+        env:
+          VOUCH_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/vouch_test
+        run: alembic upgrade head
+
+      - name: Check the models match the migrations
+        env:
+          VOUCH_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/vouch_test
+        run: alembic check
+
       - name: Run tests with coverage
         run: pytest --cov=app --cov-report=term-missing

@@ -18,10 +18,9 @@ pytestmark = pytest.mark.skipif(
     reason="VOUCH_TEST_DATABASE_URL is required for live PostgreSQL checks",
 )
 
-# Known, accepted differences. Only this one: the ORM declares an FK on
-# handover_records.vendor_signer_id that the older migration never created; adding
-# it is outside Step 2.
-ALLOWED = {("add_fk", "handover_records", ("vendor_signer_id",))}
+# Known, accepted differences: none. (The model-only FK on
+# handover_records.vendor_signer_id was removed in M3a, A19.)
+ALLOWED: set[tuple] = set()
 
 
 def _describe(diff) -> tuple | None:

@@ -142,12 +142,6 @@ class User(TimestampMixin, SoftDeleteMixin, Base):
         back_populates="vendor",
         lazy="raise",
     )
-    handovers_signed_as_vendor: Mapped[list] = relationship(
-        "HandoverRecord",
-        foreign_keys="HandoverRecord.vendor_signer_id",
-        back_populates="vendor_signer",
-        lazy="raise",
-    )
     handovers_signed_as_renter: Mapped[list] = relationship(
         "HandoverRecord",
         foreign_keys="HandoverRecord.renter_signer_id",
