@@ -60,3 +60,22 @@ jobs:
 
       - name: Run tests with coverage
         run: pytest --cov=app --cov-report=term-missing
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build the container image (no push)
+        run: docker build --tag vouch-api:ci .
+
+      - name: Check the image imports the app and its commands
+        run: >-
+          docker run --rm vouch-api:ci
+          python -c "import app.main, app.cli, app.jobs.timers"
+
+      - name: Validate compose.yml
+        run: cp .env.example .env && docker compose config --quiet
