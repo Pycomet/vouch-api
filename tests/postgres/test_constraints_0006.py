@@ -65,7 +65,8 @@ def _profile(user_id: uuid.UUID, **overrides) -> dict:
 
 
 async def _vendor(session: AsyncSession) -> uuid.UUID:
-    return (await create_user(session, role=RenterRole.vendor)).id
+    # No factory profile: these tests insert their own.
+    return (await create_user(session, role=RenterRole.vendor, vendor_status=None)).id
 
 
 async def test_active_profile_without_verified_at_is_refused(db_session: AsyncSession) -> None:

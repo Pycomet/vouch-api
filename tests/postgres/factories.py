@@ -5,6 +5,9 @@ defaults are populated, and returns the row. Nothing commits: the fixture rolls
 everything back. Unique columns (phones, catalogue make/model) get random suffixes,
 so factories can be called any number of times in one test.
 
+``create_user(role=vendor)`` also creates an ``active``, verified vendor profile
+(override with ``vendor_status`` and ``vendor_profile``).
+
 ``create_booking`` fills the columns the bookings CHECK constraints require for the
 chosen status (``hold_expires_at`` for requested, ``deposit_due_at`` for accepted,
 ``claim_window_ends_at`` for returned and disputed) and, by default, gives each
@@ -18,6 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +37,10 @@ from app.db.models import (
     KYCProfile,
     Payment,
     User,
+    VendorBusinessType,
+    VendorProfile,
     VendorReference,
+    VendorStatus,
 )
 from app.db.models.asset import ListingStatus, PausedBy
 from app.db.models.booking import BookingStatus
@@ -58,8 +65,15 @@ async def create_user(
     kyc_verified: bool = False,
     full_name: str | None = None,
     phone: str | None = None,
+    vendor_status: VendorStatus | None = VendorStatus.active,
+    vendor_profile: dict[str, Any] | None = None,
 ) -> User:
-    """A user; with ``kyc_verified`` also a verified tier-1 KYC profile."""
+    """A user; with ``kyc_verified`` also a verified tier-1 KYC profile.
+
+    A vendor also gets a ``vendor_profiles`` row (see :func:`create_vendor_profile`)
+    with status ``vendor_status`` (``None``: no profile) and any column overrides in
+    ``vendor_profile`` (bank fields, ``business_type``, ...).
+    """
     user = User(
         phone=phone or _phone(),
         full_name=full_name or f"Test {role.value}",
@@ -70,7 +84,35 @@ async def create_user(
     await session.flush()
     if kyc_verified:
         await create_kyc(session, user, verified=True)
+    if role == RenterRole.vendor and vendor_status is not None:
+        await create_vendor_profile(session, user, status=vendor_status, **(vendor_profile or {}))
     return user
+
+
+async def create_vendor_profile(
+    session: AsyncSession,
+    user: User,
+    *,
+    status: VendorStatus = VendorStatus.active,
+    **columns: Any,
+) -> VendorProfile:
+    """A vendor profile: ``individual``, no bank fields, and whatever the status needs.
+
+    ``active`` gets ``verified_at``; ``suspended`` gets ``suspended_at`` and a reason.
+    Any ``VendorProfile`` column can be overridden through ``columns``.
+    """
+    values: dict[str, Any] = {"business_type": VendorBusinessType.individual}
+    if status == VendorStatus.active:
+        values["verified_at"] = DEFAULT_NOW
+    if status == VendorStatus.suspended:
+        values.update(
+            verified_at=DEFAULT_NOW, suspended_at=DEFAULT_NOW, suspended_reason="Test suspension"
+        )
+    values.update(columns)
+    profile = VendorProfile(user_id=user.id, status=status, **values)
+    session.add(profile)
+    await session.flush()
+    return profile
 
 
 async def create_kyc(session: AsyncSession, user: User, *, verified: bool = True) -> KYCProfile:

@@ -1,4 +1,4 @@
-"""The shared factories give deterministic default booking dates within each test."""
+"""The shared factories: deterministic default booking dates, and vendor profiles."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import VendorBusinessType, VendorProfile, VendorStatus
+from app.db.models.user import RenterRole
 from tests.postgres.factories import FIRST_START, create_asset, create_booking, create_user
 
 pytestmark = pytest.mark.skipif(
@@ -46,3 +48,45 @@ async def test_explicit_dates_never_invert(db_session: AsyncSession) -> None:
 
     assert (only_end.starts_on, only_end.ends_on) == (date(2027, 6, 1), date(2027, 6, 3))
     assert (only_start.starts_on, only_start.ends_on) == (date(2027, 7, 1), date(2027, 7, 3))
+
+
+async def test_a_vendor_user_gets_an_active_verified_profile(db_session: AsyncSession) -> None:
+    vendor = await create_user(db_session, role=RenterRole.vendor)
+
+    profile = await db_session.get(VendorProfile, vendor.id)
+    assert profile is not None
+    assert profile.status == VendorStatus.active
+    assert profile.business_type == VendorBusinessType.individual
+    assert profile.verified_at is not None
+    assert (profile.bank_name, profile.account_last4, profile.recipient_code) == (None, None, None)
+
+
+async def test_renters_and_admins_get_no_vendor_profile(db_session: AsyncSession) -> None:
+    for role in (RenterRole.renter, RenterRole.admin):
+        user = await create_user(db_session, role=role)
+        assert await db_session.get(VendorProfile, user.id) is None
+
+
+async def test_vendor_profile_fields_can_be_overridden(db_session: AsyncSession) -> None:
+    pending = await create_user(
+        db_session,
+        role=RenterRole.vendor,
+        vendor_status=VendorStatus.pending,
+        vendor_profile={"bank_name": "Test Bank", "account_name": "Ade", "account_last4": "0042"},
+    )
+    suspended = await create_user(
+        db_session, role=RenterRole.vendor, vendor_status=VendorStatus.suspended
+    )
+    bare = await create_user(db_session, role=RenterRole.vendor, vendor_status=None)
+
+    profile = await db_session.get(VendorProfile, pending.id)
+    assert (profile.status, profile.verified_at) == (VendorStatus.pending, None)
+    assert (profile.bank_name, profile.account_name, profile.account_last4) == (
+        "Test Bank",
+        "Ade",
+        "0042",
+    )
+    profile = await db_session.get(VendorProfile, suspended.id)
+    assert profile.status == VendorStatus.suspended
+    assert profile.suspended_at is not None and profile.suspended_reason
+    assert await db_session.get(VendorProfile, bare.id) is None
