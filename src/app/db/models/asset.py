@@ -15,11 +15,13 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
     SmallInteger,
     Text,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, ExcludeConstraint
@@ -52,6 +54,13 @@ class ListingStatus(StrEnum):
     active = "active"
     paused = "paused"
     rejected = "rejected"
+
+
+class PausedBy(StrEnum):
+    """Who paused a listing (``assets.paused_by``, 0006)."""
+
+    vendor = "vendor"
+    admin = "admin"
 
 
 FULFILMENT_DEFAULT_SQL = '\'{"pickup": true, "delivery": false}\'::jsonb'
@@ -137,6 +146,8 @@ class Asset(TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
     )
     review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Who paused the listing (0006): set exactly when ``listing_status`` is paused.
+    paused_by: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint("daily_rate > 0", name="ck_assets_daily_rate_positive"),
@@ -170,6 +181,29 @@ class Asset(TimestampMixin, SoftDeleteMixin, Base):
             ),
         ),
         Index("ix_assets_vendor_id", "vendor_id"),
+        CheckConstraint(
+            "paused_by IN ('vendor', 'admin')",
+            name="ck_assets_paused_by_values",
+        ),
+        CheckConstraint(
+            "(listing_status = 'paused') = (paused_by IS NOT NULL)",
+            name="ck_assets_paused_by_matches_status",
+        ),
+        # One live listing per vendor, catalogue item and serial (any letter case).
+        Index(
+            "uq_assets_vendor_item_serial",
+            "vendor_id",
+            "catalogue_item_id",
+            func.lower(text("serial_number")),
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL AND serial_number IS NOT NULL"),
+        ),
+        # The asset's category is its catalogue item's (0006).
+        ForeignKeyConstraint(
+            ["catalogue_item_id", "category_id"],
+            ["catalogue_items.id", "catalogue_items.category_id"],
+            name="fk_assets_item_category",
+        ),
     )
 
     vendor: Mapped[object] = relationship(
@@ -180,7 +214,9 @@ class Asset(TimestampMixin, SoftDeleteMixin, Base):
     )
     city_ref: Mapped[object] = relationship("City", lazy="raise")
     category_ref: Mapped[object] = relationship("Category", lazy="raise")
-    catalogue_item: Mapped[object] = relationship("CatalogueItem", lazy="raise")
+    catalogue_item: Mapped[object] = relationship(
+        "CatalogueItem", foreign_keys=[catalogue_item_id], lazy="raise"
+    )
     review_actor: Mapped[object] = relationship(
         "User",
         foreign_keys=[review_actor_id],

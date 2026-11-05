@@ -74,6 +74,8 @@ class CatalogueItem(Base):
 
     __table_args__ = (
         UniqueConstraint("make", "model", name="uq_catalogue_items_make_model"),
+        # Target of the assets composite FK that keeps an asset in its item's category.
+        UniqueConstraint("id", "category_id", name="uq_catalogue_items_id_category"),
         CheckConstraint(
             "replacement_value_band IN ('A', 'B', 'C')",
             name="ck_catalogue_items_replacement_value_band_valid",

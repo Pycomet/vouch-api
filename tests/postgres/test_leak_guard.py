@@ -12,6 +12,8 @@ def test_guarded_tables_are_derived_from_the_models() -> None:
     guarded = set(_guarded_tables())
 
     assert {"webhook_events", "users", "assets", "bookings", "ledger_entries"} <= guarded
+    # The 0006 tables are covered without a hand-kept list.
+    assert {"vendor_profiles", "notification_outbox"} <= guarded
     # Seeded by migration 0003 (and alembic's own bookkeeping): never empty.
     assert not guarded & {"cities", "categories", "alembic_version"}
 

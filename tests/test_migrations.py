@@ -86,7 +86,8 @@ def alembic_config(output_buffer: StringIO | None = None) -> Config:
 def test_single_initial_migration_is_head() -> None:
     script = ScriptDirectory.from_config(alembic_config())
 
-    assert script.get_heads() == ["0005_otp_challenges"]
+    assert script.get_heads() == ["0006_vendor_ops_outbox"]
+    assert script.get_revision("0006_vendor_ops_outbox").down_revision == "0005_otp_challenges"
     assert script.get_revision("0005_otp_challenges").down_revision == "0004_booking_payment"
     assert script.get_revision("0004_booking_payment").down_revision == "0003_schema_alignment"
     assert script.get_revision("0001_initial_schema").down_revision is None
@@ -106,6 +107,25 @@ def test_0004_sql_adds_and_removes_the_booking_payment_type() -> None:
     assert sql.index("raise exception") < sql.index("alter type paymenttype rename to")
     assert "create type paymenttype as enum ('deposit', 'rental_balance'" in sql
     assert "drop type paymenttype_old" in sql
+
+
+def test_0006_sql_checks_duplicate_serials_before_the_index_and_guards_the_downgrade() -> None:
+    upgrade = StringIO()
+    command.upgrade(alembic_config(upgrade), "0005_otp_challenges:0006_vendor_ops_outbox", sql=True)
+    sql = upgrade.getvalue().lower()
+    assert "raise exception 'cannot create uq_assets_vendor_item_serial" in sql
+    assert sql.index("raise exception") < sql.index("create unique index uq_assets_vendor_item")
+    assert "insert into vendor_profiles" in sql
+    assert "update assets set paused_by = 'admin'" in sql
+    assert sql.index("update assets a set category_id") < sql.index("fk_assets_item_category")
+
+    downgrade = StringIO()
+    command.downgrade(
+        alembic_config(downgrade), "0006_vendor_ops_outbox:0005_otp_challenges", sql=True
+    )
+    sql = downgrade.getvalue().lower()
+    assert sql.index("pending notification_outbox") < sql.index("drop table notification_outbox")
+    assert sql.index("a suspended vendor exists") < sql.index("drop table vendor_profiles")
 
 
 def test_env_overrides_url_from_validated_settings_in_offline_mode(

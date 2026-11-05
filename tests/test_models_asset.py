@@ -113,15 +113,17 @@ def test_listing_status_enum_has_expected_members() -> None:
 
 def test_assets_reference_columns_are_foreign_keys() -> None:
     table = _table("assets")
+    # category_id and catalogue_item_id also form the composite FK onto
+    # catalogue_items (id, category_id), added in 0006.
     expected = {
-        "city_id": "cities.id",
-        "category_id": "categories.id",
-        "catalogue_item_id": "catalogue_items.id",
+        "city_id": {"cities.id"},
+        "category_id": {"categories.id", "catalogue_items.category_id"},
+        "catalogue_item_id": {"catalogue_items.id"},
     }
-    for column, target in expected.items():
+    for column, targets in expected.items():
         col = table.c[column]
         assert not col.nullable
-        assert {fk.target_fullname for fk in col.foreign_keys} == {target}
+        assert {fk.target_fullname for fk in col.foreign_keys} == targets
     assert isinstance(table.c["city_id"].type, SmallInteger)
     assert isinstance(table.c["category_id"].type, SmallInteger)
 

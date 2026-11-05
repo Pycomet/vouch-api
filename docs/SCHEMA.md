@@ -2,11 +2,11 @@
 
 ## 1. Purpose, sources and notation
 
-This document describes the **current** schema: what migrations `0001` to `0005` build, and how the Milestone 2 services use it. Everything under §4 exists today. The few items that are still future work are listed in §11, *Not in M2*.
+This document describes the **current** schema: what migrations `0001` to `0006` build, and how the Milestone 2 services use it. Everything under §4 exists today. The few items that are still future work are listed in §11, *Not in M2*.
 
 Sources of truth, in order:
 
-1. `migrations/versions/0001_initial_schema.py` … `0005_otp_challenges.py` (what the database has);
+1. `migrations/versions/0001_initial_schema.py` … `0006_vendor_ops_outbox.py` (what the database has);
 2. `src/app/db/models/` (the ORM; `tests/postgres/test_schema_drift.py` and the CI `alembic check` step compare it with a database migrated to head, and fail on any difference);
 3. the services that write the rows: `src/app/services/booking.py` (the `_TRANSITIONS` registry), `money.py` (ledger recipes), `payments.py`, `webhooks.py` and `money_line.py`.
 
@@ -24,7 +24,7 @@ npx -y @mermaid-js/mermaid-cli -i docs/erd.mmd -o docs/erd.svg
 Other conventions:
 
 - Every timestamp is `TIMESTAMPTZ`, written and read in UTC. Business days (the renter cancellation cut-off, the no-show window, the at-risk and lost dates, "today" for request dates) use `VOUCH_BUSINESS_TIMEZONE` (default `Africa/Lagos`).
-- UUID primary keys come from `gen_random_uuid()` (`pgcrypto`). The append-only tables and `webhook_events` use `BIGSERIAL`. The reference tables use `SMALLSERIAL`.
+- UUID primary keys come from `gen_random_uuid()` (`pgcrypto`). The append-only tables, `webhook_events` and `notification_outbox` use `BIGSERIAL`. The reference tables use `SMALLSERIAL`.
 - "Python default" means the ORM sets the value on insert. The column has no database default.
 - `created_at` / `updated_at` come from `TimestampMixin`: both default to `now()`, and the ORM refreshes `updated_at` on update. No database trigger maintains `updated_at`.
 - No query, schema or docstring names a city. Launched cities come from `VOUCH_LAUNCHED_CITIES` (A2). City slugs appear only as data and configuration: the seed rows of migration `0003`, the settings default `launched_cities = ["abuja"]` (`app/core/config.py`), `VOUCH_LAUNCHED_CITIES=abuja` in `.env.example`, and the name of 0002's index `ix_assets_public_lagos`, which 0003 dropped.
@@ -62,6 +62,9 @@ Postgres enum types:
 | `paymentstatus` | `pending`, `authorized`, `captured`, `failed`, `refunded` | `payments.status` |
 | `depositstatus` | `held`, `released`, `claimed` | `payments.deposit_status` (unused in M2, §7) |
 | `payoutstatus` | `pending`, `eligible`, `paid` | `payments.payout_status` |
+| `vendorstatus` | `pending`, `active`, `suspended` | `vendor_profiles.status` (0006) |
+| `vendorbusinesstype` | `rental_house`, `individual` | `vendor_profiles.business_type` (0006) |
+| `outboxstatus` | `pending`, `sent`, `dead` | `notification_outbox.status` (0006) |
 
 The 0001 enums `city` and `assetcategory` were replaced by the `cities` and `categories` tables in 0003, and then dropped.
 
@@ -75,12 +78,14 @@ Text columns with a CHECKed value set:
 | `catalogue_items.replacement_value_band` | `A`, `B`, `C` |
 | `assets.condition_grade` | `excellent`, `good`, `fair` (or NULL) |
 | `bookings.fulfilment_choice` | `pickup`, `delivery` |
+| `assets.paused_by` | `vendor`, `admin` (or NULL; set exactly when paused) |
+| `webhook_events.resolution` | `returned`, `reposted`, `written_off` (or NULL) |
 
 Trust tiers (`TrustTier`, an `IntEnum` in code): `0 phone_verified`, `1 identity_verified`, `2 established`, `3 vendor_approved` (§9).
 
 ## 4. Tables
 
-There are fifteen tables, plus Alembic's `alembic_version`. Each table section lists its columns, then its constraints, indexes and triggers.
+There are seventeen tables, plus Alembic's `alembic_version`. Each table section lists its columns, then its constraints, indexes and triggers.
 
 ### `cities`
 
@@ -165,10 +170,38 @@ One row per login code sent (0005; spec §4, A10).
 | `attempts` | SMALLINT | NOT NULL | `0`. Each wrong guess adds one. |
 | `consumed_at` | TIMESTAMPTZ | NULL | "Can no longer be used": used, replaced by a newer code, or cleared by a successful login |
 | `created_at` | TIMESTAMPTZ | NOT NULL | `now()` |
+| `ip_hash` | TEXT | NULL | HMAC of the client IP, keyed like `code_hash`; NULL when unknown (0006) |
 
 - PK `pk_otp_challenges (id)`; CHECK `ck_otp_challenges_attempts_range`: `attempts BETWEEN 0 AND 5` (at 5 the challenge is used up).
+- Index `ix_otp_challenges_ip_created (ip_hash, created_at) WHERE ip_hash IS NOT NULL` (0006) is for per-IP limits.
 - Index `ix_otp_challenges_phone_created_at (phone, created_at)` serves both the latest-challenge lookup and the rolling-hour count. More than 5 requests for one phone in an hour get 429.
 - A new code marks the phone's open challenges consumed, so only the newest code works. A correct code consumes every open challenge for the phone. Both requests and verifies take a per-phone, transaction-scoped advisory lock.
+
+### `vendor_profiles`
+
+One row per vendor user (0006, M3a spec §3.1).
+
+| Column | Type | Null | Default |
+|---|---|---|---|
+| `user_id` | UUID | NOT NULL | The vendor's `users.id` |
+| `status` | `vendorstatus` | NOT NULL | `'pending'` |
+| `business_type` | `vendorbusinesstype` | NOT NULL | |
+| `is_sub_broker` | BOOLEAN | NOT NULL | `false`. Self-declared, shown on the profile. |
+| `business_name` | TEXT | NULL | |
+| `business_registration_ref` | TEXT | NULL | |
+| `bank_name` | TEXT | NULL | |
+| `account_name` | TEXT | NULL | What the bank returned, or what ops read from the account |
+| `account_last4` | CHAR(4) | NULL | The full account number is never stored |
+| `recipient_code` | TEXT | NULL | The provider's transfer recipient, entered by ops |
+| `verified_by` | UUID | NULL | The admin who verified the vendor |
+| `verified_at` | TIMESTAMPTZ | NULL | |
+| `suspended_at` | TIMESTAMPTZ | NULL | |
+| `suspended_reason` | TEXT | NULL | |
+| `created_at`, `updated_at` | TIMESTAMPTZ | NOT NULL | `now()` |
+
+- PK `pk_vendor_profiles (user_id)`; FKs `fk_vendor_profiles_user_id (user_id) → users(id)` and `fk_vendor_profiles_verified_by (verified_by) → users(id)`; UNIQUE `uq_vendor_profiles_recipient_code (recipient_code)`.
+- CHECKs: `ck_vendor_profiles_active_verified` (`active` needs `verified_at`), `ck_vendor_profiles_last4_digits` (four digits or NULL), `ck_vendor_profiles_suspension` (`suspended` exactly when both `suspended_at` and `suspended_reason` are set).
+- Backfill (0006): every existing vendor got an `active` profile, `business_type = 'individual'`, `verified_at = users.created_at`, bank fields NULL.
 
 ### `vendor_references`
 
@@ -203,7 +236,7 @@ The make-and-model catalogue (0003, spec §2.2).
 | `is_active` | BOOLEAN | NOT NULL | `true` |
 | `created_at` | TIMESTAMPTZ | NOT NULL | `now()` |
 
-- PK `pk_catalogue_items (id)`; FK `fk_catalogue_items_category_id (category_id) → categories(id)`; UNIQUE `uq_catalogue_items_make_model (make, model)`.
+- PK `pk_catalogue_items (id)`; FK `fk_catalogue_items_category_id (category_id) → categories(id)`; UNIQUE `uq_catalogue_items_make_model (make, model)`; UNIQUE `uq_catalogue_items_id_category (id, category_id)` (0006), the target of `fk_assets_item_category`.
 - CHECK `ck_catalogue_items_replacement_value_band_valid`: `replacement_value_band IN ('A','B','C')`.
 - Index `ix_catalogue_items_search`: `GIN (catalogue_search_vector(make, model, aliases))` (A11). The migrations own this index; the ORM cannot express it, and autogenerate skips it through `app.db.migration_filters`.
 - The band sets the default `assets.minimum_trust_tier` for a new listing: A→1, B→2, C→3 (A3). Backfilled items (one per pre-0003 asset) have make `Unknown`, band `B` and `specs = {"needs_review": true}`.
@@ -238,12 +271,13 @@ One rentable unit: one serial number, quantity 1. Several units of a model are s
 | `weekend_rate` | NUMERIC(12,2) | NULL | Charged for exactly Friday to Sunday |
 | `weekly_rate` | NUMERIC(12,2) | NULL | Charged per full week of a span of 7 days or more |
 | `fulfilment` | JSONB | NOT NULL | `'{"pickup": true, "delivery": false}'`. An optional `delivery_fee` key sets the delivery fee (default 0, A8). |
+| `paused_by` | TEXT | NULL | Who paused the listing: `vendor` or `admin` (0006) |
 
 - PK `assets_pkey (id)`.
-- FKs: `assets_vendor_id_fkey (vendor_id) → users(id)`, `assets_review_actor_id_fkey (review_actor_id) → users(id)`, `fk_assets_city_id (city_id) → cities(id)`, `fk_assets_category_id (category_id) → categories(id)`, `fk_assets_catalogue_item_id (catalogue_item_id) → catalogue_items(id)`.
-- CHECKs: `ck_assets_daily_rate_positive` (`daily_rate > 0`), `ck_assets_deposit_amount_nonnegative` (`deposit_amount >= 0`), `ck_assets_weekend_rate_positive` and `ck_assets_weekly_rate_positive` (NULL or `> 0`), `ck_assets_condition_grade_valid`, `ck_assets_minimum_trust_tier_valid` (`minimum_trust_tier BETWEEN 0 AND 3`; widened from 0–2 by 0003).
-- Indexes: `ix_assets_vendor_id (vendor_id)`, and the partial index `ix_assets_public (city_id, category_id, daily_rate, created_at, id) WHERE listing_status = 'active' AND is_available = true AND deleted_at IS NULL`. It replaced 0002's `ix_assets_public_lagos`.
-- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor, and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, audit `asset.paused`).
+- FKs: `assets_vendor_id_fkey (vendor_id) → users(id)`, `assets_review_actor_id_fkey (review_actor_id) → users(id)`, `fk_assets_city_id (city_id) → cities(id)`, `fk_assets_category_id (category_id) → categories(id)`, `fk_assets_catalogue_item_id (catalogue_item_id) → catalogue_items(id)`, and `fk_assets_item_category (catalogue_item_id, category_id) → catalogue_items(id, category_id)` (0006), so an asset's category is always its item's.
+- CHECKs: `ck_assets_daily_rate_positive` (`daily_rate > 0`), `ck_assets_deposit_amount_nonnegative` (`deposit_amount >= 0`), `ck_assets_weekend_rate_positive` and `ck_assets_weekly_rate_positive` (NULL or `> 0`), `ck_assets_condition_grade_valid`, `ck_assets_minimum_trust_tier_valid` (`minimum_trust_tier BETWEEN 0 AND 3`; widened from 0–2 by 0003), `ck_assets_paused_by_values` (`paused_by IN ('vendor', 'admin')`) and `ck_assets_paused_by_matches_status` (`(listing_status = 'paused') = (paused_by IS NOT NULL)`) (0006).
+- Indexes: `ix_assets_vendor_id (vendor_id)`, and the partial index `ix_assets_public (city_id, category_id, daily_rate, created_at, id) WHERE listing_status = 'active' AND is_available = true AND deleted_at IS NULL`. It replaced 0002's `ix_assets_public_lagos`. The partial unique index `uq_assets_vendor_item_serial (vendor_id, catalogue_item_id, lower(serial_number)) WHERE deleted_at IS NULL AND serial_number IS NOT NULL` (0006) allows one live listing per vendor, item and serial, ignoring letter case.
+- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor, and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, `paused_by = 'admin'`, audit `asset.paused`); if the vendor had paused it, the pause becomes an admin one (audit `asset.pause_taken_over`), so the vendor cannot resume lost gear.
 
 ### `availability_windows`
 
@@ -416,7 +450,7 @@ Append-only history (0003, spec §2.6).
   - `booking.vendor_approved` and `booking.at_risk` (no status change);
   - `deposit.released`, `deposit.deducted` and `deposit.forfeited`, beside the booking's own row;
   - `vendor.reliability_penalty` (entity `user`) on a vendor cancellation or a no-show;
-  - `user.restricted` and `asset.paused`;
+  - `user.restricted` and `asset.paused`; `asset.pause_taken_over` (M3a) when a lost booking turns a vendor pause into an admin one;
   - `handover.updated` and `handover.signed`;
   - `kyc.verified` and `kyc.failed`;
   - `payment.refunded_late`, `payment.refunded_mismatch`, `payment.refunded_unapplied`, `payment.refunded_duplicate` and `payout.paid`.
@@ -437,9 +471,35 @@ One row per provider delivery (0003, spec §2.6), for idempotency.
 | `received_at` | TIMESTAMPTZ | NOT NULL | `now()` |
 | `processed_at` | TIMESTAMPTZ | NULL | Set on every verified event |
 | `processing_error` | TEXT | NULL | Why a genuine event was not applied |
+| `resolution` | TEXT | NULL | How ops closed a failed event (0006) |
+| `resolved_at` | TIMESTAMPTZ | NULL | (0006) |
+| `resolved_by` | UUID | NULL | The admin who resolved it (0006) |
+| `resolution_note` | TEXT | NULL | (0006) |
 
 - PK `webhook_events_pkey (id)`; UNIQUE `uq_webhook_events_provider_event (provider, provider_event_id)`.
+- FK `fk_webhook_events_resolved_by (resolved_by) → users(id)`. CHECKs `ck_webhook_events_resolution_values` and `ck_webhook_events_resolution_complete` (all four resolution columns set, or none). `reposted` means corrective ledger entries were posted through a reviewed script; no endpoint does this.
 - Semantics are in §10.
+
+### `notification_outbox`
+
+One row per message to send (0006, M3a spec §3.5), written in the same transaction as the change it reports.
+
+| Column | Type | Null | Default |
+|---|---|---|---|
+| `id` | BIGINT | NOT NULL | BIGSERIAL |
+| `user_id` | UUID | NULL | NULL means an operations alert (template `ops.*`) |
+| `template` | TEXT | NOT NULL | |
+| `data` | JSONB | NOT NULL | `'{}'`. May hold phone numbers: never logged. |
+| `status` | `outboxstatus` | NOT NULL | `'pending'` |
+| `attempts` | SMALLINT | NOT NULL | `0` |
+| `next_attempt_at` | TIMESTAMPTZ | NOT NULL | `now()` |
+| `last_error` | TEXT | NULL | |
+| `created_at` | TIMESTAMPTZ | NOT NULL | `now()` |
+| `sent_at` | TIMESTAMPTZ | NULL | |
+
+- PK `pk_notification_outbox (id)`; FK `fk_notification_outbox_user_id (user_id) → users(id)`.
+- CHECKs: `ck_outbox_sent_at` (`sent` exactly when `sent_at` is set), `ck_outbox_attempts_nonnegative`.
+- Partial index `ix_outbox_due (next_attempt_at, id) WHERE status = 'pending'`.
 
 ## 5. Booking statuses and transitions
 
