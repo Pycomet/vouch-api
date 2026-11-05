@@ -273,8 +273,9 @@ LISTING_TRANSITION_MESSAGE = "This listing cannot make that transition."
 class VendorNotActiveError(VouchAPIError):
     """Raised when a vendor whose profile is not ``active`` tries a vendor write.
 
-    Creating or submitting a listing, pausing or resuming one, and accepting a
-    booking request all need an ``active`` profile (M3a 4.4, 4.7). Returns 409
+    Every listing write (create, edit, submit, pause, resume, delete; amendment
+    A23) and accepting a booking request need an ``active`` profile (M3a 4.4,
+    4.7). Returns 409
     ``vendor_not_active``. Reads, handovers and returns stay allowed.
     """
 

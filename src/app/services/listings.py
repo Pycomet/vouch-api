@@ -25,6 +25,9 @@ Edit rules (:func:`update_listing`):
   has no such field, so FastAPI answers 422).
 * A new catalogue item re-derives ``category_id`` and re-applies the tier floor:
   a tier below the new item's band default is raised to it.
+* An ``active`` or ``paused`` listing must stay complete (:func:`missing_for_review`):
+  an edit that would leave something missing is 409 ``listing_incomplete`` and
+  writes nothing. A ``draft`` or ``rejected`` listing may stay incomplete.
 * One ``asset.updated`` audit row with the before and after of the changed fields
   only; no row when nothing changed.
 
@@ -97,6 +100,8 @@ IDENTITY_EDITABLE = frozenset({ListingStatus.draft, ListingStatus.rejected})
 COMMERCIAL_EDITABLE = frozenset(
     {ListingStatus.draft, ListingStatus.rejected, ListingStatus.active, ListingStatus.paused}
 )
+# A listing in one of these is public (or may be again) and must stay complete.
+LIVE_LISTING_STATUSES = frozenset({ListingStatus.active, ListingStatus.paused})
 # A listing with a booking in one of these cannot be deleted.
 UNDELETABLE_BOOKING_STATUSES = frozenset(LIVE_BOOKING_STATUSES | {BookingStatus.disputed})
 
@@ -468,6 +473,14 @@ async def update_listing(
             continue
         track(field, getattr(asset, field), value)
         setattr(asset, field, value)
+
+    # A live listing stays complete: an edit may not, say, offer delivery without
+    # a fee (new bookings would price it at zero). Drafts may stay incomplete.
+    if status in LIVE_LISTING_STATUSES:
+        missing = missing_for_review(asset)
+        if missing:
+            session.expire(asset)  # nothing of this edit is ever flushed
+            raise ListingIncompleteError(missing)
 
     await _flush_listing(session, asset)
     await record_listing_audit(

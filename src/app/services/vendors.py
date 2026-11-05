@@ -2,8 +2,8 @@
 
 A vendor whose profile is not ``active`` (``pending``, ``suspended``, or with no
 profile row at all) may still read their listings and bookings and sign handovers
-and returns, but takes no new work: no listing creation, submission, pause or
-resume, and no accepting of a booking request.
+and returns, but takes no new work: no listing write at all (create, edit, submit,
+pause, resume, delete; amendment A23) and no accepting of a booking request.
 """
 
 from __future__ import annotations

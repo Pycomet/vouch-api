@@ -200,7 +200,13 @@ LISTING = f"{LISTINGS}/{{asset_id}}"
         (
             "patch",
             LISTING,
-            {"vendor_not_active", "listing_locked", "catalogue_item_inactive", "duplicate_serial"},
+            {
+                "vendor_not_active",
+                "listing_locked",
+                "listing_incomplete",
+                "catalogue_item_inactive",
+                "duplicate_serial",
+            },
         ),
         (
             "post",

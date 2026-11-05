@@ -201,6 +201,7 @@ async def get_asset(
         *_ON_LISTING,
         LISTING_LOCKED,
         IDENTITY_LOCKED,
+        LISTING_INCOMPLETE,
         CATALOGUE_ITEM_INACTIVE,
         DUPLICATE_SERIAL,
         422,
@@ -215,7 +216,8 @@ async def update_asset(
 ) -> OwnAsset:
     """Only the fields given change. Locked in ``review``; identity fields
     (``catalogue_item_id``, ``serial_number``, ``city``) only in ``draft`` or
-    ``rejected``. ``minimum_trust_tier`` cannot be sent (422)."""
+    ``rejected``. An active or paused listing must stay complete (409
+    ``listing_incomplete``). ``minimum_trust_tier`` cannot be sent (422)."""
     asset = await listings.update_listing(
         session,
         actor=actor,

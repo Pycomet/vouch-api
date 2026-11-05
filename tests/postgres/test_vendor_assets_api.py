@@ -619,6 +619,54 @@ async def test_patch_identity_outside_draft_is_locked(
 
 
 @pytest.mark.parametrize("status", [ListingStatus.active, ListingStatus.paused])
+@pytest.mark.parametrize(
+    ("body", "missing"),
+    [
+        # Delivery with no fee would price new bookings' delivery at zero.
+        ({"fulfilment": {"pickup": False, "delivery": True}}, ["delivery_fee"]),
+        ({"fulfilment": {"pickup": False, "delivery": False}}, ["fulfilment"]),
+        ({"condition_grade": None}, ["condition_grade"]),
+        ({"condition_grade": None, "description": "x"}, ["condition_grade"]),
+    ],
+)
+async def test_patch_cannot_make_a_live_listing_incomplete(
+    client, db_session, status, body, missing
+) -> None:
+    vendor_id, headers = await _vendor(db_session)
+    paused_by = PausedBy.vendor if status == ListingStatus.paused else None
+    asset_id = await _listing(db_session, vendor_id, status, paused_by)
+    before = await _asset(db_session, asset_id)
+    snapshot = (before.fulfilment, before.condition_grade, before.description, before.updated_at)
+
+    response = await client.patch(f"{API}/{asset_id}", json=body, headers=headers)
+
+    assert response.status_code == 409, response.text
+    assert _error(response)["code"] == "listing_incomplete"
+    assert _error(response)["details"] == {"missing": missing}
+    after = await _asset(db_session, asset_id)
+    assert (after.fulfilment, after.condition_grade, after.description, after.updated_at) == (
+        snapshot
+    )
+    assert after.listing_status == status
+    assert await _audits(db_session, asset_id) == []
+
+
+@pytest.mark.parametrize("status", [ListingStatus.draft, ListingStatus.rejected])
+async def test_patch_may_leave_a_draft_incomplete(client, db_session, status) -> None:
+    vendor_id, headers = await _vendor(db_session)
+    asset_id = await _listing(db_session, vendor_id, status)
+
+    response = await client.patch(
+        f"{API}/{asset_id}",
+        json={"condition_grade": None, "fulfilment": {"pickup": False, "delivery": True}},
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["condition_grade"] is None
+
+
+@pytest.mark.parametrize("status", [ListingStatus.active, ListingStatus.paused])
 async def test_patch_commercial_fields_while_live(client, db_session, status) -> None:
     vendor_id, headers = await _vendor(db_session)
     paused_by = PausedBy.vendor if status == ListingStatus.paused else None
