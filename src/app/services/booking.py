@@ -1172,17 +1172,24 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
     asset = await ctx.session.get(
         Asset, booking.asset_id, with_for_update=True, populate_existing=True
     )
-    if asset.listing_status != ListingStatus.paused:
-        previous = asset.listing_status
+    # Marking a booking lost is an admin act, and the pause must be an admin one so
+    # the vendor can never resume lost gear: a vendor pause is taken over.
+    if asset.listing_status != ListingStatus.paused or asset.paused_by != PausedBy.admin:
+        if asset.listing_status != ListingStatus.paused:
+            action = "asset.paused"
+            before = {"listing_status": asset.listing_status}
+        else:
+            action = "asset.pause_taken_over"
+            before = {"listing_status": asset.listing_status, "paused_by": asset.paused_by}
         asset.listing_status = ListingStatus.paused
-        asset.paused_by = PausedBy.admin  # marking a booking lost is an admin act
+        asset.paused_by = PausedBy.admin
         await record_audit(
             ctx.session,
             actor=ctx.actor,
             entity="asset",
             entity_id=asset.id,
-            action="asset.paused",
-            before={"listing_status": previous},
+            action=action,
+            before=before,
             after={
                 "listing_status": ListingStatus.paused,
                 "paused_by": PausedBy.admin,

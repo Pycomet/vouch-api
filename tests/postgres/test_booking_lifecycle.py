@@ -1198,11 +1198,11 @@ async def test_vendor_cannot_mark_lost(db_session, clock, notifier) -> None:
         )
 
 
-async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, notifier) -> None:
+async def _lost_with_asset_paused_by(db_session, notifier, paused_by: PausedBy):
     booking = await _paid(db_session, BookingStatus.in_progress)
     asset = await db_session.get(Asset, booking.asset_id)
     asset.listing_status = ListingStatus.paused
-    asset.paused_by = PausedBy.vendor
+    asset.paused_by = paused_by
     await db_session.flush()
     admin = await admin_actor(db_session)
 
@@ -1215,8 +1215,35 @@ async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, 
         notifier,
         {"reason": "Gone"},
     )
-
     assert result.status == BookingStatus.lost
+    await db_session.refresh(asset)
+    return booking, asset
+
+
+async def test_mark_lost_takes_over_a_vendor_pause(db_session, clock, notifier) -> None:
+    # A vendor must never be able to resume lost gear, so the pause becomes an admin one.
+    booking, asset = await _lost_with_asset_paused_by(db_session, notifier, PausedBy.vendor)
+
+    assert asset.listing_status == ListingStatus.paused
+    assert asset.paused_by == PausedBy.admin
+    audits = await _audits(db_session, booking.asset_id)
+    assert [a.action for a in audits] == ["asset.pause_taken_over"]
+    assert audits[0].before == {"listing_status": "paused", "paused_by": "vendor"}
+    assert audits[0].after == {
+        "listing_status": "paused",
+        "paused_by": "admin",
+        "booking_id": str(booking.id),
+    }
+    assert audits[0].reason == "Gone"
+    assert audits[0].actor_role == "admin"
+
+
+async def test_mark_lost_on_admin_paused_asset_writes_no_pause_row(
+    db_session, clock, notifier
+) -> None:
+    booking, asset = await _lost_with_asset_paused_by(db_session, notifier, PausedBy.admin)
+
+    assert (asset.listing_status, asset.paused_by) == (ListingStatus.paused, PausedBy.admin)
     assert await _audits(db_session, booking.asset_id) == []
 
 

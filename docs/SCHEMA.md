@@ -277,7 +277,7 @@ One rentable unit: one serial number, quantity 1. Several units of a model are s
 - FKs: `assets_vendor_id_fkey (vendor_id) → users(id)`, `assets_review_actor_id_fkey (review_actor_id) → users(id)`, `fk_assets_city_id (city_id) → cities(id)`, `fk_assets_category_id (category_id) → categories(id)`, `fk_assets_catalogue_item_id (catalogue_item_id) → catalogue_items(id)`, and `fk_assets_item_category (catalogue_item_id, category_id) → catalogue_items(id, category_id)` (0006), so an asset's category is always its item's.
 - CHECKs: `ck_assets_daily_rate_positive` (`daily_rate > 0`), `ck_assets_deposit_amount_nonnegative` (`deposit_amount >= 0`), `ck_assets_weekend_rate_positive` and `ck_assets_weekly_rate_positive` (NULL or `> 0`), `ck_assets_condition_grade_valid`, `ck_assets_minimum_trust_tier_valid` (`minimum_trust_tier BETWEEN 0 AND 3`; widened from 0–2 by 0003), `ck_assets_paused_by_values` (`paused_by IN ('vendor', 'admin')`) and `ck_assets_paused_by_matches_status` (`(listing_status = 'paused') = (paused_by IS NOT NULL)`) (0006).
 - Indexes: `ix_assets_vendor_id (vendor_id)`, and the partial index `ix_assets_public (city_id, category_id, daily_rate, created_at, id) WHERE listing_status = 'active' AND is_available = true AND deleted_at IS NULL`. It replaced 0002's `ix_assets_public_lagos`. The partial unique index `uq_assets_vendor_item_serial (vendor_id, catalogue_item_id, lower(serial_number)) WHERE deleted_at IS NULL AND serial_number IS NOT NULL` (0006) allows one live listing per vendor, item and serial, ignoring letter case.
-- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor, and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, `paused_by = 'admin'`, audit `asset.paused`).
+- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor, and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, `paused_by = 'admin'`, audit `asset.paused`); if the vendor had paused it, the pause becomes an admin one (audit `asset.pause_taken_over`), so the vendor cannot resume lost gear.
 
 ### `availability_windows`
 
@@ -450,7 +450,7 @@ Append-only history (0003, spec §2.6).
   - `booking.vendor_approved` and `booking.at_risk` (no status change);
   - `deposit.released`, `deposit.deducted` and `deposit.forfeited`, beside the booking's own row;
   - `vendor.reliability_penalty` (entity `user`) on a vendor cancellation or a no-show;
-  - `user.restricted` and `asset.paused`;
+  - `user.restricted` and `asset.paused`; `asset.pause_taken_over` (M3a) when a lost booking turns a vendor pause into an admin one;
   - `handover.updated` and `handover.signed`;
   - `kyc.verified` and `kyc.failed`;
   - `payment.refunded_late`, `payment.refunded_mismatch`, `payment.refunded_unapplied`, `payment.refunded_duplicate` and `payout.paid`.
