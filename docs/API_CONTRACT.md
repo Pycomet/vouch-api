@@ -83,6 +83,7 @@ The client never sets a role, tier, price, commission, payment status or payout 
 
 - `/assets`: `starts_on` and `ends_on` must be given together, with `starts_on <= ends_on` (400 otherwise). With them, units that have a live booking or a blocked window overlapping the range are left out.
 - `/catalogue/search`: `q` is a full-text match on make, model and aliases. `from` and `to` work like the `/assets` dates. If nothing is free and `q` matched catalogue items, the search runs again over those items' categories without `q`, and the response says `"equivalents": true`.
+- `/catalogue/items`: an unknown `category` slug is 400 `invalid_request`, while `/assets?category=` with an unknown slug is an empty 200. The difference is deliberate: this is a lookup of the catalogue's own categories, so it rejects a slug that is not one of them, while `/assets` is a search that simply finds nothing.
 
 ### 4.3 Bookings
 
