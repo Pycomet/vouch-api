@@ -46,7 +46,8 @@ from __future__ import annotations
 
 import datetime
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -272,10 +273,21 @@ async def _launched_city(session: AsyncSession, slug: str, settings: Settings) -
     return city
 
 
-async def _flush_listing(session: AsyncSession, asset: Asset) -> None:
-    """Flush in a savepoint, translating the serial index into 409 ``duplicate_serial``."""
+@asynccontextmanager
+async def _listing_savepoint(session: AsyncSession, asset: Asset) -> AsyncIterator[None]:
+    """Change ``asset`` inside this block; it is flushed only inside a savepoint.
+
+    ``begin_nested()`` flushes whatever is already dirty *before* it emits the
+    SAVEPOINT, so the listing must not be changed before the block opens: run
+    every lookup first. Inside, autoflush is off, the block's changes are flushed
+    at its end within the savepoint, and the serial index becomes 409
+    ``duplicate_serial``. A failure (or an error the block raises) rolls back to
+    the savepoint only, so the caller's transaction stays usable.
+    """
     try:
         async with session.begin_nested():
+            with session.no_autoflush:
+                yield
             session.add(asset)
             await session.flush()
     except IntegrityError as exc:
@@ -356,7 +368,9 @@ async def create_listing(
         listing_status=ListingStatus.draft,
         minimum_trust_tier=tier,
     )
-    await _flush_listing(session, asset)
+    # Not yet in the session, so nothing flushes before the savepoint.
+    async with _listing_savepoint(session, asset):
+        pass
     await record_listing_audit(
         session,
         asset,
@@ -451,36 +465,45 @@ async def update_listing(
         before[field] = old
         after[field] = new
 
+    # Every lookup runs before any attribute changes: a query after a change would
+    # autoflush it outside the savepoint, where a duplicate serial escapes as a 500.
+    item = None
     if "catalogue_item_id" in changes:
         item = await _catalogue_item(session, changes["catalogue_item_id"])
-        track("catalogue_item_id", asset.catalogue_item_id, item.id)
-        asset.catalogue_item_id = item.id
-        if asset.category_id != item.category_id:
-            track("category_id", asset.category_id, item.category_id)
-            asset.category_id = item.category_id
-        floor = band_default_tier(item)
-        if asset.minimum_trust_tier < floor:
-            track("minimum_trust_tier", asset.minimum_trust_tier, floor)
-            asset.minimum_trust_tier = floor
+    city = None
     if "city" in changes:
         city = await _launched_city(session, changes["city"], settings)
-        track("city", city_slug, city.slug)
-        asset.city_id = city.id
-    for field, value in changes.items():
-        if field in ("catalogue_item_id", "city"):
-            continue
-        track(field, getattr(asset, field), value)
-        setattr(asset, field, value)
 
-    # A live listing stays complete: an edit may not, say, offer delivery without
-    # a fee (new bookings would price it at zero). Drafts may stay incomplete.
-    if status in LIVE_LISTING_STATUSES:
-        missing = missing_for_review(asset)
-        if missing:
-            session.expire(asset)  # nothing of this edit is ever flushed
-            raise ListingIncompleteError(missing)
+    # Every change happens inside the savepoint (no query runs in it, and
+    # autoflush is off there anyway); an error rolls back to the savepoint only.
+    async with _listing_savepoint(session, asset):
+        if item is not None:
+            track("catalogue_item_id", asset.catalogue_item_id, item.id)
+            asset.catalogue_item_id = item.id
+            if asset.category_id != item.category_id:
+                track("category_id", asset.category_id, item.category_id)
+                asset.category_id = item.category_id
+            floor = band_default_tier(item)
+            if asset.minimum_trust_tier < floor:
+                track("minimum_trust_tier", asset.minimum_trust_tier, floor)
+                asset.minimum_trust_tier = floor
+        if city is not None:
+            track("city", city_slug, city.slug)
+            asset.city_id = city.id
+        for field, value in changes.items():
+            if field in ("catalogue_item_id", "city"):
+                continue
+            track(field, getattr(asset, field), value)
+            setattr(asset, field, value)
 
-    await _flush_listing(session, asset)
+        # A live listing stays complete: an edit may not, say, offer delivery
+        # without a fee (new bookings would price it at zero). Drafts may stay
+        # incomplete.
+        if status in LIVE_LISTING_STATUSES:
+            missing = missing_for_review(asset)
+            if missing:
+                raise ListingIncompleteError(missing)
+
     await record_listing_audit(
         session,
         asset,
@@ -526,6 +549,8 @@ async def _vendor_transition(
     from_paused_by = asset.paused_by
     target = next_status(from_status, event)
 
+    # Guards and lookups first; the listing changes only inside the savepoint.
+    paused_by = from_paused_by
     if event == ListingEvent.submit:
         missing = missing_for_review(asset)
         if missing:
@@ -536,15 +561,16 @@ async def _vendor_transition(
                 details={"catalogue_item_id": str(asset.catalogue_item_id)}
             )
     elif event == ListingEvent.pause:
-        asset.paused_by = PausedBy.vendor.value
+        paused_by = PausedBy.vendor.value
     elif event == ListingEvent.resume:
         # A vendor resumes only their own pause; an admin pause is the admin's to lift.
-        if asset.paused_by != PausedBy.vendor.value:
+        if from_paused_by != PausedBy.vendor.value:
             raise listing_transition_error(from_status, event)
-        asset.paused_by = None
+        paused_by = None
 
-    asset.listing_status = target
-    await _flush_listing(session, asset)
+    async with _listing_savepoint(session, asset):
+        asset.paused_by = paused_by
+        asset.listing_status = target
     action = {
         ListingEvent.submit: "asset.submitted",
         ListingEvent.pause: "asset.paused",
@@ -613,8 +639,8 @@ async def delete_listing(
     )
     if busy:
         raise HasLiveBookingsError()
-    asset.deleted_at = now
-    await session.flush()
+    async with _listing_savepoint(session, asset):
+        asset.deleted_at = now
     await record_listing_audit(
         session,
         asset,

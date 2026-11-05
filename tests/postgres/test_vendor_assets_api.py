@@ -30,6 +30,7 @@ from app.db.models import (
     Booking,
     CatalogueItem,
     Category,
+    City,
     User,
     VendorStatus,
 )
@@ -39,6 +40,10 @@ from app.db.models.booking import BookingStatus
 from app.db.models.user import RenterRole
 from app.db.session import get_session
 from app.main import create_app
+from app.schemas.errors import DuplicateSerialError, ListingIncompleteError
+from app.schemas.listings import OwnAssetCreate, OwnAssetUpdate
+from app.services.audit import Actor
+from app.services.listings import create_listing, update_listing
 from app.services.notify import RecordingNotifier
 from tests.helpers.auth import bearer
 from tests.postgres.factories import (
@@ -847,6 +852,45 @@ async def test_patch_city_moves_a_draft_between_launched_cities(db_session) -> N
     assert (update.before, update.after) == ({"city": CITY}, {"city": other})
 
 
+async def test_patch_item_and_city_together_to_a_duplicate_serial_is_409(db_session) -> None:
+    """The item and city lookups run before any attribute changes, so the
+    duplicate surfaces inside the savepoint as 409, never as an autoflush 500."""
+    other = "lagos" if CITY != "lagos" else "abuja"
+    settings = SETTINGS.model_copy(update={"launched_cities": [CITY, other]})
+    app = create_app(settings)
+
+    async def session_override() -> AsyncIterator[AsyncSession]:
+        await db_session.commit()
+        try:
+            yield db_session
+        finally:
+            await db_session.rollback()
+
+    app.dependency_overrides[get_session] = session_override
+    vendor_id, _ = await _vendor(db_session)
+    headers = bearer(vendor_id, ActorRole.vendor, settings)
+    item_a, item_b = await _item(db_session), await _item(db_session)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        listed = await http.post(API, json=_body(item_a.id, serial_number="S-1"), headers=headers)
+        draft = await http.post(API, json=_body(item_b.id, serial_number="S-1"), headers=headers)
+        assert listed.status_code == draft.status_code == 201
+        draft_id = draft.json()["id"]
+
+        response = await http.patch(
+            f"{API}/{draft_id}",
+            json={"catalogue_item_id": str(item_a.id), "city": other},
+            headers=headers,
+        )
+
+    assert response.status_code == 409, response.text
+    assert _error(response)["code"] == "duplicate_serial"
+    asset = await _asset(db_session, draft_id)
+    assert asset.catalogue_item_id == item_b.id
+    city = await db_session.scalar(select(City.slug).where(City.id == asset.city_id))
+    assert city == CITY
+    assert [audit.action for audit in await _audits(db_session, draft_id)] == ["asset.created"]
+
+
 async def test_patch_to_a_duplicate_serial_is_409(client, db_session) -> None:
     _, headers = await _vendor(db_session)
     item = await _item(db_session)
@@ -1210,3 +1254,50 @@ async def test_public_asset_still_hides_the_serial(client, db_session) -> None:
         assert "private note" not in text and "private reason" not in text
         assert str(vendor_id) not in text
     assert "serial_number" not in detail.json()
+
+
+# ---------------------------------------------------------------------------
+# The service inside a caller's transaction (Step 4 reuses it)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra", [{}, {"description": "x"}])
+async def test_a_refused_duplicate_leaves_the_transaction_usable(db_session, extra) -> None:
+    """The failing UPDATE runs inside a savepoint, so the caller's transaction is
+    not aborted (a later query would fail with "current transaction is aborted")."""
+    vendor = await create_user(db_session, role=RenterRole.vendor)
+    actor = Actor(vendor.id, ActorRole.vendor)
+    item_a, item_b = await _item(db_session), await _item(db_session)
+    for item_id in (item_a.id, item_b.id):
+        await create_listing(
+            db_session,
+            actor=actor,
+            body=OwnAssetCreate.model_validate(_body(item_id, serial_number="S-9")),
+            settings=SETTINGS,
+        )
+    draft_id = await db_session.scalar(select(Asset.id).where(Asset.catalogue_item_id == item_b.id))
+    body = OwnAssetUpdate.model_validate({"catalogue_item_id": str(item_a.id), **extra})
+
+    with pytest.raises(DuplicateSerialError):
+        await update_listing(
+            db_session, actor=actor, asset_id=draft_id, body=body, settings=SETTINGS
+        )
+
+    asset = await _asset(db_session, draft_id)
+    assert (asset.catalogue_item_id, asset.description) == (item_b.id, None)
+    assert [audit.action for audit in await _audits(db_session, draft_id)] == ["asset.created"]
+
+
+async def test_a_refused_live_edit_leaves_the_transaction_usable(db_session) -> None:
+    vendor = await create_user(db_session, role=RenterRole.vendor)
+    actor = Actor(vendor.id, ActorRole.vendor)
+    asset_id = await _listing(db_session, vendor.id, ListingStatus.active)
+    body = OwnAssetUpdate.model_validate({"condition_grade": None, "description": "x"})
+
+    with pytest.raises(ListingIncompleteError):
+        await update_listing(
+            db_session, actor=actor, asset_id=asset_id, body=body, settings=SETTINGS
+        )
+
+    asset = await _asset(db_session, asset_id)
+    assert (asset.condition_grade, asset.description) == ("good", None)
