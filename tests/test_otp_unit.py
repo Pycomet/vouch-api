@@ -22,6 +22,7 @@ from app.providers.otp import (
 )
 from app.schemas.auth import OtpRequest, OtpVerify
 from app.schemas.errors import RateLimitedError
+from app.services import auth as auth_service
 from app.services.auth import normalize_phone
 
 
@@ -203,3 +204,34 @@ def test_otp_request_is_503_without_a_sender() -> None:
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "otp_unavailable"
+
+
+# Fixed development code (VOUCH_FAKE_OTP_CODE) for local clients and e2e tests
+# ---------------------------------------------------------------------------
+
+
+@GUARDED
+def test_fake_otp_code_refused_outside_development_and_test(environment) -> None:
+    with pytest.raises(ValidationError, match="fake_otp_code is not allowed"):
+        Settings(
+            _env_file=None, environment=environment, jwt_secret=REAL_SECRET, fake_otp_code="000000"
+        )
+
+
+@pytest.mark.parametrize("code", ["", "12345", "1234567", "12a456", " 123456"])
+def test_fake_otp_code_must_be_six_digits(code: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, fake_otp_code=code)
+
+
+@pytest.mark.parametrize("environment", [Environment.DEVELOPMENT, Environment.TEST])
+def test_fake_otp_code_replaces_the_random_code_with_the_fake_sender(environment) -> None:
+    settings = Settings(_env_file=None, environment=environment, fake_otp_code="000000")
+
+    assert auth_service._new_code(settings) == "000000"
+
+
+def test_codes_stay_random_without_a_fixed_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(auth_service.secrets, "randbelow", lambda _: 42)
+
+    assert auth_service._new_code(Settings(_env_file=None)) == "000042"
