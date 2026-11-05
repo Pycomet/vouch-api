@@ -15,6 +15,11 @@ Fixtures
     Drops the schema, upgrades to ``0002_listing_publication_fields`` and seeds it
     with raw SQL (see :func:`seed_0002`). Yields a :class:`Seed0002` with the ids of
     the seeded rows. Later tasks extend :func:`seed_0002` and ``Seed0002``.
+``db_at_0005``
+    The same at ``0005_otp_challenges`` with :func:`seed_0005` (vendor, assets
+    including a paused one and one whose category disagrees with its catalogue
+    item, bookings and webhook events), for migration 0006. Yields a
+    :class:`Seed0005`.
 ``conn``
     An asyncpg connection to the test database. Request it after ``migrated_db`` or
     ``db_at_0002`` so it sees the prepared schema.
@@ -37,6 +42,7 @@ so later test files still work.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -248,6 +254,131 @@ def db_at_0002(alembic_cfg: Config) -> Iterator[Seed0002]:
     command.upgrade(alembic_cfg, REVISION_0002)
     try:
         yield asyncio.run(seed_0002(asyncpg_url()))
+    finally:
+        command.upgrade(alembic_cfg, "head")
+
+
+# ---------------------------------------------------------------------------
+# Seeded 0005 database (for migration 0006)
+# ---------------------------------------------------------------------------
+
+REVISION_0005 = "0005_otp_challenges"
+SEED_0005_VENDOR_CREATED_AT = datetime.datetime(2026, 3, 14, 10, 0, tzinfo=datetime.UTC)
+
+
+@dataclass
+class Seed0005:
+    """Ids of the rows :func:`seed_0005` inserted."""
+
+    renter_id: uuid.UUID
+    vendor_id: uuid.UUID
+    active_asset_id: uuid.UUID
+    paused_asset_id: uuid.UUID
+    mismatched_asset_id: uuid.UUID
+    camera_item_id: uuid.UUID
+    camera_category_id: int
+    lens_category_id: int
+    booking_ids: list[uuid.UUID]
+    webhook_event_ids: list[int]
+
+
+async def seed_0005(url: str) -> Seed0005:
+    """Seed a database at revision 0005 with raw SQL (no ORM: models track head).
+
+    Rows: a renter and a vendor (``created_at`` fixed at
+    :data:`SEED_0005_VENDOR_CREATED_AT`); a camera catalogue item; three of the
+    vendor's assets on it: an active one with serial ``SN-SEED-1``, a paused one and
+    one whose ``category_id`` says ``lens`` (0005 has no FK that stops this); a
+    completed and a cancelled booking of the active asset; and two webhook events,
+    one processed and one with a ``processing_error``.
+    """
+    connection = await asyncpg.connect(url)
+    try:
+        renter_id = await connection.fetchval(
+            "INSERT INTO users (phone, full_name, role, is_active) "
+            "VALUES ('+2348000000501', 'Seed Renter', 'renter', true) RETURNING id"
+        )
+        vendor_id = await connection.fetchval(
+            "INSERT INTO users (phone, full_name, role, is_active, created_at) "
+            "VALUES ('+2348000000502', 'Seed Vendor', 'vendor', true, $1) "
+            "RETURNING id",
+            SEED_0005_VENDOR_CREATED_AT,
+        )
+        camera = await connection.fetchval("SELECT id FROM categories WHERE slug = 'camera'")
+        lens = await connection.fetchval("SELECT id FROM categories WHERE slug = 'lens'")
+        city = await connection.fetchval("SELECT id FROM cities WHERE slug = 'lagos'")
+        item_id = await connection.fetchval(
+            "INSERT INTO catalogue_items (category_id, make, model, replacement_value_band) "
+            "VALUES ($1, 'Sony', 'FX3', 'B') RETURNING id",
+            camera,
+        )
+        asset_sql = (
+            "INSERT INTO assets (vendor_id, catalogue_item_id, category_id, city_id, "
+            "daily_rate, deposit_amount, listing_status, serial_number) "
+            "VALUES ($1, $2, $3, $4, 50000, 150000, $5, $6) RETURNING id"
+        )
+        active = await connection.fetchval(
+            asset_sql, vendor_id, item_id, camera, city, "active", "SN-SEED-1"
+        )
+        paused = await connection.fetchval(
+            asset_sql, vendor_id, item_id, camera, city, "paused", "SN-SEED-2"
+        )
+        mismatched = await connection.fetchval(
+            asset_sql, vendor_id, item_id, lens, city, "active", None
+        )
+        booking_ids = []
+        for status, start in (
+            ("completed", datetime.date(2026, 11, 1)),
+            ("cancelled_by_renter", datetime.date(2026, 11, 10)),
+        ):
+            booking_ids.append(
+                await connection.fetchval(
+                    "INSERT INTO bookings (asset_id, renter_id, vendor_id, starts_on, ends_on, "
+                    "status, total_rental_fee, deposit_amount, price_snapshot, "
+                    "fulfilment_choice) "
+                    "VALUES ($1, $2, $3, $4::date, $4::date + 2, $5, 150000, 150000, "
+                    "'{}', 'pickup') RETURNING id",
+                    active,
+                    renter_id,
+                    vendor_id,
+                    start,
+                    status,
+                )
+            )
+        webhook_event_ids = []
+        for event, error in (("evt-seed-ok", None), ("evt-seed-failed", "amount mismatch")):
+            webhook_event_ids.append(
+                await connection.fetchval(
+                    "INSERT INTO webhook_events (provider, provider_event_id, payload, "
+                    "signature_ok, processed_at, processing_error) "
+                    "VALUES ('fake', $1, '{}'::jsonb, true, now(), $2) RETURNING id",
+                    event,
+                    error,
+                )
+            )
+        return Seed0005(
+            renter_id=renter_id,
+            vendor_id=vendor_id,
+            active_asset_id=active,
+            paused_asset_id=paused,
+            mismatched_asset_id=mismatched,
+            camera_item_id=item_id,
+            camera_category_id=camera,
+            lens_category_id=lens,
+            booking_ids=booking_ids,
+            webhook_event_ids=webhook_event_ids,
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.fixture
+def db_at_0005(alembic_cfg: Config) -> Iterator[Seed0005]:
+    """A fresh schema at 0005 holding the :func:`seed_0005` rows; ``head`` after."""
+    asyncio.run(_drop_public_schema(asyncpg_url()))
+    command.upgrade(alembic_cfg, REVISION_0005)
+    try:
+        yield asyncio.run(seed_0005(asyncpg_url()))
     finally:
         command.upgrade(alembic_cfg, "head")
 
