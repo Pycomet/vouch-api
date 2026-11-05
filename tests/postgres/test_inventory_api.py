@@ -25,6 +25,7 @@ from app.core.config import Environment, Settings
 from app.main import create_app
 from app.schemas.errors import CityNotLaunchedError, ResourceNotFoundError
 from app.services.inventory import get_public_asset, search_public_assets
+from tests.helpers.cursors import CRAFTED_CURSORS
 from tests.postgres.conftest import DATABASE_URL, asyncpg_url
 
 pytestmark = pytest.mark.skipif(
@@ -49,7 +50,7 @@ async def _seed() -> InventorySeed:
     try:
 
         async def user(phone: str, role: str, active: bool = True) -> uuid.UUID:
-            return await conn.fetchval(
+            user_id = await conn.fetchval(
                 "INSERT INTO users (phone, full_name, role, is_active) "
                 "VALUES ($1, $2, $3, $4) RETURNING id",
                 phone,
@@ -57,6 +58,14 @@ async def _seed() -> InventorySeed:
                 role,
                 active,
             )
+            if role == "vendor":
+                # An active vendor profile (M3a 4.7): without one, nothing is public.
+                await conn.execute(
+                    "INSERT INTO vendor_profiles (user_id, status, business_type, verified_at) "
+                    "VALUES ($1, 'active', 'individual', now())",
+                    user_id,
+                )
+            return user_id
 
         async def item(category: str, make: str, model: str, aliases: list[str]) -> uuid.UUID:
             return await conn.fetchval(
@@ -397,3 +406,11 @@ async def test_service_rejects_unlaunched_city_and_hides_detail(seed: InventoryS
             assert row.city_slug == "lagos"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.parametrize("cursor", CRAFTED_CURSORS.values(), ids=CRAFTED_CURSORS.keys())
+def test_search_well_formed_but_wrong_cursor_is_400(client: TestClient, cursor) -> None:
+    response = client.get("/api/v1/assets", params={"cursor": cursor})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_cursor"

@@ -44,7 +44,7 @@ The client never sets a role, tier, price, commission, payment status or payout 
 | GET | `/catalogue/search` | anyone | query: `q`, `city`, `from`, `to`, `limit`, `cursor` | 200 page of `PublicAsset` + `equivalents` | 400 `invalid_request` / `city_not_launched` / `invalid_cursor`, 422 |
 | POST | `/bookings` | renter | `{asset_id, starts_on, ends_on, fulfilment, damage_contribution}` | 201 `Booking` (`requested`) | 400, 401, 403, 404, 409 guards, 422 |
 | GET | `/bookings/{id}` | the booking's renter or vendor, or an admin | — | 200 `Booking` | 401, 403, 404, 422 |
-| POST | `/bookings/{id}/accept` | vendor | — | 200 `Booking` (`accepted`) | 401, 403, 404, 409, 422, 502 `payment_provider_error`, 503 `payment_unavailable` |
+| POST | `/bookings/{id}/accept` | vendor | — | 200 `Booking` (`accepted`) | 401, 403, 404, 409 (incl. `vendor_not_active`), 422, 502 `payment_provider_error`, 503 `payment_unavailable` |
 | POST | `/bookings/{id}/decline` | vendor | `{reason?}` | 200 `Booking` (`declined`) | 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/approve` | vendor | — | 200 `Booking` (`vendor_approved_at` set) | 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/cancel` | renter or vendor | `{reason?}` (vendor: required) | 200 `Booking` (`cancelled_by_renter` / `cancelled_by_vendor`) | 401, 403, 404, 409, 422 |
@@ -54,6 +54,19 @@ The client never sets a role, tier, price, commission, payment status or payout 
 | POST | `/bookings/{id}/claim` | vendor | `{amount, description, evidence_urls}` | 200 `Booking` (`disputed`) | 400, 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/resolve` | admin | `{decision, reason, amount?}` | 200 `Booking` (`completed`) | 400, 401, 403, 404, 409, 422 |
 | GET | `/me/home` | renter | — | 200 `{active, past}` | 401, 403 |
+| GET | `/catalogue/items` | anyone | query: `q`, `category` (slug), `limit`, `cursor` | 200 page of `{id, category, make, model, mount, specs, replacement_value_band}` (active items only) | 400 `invalid_request` (unknown category) / `invalid_cursor`, 422 |
+| GET | `/vendor/profile` | vendor | — | 200 `{status, business_type, is_sub_broker, business_name, bank_name, account_name, account_last4, has_recipient_code}` (the recipient code itself is never returned) | 401, 403, 404 (no profile) |
+| POST | `/vendor/assets` | vendor (active profile) | `{catalogue_item_id, city, serial_number?, condition_grade?, daily_rate, deposit_amount, weekend_rate?, weekly_rate?, description?, condition_notes?, included_accessories?, fulfilment?, minimum_trust_tier?}` | 201 `OwnAsset` (`draft`) | 400 `city_not_launched`, 401, 403, 409 `vendor_not_active` / `catalogue_item_inactive` / `duplicate_serial`, 422 (incl. unknown catalogue item, tier below the band default) |
+| GET | `/vendor/assets` | vendor | query: `status`, `limit`, `cursor` | 200 page of `OwnAsset`, newest first | 400 `invalid_cursor`, 401, 403, 422 |
+| GET | `/vendor/assets/{id}` | vendor (own listing) | — | 200 `OwnAsset` | 401, 403, 404, 422 |
+| PATCH | `/vendor/assets/{id}` | vendor (own listing, active profile) | any create field except `minimum_trust_tier` | 200 `OwnAsset` | 400 `city_not_launched`, 401, 403, 404, 409 `vendor_not_active` / `listing_locked` / `listing_incomplete` / `catalogue_item_inactive` / `duplicate_serial`, 422 |
+| POST | `/vendor/assets/{id}/submit` | vendor (own listing, active profile) | — | 200 `OwnAsset` (`review`) | 401, 403, 404, 409 `vendor_not_active` / `invalid_transition` / `listing_incomplete` / `catalogue_item_inactive`, 422 |
+| POST | `/vendor/assets/{id}/pause` | vendor (own listing, active profile) | — | 200 `OwnAsset` (`paused`, `paused_by: "vendor"`) | 401, 403, 404, 409 `vendor_not_active` / `invalid_transition`, 422 |
+| POST | `/vendor/assets/{id}/resume` | vendor (own listing, active profile) | — | 200 `OwnAsset` (`active`) | 401, 403, 404, 409 `vendor_not_active` / `invalid_transition` (not paused, or paused by an admin), 422 |
+| DELETE | `/vendor/assets/{id}` | vendor (own listing, active profile) | — | 204 (soft delete) | 401, 403, 404, 409 `vendor_not_active` / `has_live_bookings`, 422 |
+| POST | `/vendor/assets/{id}/blocks` | vendor (own listing, active profile) | `{starts_on, ends_on}` (inclusive dates) | 201 `{id, asset_id, starts_on, ends_on, created_at}` | 400 `invalid_request` (start after end, or before today), 401, 403, 404, 409 `vendor_not_active` / `dates_blocked` / `dates_unavailable`, 422 |
+| GET | `/vendor/assets/{id}/blocks` | vendor (own listing) | query: `from` (date; default today in the business zone) | 200 `{items: [block]}`, blocks ending on or after `from`, by start date | 401, 403, 404, 422 |
+| DELETE | `/vendor/assets/{id}/blocks/{block_id}` | vendor (own listing, active profile) | — | 204 | 401, 403, 404 (not a block of this listing), 409 `vendor_not_active`, 422 |
 | GET | `/vendor/home` | vendor | — | 200 `{requests, today: {handovers, returns}, next_payout, utilisation_7d}` | 401, 403 |
 | POST | `/webhooks/{provider}` | the payment provider (no token; `X-Vouch-Signature`) | the provider's raw event | 200 `{status: "processed" \| "duplicate", processing_error}` | 401 `invalid_signature`, 404 (provider is not the configured one), 413, 422 |
 
@@ -66,10 +79,11 @@ The client never sets a role, tier, price, commission, payment status or payout 
 
 ### 4.2 Inventory
 
-`PublicAsset` is `{id, name, display_name, make, model, description, category, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, city, is_available, minimum_trust_tier, created_at, updated_at}`. It never includes the serial number, vendor identity, condition notes or review data. Only active, available, non-deleted listings of active vendors in launched cities are visible.
+`PublicAsset` is `{id, name, display_name, make, model, description, category, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, city, is_available, minimum_trust_tier, created_at, updated_at}`. It never includes the serial number, vendor identity, condition notes or review data. Only active, available, non-deleted listings of active vendors (an active user whose vendor profile is `active`) in launched cities are visible; a pending or suspended vendor's listings vanish from search and their detail is 404.
 
 - `/assets`: `starts_on` and `ends_on` must be given together, with `starts_on <= ends_on` (400 otherwise). With them, units that have a live booking or a blocked window overlapping the range are left out.
 - `/catalogue/search`: `q` is a full-text match on make, model and aliases. `from` and `to` work like the `/assets` dates. If nothing is free and `q` matched catalogue items, the search runs again over those items' categories without `q`, and the response says `"equivalents": true`.
+- `/catalogue/items`: an unknown `category` slug is 400 `invalid_request`, while `/assets?category=` with an unknown slug is an empty 200. The difference is deliberate: this is a lookup of the catalogue's own categories, so it rejects a slug that is not one of them, while `/assets` is a search that simply finds nothing.
 
 ### 4.3 Bookings
 
@@ -143,6 +157,19 @@ Each card is `{id, status, asset_id, asset_name, starts_on, ends_on, hold_expire
 
 The route commits in every case, including the 401. The full semantics are in `docs/SCHEMA.md` §10.
 
+### 4.7 Vendor listings
+
+`OwnAsset` is the owning vendor's full view: `{id, catalogue_item_id, make, model, category, city, serial_number, condition_grade, condition_notes, description, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, included_accessories, fulfilment: {pickup, delivery, delivery_fee}, listing_status, minimum_trust_tier, paused_by, review_reason, reviewed_at, is_available, created_at, updated_at}`. Nobody else ever sees it; the public view stays `PublicAsset`. Another vendor's listing, and a deleted one, are 404 on every route, exactly like an unknown id.
+
+- **Vendor status.** Reads work whatever the vendor's profile status. Every write (create, edit, submit, pause, resume, delete, and adding or removing a block) needs an `active` profile: 409 `vendor_not_active` otherwise.
+- **Create.** The listing starts as `draft`. `category` comes from the catalogue item and is never accepted from the client. An unknown catalogue item is 422 (a bad body field, in FastAPI's `detail` shape, `loc: ["body", "catalogue_item_id"]`); an inactive one is 409 `catalogue_item_inactive`. `city` must be a launched city slug. `minimum_trust_tier` defaults from the item's band (A→1, B→2, C→3); the vendor may raise it up to 3, and a value below the band default is 422 (`loc: ["body", "minimum_trust_tier"]`). A serial the vendor already lists for the same item (any letter case) is 409 `duplicate_serial`. `fulfilment` defaults to pickup only; `delivery_fee` is a money string.
+- **States.** `draft`/`rejected` →`submit`→ `review` →(admin approve)→ `active` ⇄ `paused` (`pause`/`resume`); review →(admin reject)→ `rejected`. Any other event is 409 `invalid_transition` with `details: {from, event}`. A vendor resumes only a listing they paused themselves (`paused_by: "vendor"`).
+- **Submit** needs a serial number, a condition grade, `daily_rate > 0`, `deposit_amount >= 0`, pickup or delivery enabled, and a `delivery_fee` (zero counts) when delivery is enabled; otherwise 409 `listing_incomplete` with `details.missing`. A listing whose catalogue item has since been retired is 409 `catalogue_item_inactive`.
+- **Edits.** Only the fields sent change, and a value equal to the current one is not a change. In `review` every edit is 409 `listing_locked`. Identity fields (`catalogue_item_id`, `serial_number`, `city`) change only in `draft` or `rejected` (409 `listing_locked`, `details.fields` naming them); commercial fields (rates, deposit, accessories, fulfilment, description, condition notes and grade) also in `active` and `paused`. A booking keeps the `price_snapshot` it was requested with, so an edit never changes an existing booking. An `active` or `paused` listing must stay complete by the submit rules: an edit that would leave something missing (for example delivery without a `delivery_fee`, neither pickup nor delivery, or no condition grade) is 409 `listing_incomplete` with `details.missing`, and nothing changes; a `draft` or `rejected` listing may stay incomplete until it is submitted. `minimum_trust_tier` cannot be sent (422): only an admin changes it. A new catalogue item re-derives the category, and a tier below the new item's band default is raised to it. Each edit that changes something writes one `asset.updated` audit row with the before and after of the changed fields only.
+- **Pause** removes the listing from search; live bookings continue. **Delete** is a soft delete (204), refused with 409 `has_live_bookings` while any booking on the listing is live or `disputed`; the serial can then be listed again.
+- **Availability blocks** close dates on the listing to new requests (a request on them is 409 `dates_blocked`). A block may be added in any listing status. Both dates are inclusive; the start may not be after the end, nor before today in the business zone (400 `invalid_request`). A block that overlaps another block of the listing is 409 `dates_blocked` (the exclusion constraint on `availability_windows` is the backstop and gets the same answer); one that overlaps a live booking is 409 `dates_unavailable`. `GET` lists blocks ending on or after `from` (default today), ordered by start date. `DELETE` removes the block (204), and its dates can be requested again; a block id that is not a block of this listing is 404. Each add or removal writes one audit row (`availability.blocked` / `availability.unblocked`, with the asset and the dates).
+- **Blocks and requests never race.** Adding a block and `POST /bookings` both lock the listing's row first, then check blocks, then live bookings, then insert. Whichever arrives first wins; the other waits for it and then gets 409 (`dates_blocked` for the request, `dates_unavailable` for the block).
+
 ## 5. Error envelope
 
 Every error except a 422 uses this envelope:
@@ -165,13 +192,19 @@ A 422 is FastAPI's validation body, `{"detail": [{"type", "loc", "msg", "ctx"?}]
 | 401 | `unauthenticated` | Missing, bad or expired token; the token's user is missing, inactive, deleted or has another role; any failed OTP verify. Sent with `WWW-Authenticate: Bearer`. |
 | 401 | `invalid_signature` | The webhook's `X-Vouch-Signature` is missing or wrong |
 | 403 | `forbidden` | Authenticated, but this role may not use the route or action |
-| 404 | `resource_not_found` | Unknown or hidden: an asset that is not public, a booking the caller is not party to, an unknown webhook provider |
-| 409 | `invalid_transition` | The booking cannot take this event from its status, or this actor may not send it. `details: {from, event}` |
+| 404 | `resource_not_found` | Unknown or hidden: an asset that is not public (including every listing of a vendor whose profile is not `active`), a booking the caller is not party to, an unknown webhook provider |
+| 409 | `invalid_transition` | The booking (or listing) cannot take this event from its status, or this actor may not send it. `details: {from, event}` |
+| 409 | `vendor_not_active` | The vendor's profile is `pending` or `suspended` (or missing): no listing write at all (create, `PATCH`, submit, pause, resume, delete, adding or removing a block) and no accepting a request. Reads, handovers and returns still work. `details: {status}` |
+| 409 | `listing_locked` | The vendor's listing cannot take this edit: any edit while it is in `review`, or an identity field (`catalogue_item_id`, `serial_number`, `city`) outside `draft`/`rejected`. `details: {status, fields?}` |
+| 409 | `listing_incomplete` | A listing submitted for review lacks something it needs, or an edit would leave an `active` or `paused` listing without it (nothing is changed). `details: {missing: [...]}` (`serial_number`, `condition_grade`, `daily_rate`, `deposit_amount`, `fulfilment`, `delivery_fee`) |
+| 409 | `catalogue_item_inactive` | The listing names a catalogue item that is no longer active |
+| 409 | `duplicate_serial` | The vendor already lists a unit of this catalogue item with this serial number (any letter case) |
+| 409 | `has_live_bookings` | A listing with a live or disputed booking cannot be deleted |
 | 409 | `tier_insufficient` | The renter's effective trust tier is below the item's minimum. `details: {required, effective}` |
 | 409 | `vendor_approval_required` | A tier-3 item: the vendor must approve the renter before accepting |
 | 409 | `approval_not_required` | `/approve` on an item that does not need it |
-| 409 | `dates_blocked` | The vendor has blocked some of the dates |
-| 409 | `dates_unavailable` | Another live booking holds overlapping dates |
+| 409 | `dates_blocked` | The vendor has blocked some of the dates: a booking request on a block, or a new block that overlaps another block of the listing |
+| 409 | `dates_unavailable` | A live booking holds overlapping dates: a booking request on them, or a new block over them |
 | 409 | `renter_restricted` | The renter's account is restricted, inactive or deleted |
 | 409 | `self_booking` | The renter is the item's own vendor |
 | 409 | `hold_expired` | The 4-hour request hold has passed. `details: {hold_expires_at}` |

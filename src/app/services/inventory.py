@@ -12,6 +12,8 @@ Visibility rules applied here
 4. The asset's city is launched: its ``cities.slug`` is in ``launched_cities``
    (from ``Settings.launched_cities``) and ``cities.is_active = TRUE``.
 5. Owning vendor: ``users.is_active = TRUE AND users.deleted_at IS NULL``
+6. The owning vendor's profile is ``active`` (M3a 4.7): a ``pending`` or
+   ``suspended`` profile, or none at all, hides every listing of that vendor.
 
 A ``city`` filter that is not in ``launched_cities`` raises
 :class:`~app.schemas.errors.CityNotLaunchedError` (400) before any query runs.
@@ -57,7 +59,8 @@ from app.db.models.booking import LIVE_BOOKING_STATUSES, Booking
 from app.db.models.catalogue import CATALOGUE_SEARCH_FUNCTION, CatalogueItem
 from app.db.models.reference import Category, City
 from app.db.models.user import User
-from app.schemas.errors import CityNotLaunchedError, ResourceNotFoundError
+from app.db.models.vendor import VendorProfile, VendorStatus
+from app.schemas.errors import CityNotLaunchedError, InvalidRequestError, ResourceNotFoundError
 from app.schemas.pagination import MAX_PAGE_LIMIT, decode_cursor, encode_cursor
 
 
@@ -99,6 +102,8 @@ def _public_query(launched_cities: Sequence[str]) -> Select:
         .join(Category, Category.id == Asset.category_id)
         .join(CatalogueItem, CatalogueItem.id == Asset.catalogue_item_id)
         .join(User, User.id == Asset.vendor_id)
+        # Inner join: a vendor without a profile counts as not active.
+        .join(VendorProfile, VendorProfile.user_id == Asset.vendor_id)
         .where(
             Asset.listing_status == ListingStatus.active,
             Asset.is_available.is_(True),
@@ -107,6 +112,7 @@ def _public_query(launched_cities: Sequence[str]) -> Select:
             City.is_active.is_(True),
             User.is_active.is_(True),
             User.deleted_at.is_(None),
+            VendorProfile.status == VendorStatus.active,
         )
     )
 
@@ -232,9 +238,7 @@ async def search_public_assets(
 
     # Cursor: items after the encoded (created_at, id) position.
     if cursor is not None:
-        created_at_iso, id_str = decode_cursor(cursor)
-        cursor_dt = datetime.datetime.fromisoformat(created_at_iso)
-        cursor_id = uuid.UUID(id_str)
+        cursor_dt, cursor_id = decode_cursor(cursor)
         stmt = stmt.where(
             and_(
                 Asset.created_at >= cursor_dt,
@@ -286,8 +290,8 @@ async def get_public_asset(
 
     Raises :class:`app.schemas.errors.ResourceNotFoundError` when the asset is
     absent, soft-deleted, non-active, in a city that is not launched, or owned
-    by an inactive vendor, making all hidden states indistinguishable from a
-    genuine 404.
+    by an inactive vendor or one whose profile is not ``active``, making all
+    hidden states indistinguishable from a genuine 404.
     """
     stmt = _public_query(launched_cities).where(Asset.id == asset_id)
     result = await session.execute(stmt)
@@ -297,3 +301,62 @@ async def get_public_asset(
         raise ResourceNotFoundError()
 
     return _to_row(row)
+
+
+@dataclass(frozen=True)
+class CatalogueItemRow:
+    """One active catalogue item with its category slug."""
+
+    item: CatalogueItem
+    category_slug: str
+
+
+@dataclass
+class CatalogueItemPage:
+    items: list[CatalogueItemRow]
+    next_cursor: str | None
+
+
+async def list_catalogue_items(
+    session: AsyncSession,
+    *,
+    q: str | None = None,
+    category: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> CatalogueItemPage:
+    """A page of active catalogue items (M3a 4.1), ordered by ``(created_at, id)``.
+
+    ``q`` uses the same search vector as :func:`search_public_assets`. A ``category``
+    slug that does not exist raises 400 ``invalid_request``.
+    """
+    limit = min(limit, MAX_PAGE_LIMIT)
+    if category is not None:
+        known = await session.scalar(select(Category.id).where(Category.slug == category))
+        if known is None:
+            raise InvalidRequestError(message="Unknown category.", details={"category": category})
+
+    stmt = (
+        select(CatalogueItem, Category.slug)
+        .join(Category, Category.id == CatalogueItem.category_id)
+        .where(CatalogueItem.is_active.is_(True))
+    )
+    if category is not None:
+        stmt = stmt.where(Category.slug == category)
+    if q is not None and q.strip():
+        stmt = stmt.where(_text_match(q))
+    if cursor is not None:
+        cursor_dt, cursor_id = decode_cursor(cursor)
+        stmt = stmt.where(
+            CatalogueItem.created_at >= cursor_dt,
+            ~and_(CatalogueItem.created_at == cursor_dt, CatalogueItem.id <= cursor_id),
+        )
+    stmt = stmt.order_by(CatalogueItem.created_at.asc(), CatalogueItem.id.asc()).limit(limit + 1)
+
+    rows = [CatalogueItemRow(item, slug) for item, slug in (await session.execute(stmt)).all()]
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1].item
+        next_cursor = encode_cursor(last.created_at.isoformat(), str(last.id))
+    return CatalogueItemPage(items=rows, next_cursor=next_cursor)

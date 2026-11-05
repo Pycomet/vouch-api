@@ -20,7 +20,7 @@ from app.db.session import create_database_engine, create_database_sessionmaker
 from app.providers.kyc import build_kyc_provider
 from app.providers.otp import build_otp_sender
 from app.providers.registry import build_payment_provider
-from app.schemas.errors import ErrorDetail, ErrorEnvelope, VouchAPIError
+from app.schemas.errors import BodyFieldError, ErrorDetail, ErrorEnvelope, VouchAPIError
 
 
 def _error_response(request: Request, exc: VouchAPIError) -> JSONResponse:
@@ -52,7 +52,9 @@ def _json_safe(value: object) -> object:
     return value
 
 
-def _validation_response(request: Request, exc: RequestValidationError) -> JSONResponse:
+def _validation_response(
+    request: Request, exc: RequestValidationError | BodyFieldError
+) -> JSONResponse:
     """FastAPI's 422 body without the rejected input.
 
     Each item keeps ``type``, ``loc``, ``msg`` and ``ctx``. ``input`` is dropped: on a
@@ -107,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.add_exception_handler(VouchAPIError, _error_response)  # type: ignore[arg-type]
     application.add_exception_handler(RequestValidationError, _validation_response)  # type: ignore[arg-type]
+    application.add_exception_handler(BodyFieldError, _validation_response)  # type: ignore[arg-type]
     application.include_router(api_router, prefix=runtime_settings.api_v1_prefix)
     return application
 

@@ -13,7 +13,9 @@ read-only public endpoint.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
+import uuid
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
@@ -55,15 +57,23 @@ def encode_cursor(created_at_iso: str, id_str: str) -> str:
     return base64.urlsafe_b64encode(payload.encode()).decode()
 
 
-def decode_cursor(cursor: str) -> tuple[str, str]:
-    """Decode a cursor and return ``(created_at_iso, id_str)``.
+def decode_cursor(cursor: str) -> tuple[datetime.datetime, uuid.UUID]:
+    """Decode a cursor and return ``(created_at, id)`` as typed values.
 
-    Raises :class:`CursorDecodeError` on any decode failure so callers receive
-    a stable 400 response rather than an unhandled exception.
+    ``created_at`` must be an ISO-8601 string with an offset (every cursor the API
+    issues has one) and ``id`` a UUID string. Raises :class:`CursorDecodeError` on
+    any failure, including a well-formed cursor whose values are wrong, so callers
+    receive a stable 400 response rather than an unhandled exception.
     """
     try:
         raw = base64.urlsafe_b64decode(cursor.encode() + b"==")
         data = json.loads(raw)
-        return str(data["created_at"]), str(data["id"])
+        created_at_iso, id_str = data["created_at"], data["id"]
+        if not isinstance(created_at_iso, str) or not isinstance(id_str, str):
+            raise TypeError("cursor values must be strings")
+        created_at = datetime.datetime.fromisoformat(created_at_iso)
+        if created_at.utcoffset() is None:
+            raise ValueError("cursor timestamp has no offset")
+        return created_at, uuid.UUID(id_str)
     except Exception as exc:
         raise CursorDecodeError() from exc

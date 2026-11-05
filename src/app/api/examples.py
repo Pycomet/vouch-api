@@ -20,10 +20,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.schemas.errors import (
+    LISTING_TRANSITION_MESSAGE,
     BookingGuardFailed,
+    CatalogueItemInactiveError,
+    DatesBlockedError,
+    DatesUnavailableError,
+    DuplicateSerialError,
     ErrorEnvelope,
+    HasLiveBookingsError,
+    InvalidTransition,
+    ListingIncompleteError,
+    ListingLockedError,
     OtpRejectedError,
     ValidationErrorResponse,
+    VendorNotActiveError,
+    VouchAPIError,
 )
 
 REQUEST_ID = "4b9f7c1e-2d3a-4e5f-8a6b-7c8d9e0f1a2b"
@@ -50,6 +61,24 @@ def guard(code: str, details: dict[str, Any] | None = None, description: str = "
     """The 409 a booking guard ``code`` returns, with the API's own message."""
     error = BookingGuardFailed(code, details)
     return Err(409, code, error.detail_message, error.error_details, description or None)
+
+
+def raised(
+    error: type[VouchAPIError] | VouchAPIError,
+    details: dict[str, Any] | None = None,
+    description: str = "",
+    name: str | None = None,
+) -> Err:
+    """The error an exception class (or instance) returns, with its own message."""
+    instance = error if isinstance(error, VouchAPIError) else error(details=details)
+    return Err(
+        instance.status_code,
+        instance.code,
+        instance.detail_message,
+        details if details is not None else instance.error_details,
+        description or None,
+        name,
+    )
 
 
 _DEFAULT_ERRORS: dict[int, Err] = {
@@ -373,6 +402,131 @@ VENDOR_HOME_EXAMPLE: dict[str, Any] = {
     "utilisation_7d": "0.43",
 }
 
+CATALOGUE_ITEMS_EXAMPLE: dict[str, Any] = {
+    "items": [
+        {
+            "id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e",
+            "category": "camera",
+            "make": "Sony",
+            "model": "FX3",
+            "mount": "E",
+            "specs": {},
+            "replacement_value_band": "C",
+        }
+    ],
+    "pagination": {"limit": 20, "next_cursor": None},
+}
+
+UNKNOWN_CATEGORY = Err(
+    400,
+    "invalid_request",
+    "Unknown category.",
+    {"category": "no-such-category"},
+    description="The category slug does not exist.",
+)
+
+VENDOR_PROFILE_EXAMPLE: dict[str, Any] = {
+    "status": "active",
+    "business_type": "rental_house",
+    "is_sub_broker": False,
+    "business_name": "Example Rentals Ltd",
+    "bank_name": "Example Bank",
+    "account_name": "EXAMPLE RENTALS LTD",
+    "account_last4": "4321",
+    "has_recipient_code": True,
+}
+
+# The vendor's own listings (M3a 4.4).
+OWN_ASSET_EXAMPLE: dict[str, Any] = {
+    "id": ASSET_ID,
+    "catalogue_item_id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e",
+    "make": "Sony",
+    "model": "FX3",
+    "category": "camera",
+    "city": "city-slug",
+    "serial_number": "SN-0001",
+    "condition_grade": "excellent",
+    "condition_notes": "Light wear on the grip.",
+    "description": "Full-frame cinema body with two batteries.",
+    "daily_rate": "50000.00",
+    "weekend_rate": "90000.00",
+    "weekly_rate": None,
+    "deposit_amount": "150000.00",
+    "currency": "NGN",
+    "included_accessories": ["2 batteries", "128 GB card"],
+    "fulfilment": {"pickup": True, "delivery": True, "delivery_fee": "5000.00"},
+    "listing_status": "draft",
+    "minimum_trust_tier": 3,
+    "paused_by": None,
+    "review_reason": None,
+    "reviewed_at": None,
+    "is_available": True,
+    "created_at": "2026-11-05T09:15:00Z",
+    "updated_at": "2026-11-05T09:15:00Z",
+}
+OWN_ASSET_PAGE_EXAMPLE: dict[str, Any] = {
+    "items": [OWN_ASSET_EXAMPLE],
+    "pagination": {"limit": 20, "next_cursor": None},
+}
+REVIEW_ASSET_EXAMPLE: dict[str, Any] = {**OWN_ASSET_EXAMPLE, "listing_status": "review"}
+PAUSED_ASSET_EXAMPLE: dict[str, Any] = {
+    **OWN_ASSET_EXAMPLE,
+    "listing_status": "paused",
+    "paused_by": "vendor",
+}
+ACTIVE_ASSET_EXAMPLE: dict[str, Any] = {**OWN_ASSET_EXAMPLE, "listing_status": "active"}
+
+LISTING_LOCKED = raised(
+    ListingLockedError, {"status": "review"}, "Locked while in review.", name="listing_locked"
+)
+IDENTITY_LOCKED = raised(
+    ListingLockedError,
+    {"status": "active", "fields": ["serial_number"]},
+    "An identity field outside draft or rejected.",
+    name="identity_locked",
+)
+LISTING_INCOMPLETE = raised(
+    ListingIncompleteError(["serial_number", "delivery_fee"]),
+    description="Something the review needs is missing.",
+)
+CATALOGUE_ITEM_INACTIVE = raised(
+    CatalogueItemInactiveError,
+    {"catalogue_item_id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e"},
+    "The catalogue item is no longer active.",
+)
+DUPLICATE_SERIAL = raised(DuplicateSerialError, description="You already list this serial.")
+HAS_LIVE_BOOKINGS = raised(HasLiveBookingsError, description="A booking still holds the unit.")
+
+
+# Availability blocks (M3a 4.6).
+BLOCK_EXAMPLE: dict[str, Any] = {
+    "id": "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a",
+    "asset_id": ASSET_ID,
+    "starts_on": "2026-12-24",
+    "ends_on": "2026-12-27",
+    "created_at": "2026-11-05T09:15:00Z",
+}
+BLOCK_LIST_EXAMPLE: dict[str, Any] = {"items": [BLOCK_EXAMPLE]}
+BLOCK_DATES_INVALID = Err(
+    400,
+    "invalid_request",
+    "The start date must not be in the past.",
+    description="The start is after the end, or before today (business zone).",
+)
+BLOCK_OVERLAPS_BLOCK = raised(DatesBlockedError, description="Another block overlaps these dates.")
+BLOCK_OVERLAPS_BOOKING = raised(
+    DatesUnavailableError, description="A live booking holds some of these dates."
+)
+
+
+def listing_transition(from_status: str, event: str, description: str) -> Err:
+    """The 409 ``invalid_transition`` an illegal listing event returns."""
+    return raised(
+        InvalidTransition(from_status, event, message=LISTING_TRANSITION_MESSAGE),
+        description=description,
+    )
+
+
 LIVE_EXAMPLE: dict[str, Any] = {"status": "ok", "service": "Vouch API", "version": "0.1.0"}
 READY_EXAMPLE: dict[str, Any] = {**LIVE_EXAMPLE, "checks": {"database": "ok"}}
 NOT_READY_EXAMPLE: dict[str, Any] = {
@@ -473,6 +627,12 @@ PAYLOAD_TOO_LARGE = Err(
     "The request body is too large.",
     description="The body is over the size cap.",
 )
+VENDOR_NOT_ACTIVE = raised(
+    VendorNotActiveError,
+    {"status": "suspended"},
+    "Your vendor profile is pending or suspended.",
+)
+
 PAYMENT_PROVIDER_FAILED = Err(
     502,
     "payment_provider_error",

@@ -10,6 +10,10 @@ An asset is publicly visible when ALL of the following hold:
 4. Its city is launched: the slug is in ``Settings.launched_cities`` and the
    ``cities`` row is active.
 5. The owning vendor has ``is_active = True`` and ``deleted_at IS NULL``.
+6. The owning vendor's profile (``vendor_profiles.status``) is ``active`` (M3a
+   4.7). A ``pending`` or ``suspended`` profile, or no profile at all, counts as
+   not active: every listing of that vendor vanishes from search, and its detail
+   (and a booking request on it) is 404.
 
 A ``city`` filter outside the launched cities returns 400 ``city_not_launched``;
 the detail of an asset in a city that is not launched returns 404.

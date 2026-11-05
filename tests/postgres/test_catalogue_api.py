@@ -22,6 +22,7 @@ from app.core.config import get_settings
 from app.db.models.booking import BookingStatus
 from app.db.session import get_session
 from app.main import create_app
+from tests.helpers.cursors import CRAFTED_CURSORS
 from tests.postgres.factories import create_asset, create_booking, create_user
 
 pytestmark = pytest.mark.skipif(
@@ -178,3 +179,11 @@ async def test_catalogue_search_pages(client, db_session) -> None:
     assert len(_ids(first)) == 2
     assert len(_ids(second)) == 1
     assert second.json()["pagination"]["next_cursor"] is None
+
+
+@pytest.mark.parametrize("cursor", CRAFTED_CURSORS.values(), ids=CRAFTED_CURSORS.keys())
+async def test_catalogue_search_well_formed_but_wrong_cursor_is_400(client, cursor) -> None:
+    response = await client.get(API, params={"cursor": cursor})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_cursor"

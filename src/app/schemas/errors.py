@@ -63,6 +63,30 @@ class ValidationErrorResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class BodyFieldError(Exception):
+    """One request-body field is wrong in a way the schema cannot see.
+
+    For example an unknown ``catalogue_item_id`` or a trust tier below the
+    item's band default. Framework-free, so services can raise it; the app
+    answers 422 in exactly FastAPI's ``{"detail": [...]}`` validation shape, so
+    every 422 looks the same. Not a :class:`VouchAPIError`: it never uses the
+    error envelope.
+    """
+
+    def __init__(self, field: str, type: str, msg: str, input: object = None) -> None:
+        super().__init__(msg)
+        self.field = field
+        self.type = type
+        self.msg = msg
+        self.input = input
+
+    def errors(self) -> list[dict[str, object]]:
+        """The validation issues, as FastAPI's ``RequestValidationError.errors()``."""
+        return [
+            {"type": self.type, "loc": ("body", self.field), "msg": self.msg, "input": self.input}
+        ]
+
+
 class VouchAPIError(Exception):
     """Base for all application-level exceptions that map to HTTP responses."""
 
@@ -263,8 +287,110 @@ class InvalidTransition(VouchAPIError):
     code = "invalid_transition"
     message = "This booking cannot make that transition."
 
-    def __init__(self, from_status: str | None, event: str) -> None:
-        super().__init__(details={"from": from_status, "event": event})
+    def __init__(self, from_status: str | None, event: str, message: str | None = None) -> None:
+        super().__init__(message, details={"from": from_status, "event": event})
+
+
+LISTING_TRANSITION_MESSAGE = "This listing cannot make that transition."
+
+
+class VendorNotActiveError(VouchAPIError):
+    """Raised when a vendor whose profile is not ``active`` tries a vendor write.
+
+    Every listing write (create, edit, submit, pause, resume, delete, adding or
+    removing a block; amendment A23) and accepting a booking request need an
+    ``active`` profile (M3a 4.4, 4.6, 4.7). Returns 409 ``vendor_not_active``.
+    Reads, handovers and returns stay allowed.
+    """
+
+    status_code = 409
+    code = "vendor_not_active"
+    message = "Your vendor account is not active."
+
+
+class ListingLockedError(VouchAPIError):
+    """Raised when a vendor edits a listing, or a field, its status locks (M3a 4.5).
+
+    Returns 409 ``listing_locked`` with ``details: {status}`` and, for an identity
+    field outside ``draft``/``rejected``, ``details.fields``.
+    """
+
+    status_code = 409
+    code = "listing_locked"
+    message = "This listing cannot be edited in its current status."
+
+
+class ListingIncompleteError(VouchAPIError):
+    """Raised when a listing is submitted for review without everything it needs.
+
+    Returns 409 ``listing_incomplete`` with ``details: {missing: [...]}``.
+    """
+
+    status_code = 409
+    code = "listing_incomplete"
+    message = "This listing is missing details needed for review."
+
+    def __init__(self, missing: list[str]) -> None:
+        super().__init__(details={"missing": missing})
+
+
+class CatalogueItemInactiveError(VouchAPIError):
+    """Raised when a listing names a catalogue item that is no longer active.
+
+    Returns 409 ``catalogue_item_inactive``.
+    """
+
+    status_code = 409
+    code = "catalogue_item_inactive"
+    message = "This catalogue item is not available for new listings."
+
+
+class DuplicateSerialError(VouchAPIError):
+    """Raised when the vendor already lists this serial for this catalogue item.
+
+    Translates the unique index ``uq_assets_vendor_item_serial``. Returns 409
+    ``duplicate_serial``.
+    """
+
+    status_code = 409
+    code = "duplicate_serial"
+    message = "You already list a unit of this item with this serial number."
+
+
+class HasLiveBookingsError(VouchAPIError):
+    """Raised when a listing with a live or disputed booking is deleted.
+
+    Returns 409 ``has_live_bookings``.
+    """
+
+    status_code = 409
+    code = "has_live_bookings"
+    message = "This listing has bookings in progress and cannot be deleted."
+
+
+class DatesBlockedError(VouchAPIError):
+    """Raised when a vendor's new block overlaps another block on the listing (M3a 4.6).
+
+    Also the translation of the exclusion constraint
+    ``ex_availability_windows_no_blocked_overlap``. Returns 409 ``dates_blocked``,
+    the code a booking request on blocked dates gets too.
+    """
+
+    status_code = 409
+    code = "dates_blocked"
+    message = "These dates overlap another block on this listing."
+
+
+class DatesUnavailableError(VouchAPIError):
+    """Raised when a vendor's new block overlaps a live booking (M3a 4.6).
+
+    Returns 409 ``dates_unavailable``, the code a booking request gets when another
+    live booking holds the dates.
+    """
+
+    status_code = 409
+    code = "dates_unavailable"
+    message = "A live booking holds some of these dates."
 
 
 _GUARD_MESSAGES = {

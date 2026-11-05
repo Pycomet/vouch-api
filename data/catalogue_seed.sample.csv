@@ -1,0 +1,13 @@
+# SAMPLE DATA ONLY: placeholder gear and placeholder value bands for tests and local use.
+# The owner supplies the real catalogue and bands (spec section 11, D2). Lines starting with # are skipped by the loader.
+category,make,model,mount,band,aliases
+camera,Sony,FX3,E,C,fx3|sony fx 3
+camera,Canon,EOS R5,RF,C,r5|canon r5
+camera,Panasonic,Lumix S5 II,L,B,s5ii|s5 2
+lens,Sony,FE 24-70mm f/2.8 GM II,E,B,24-70 gm|gm ii
+lighting,Aputure,LS 300x,,B,300x|aputure 300x
+audio,Rode,Wireless GO II,,A,wireless go 2|rode go
+drone,DJI,Mavic 3 Pro,,C,mavic 3|dji mavic
+gimbal,DJI,RS 3 Pro,,A,rs3 pro|ronin rs3
+accessory,Manfrotto,Nitrotech 608 Tripod,,A,608 tripod
+accessory,SmallHD,Ultra 7 Monitor,,B,ultra 7|smallhd 7

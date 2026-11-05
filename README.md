@@ -100,6 +100,14 @@ python -m app.cli create-admin --phone +234XXXXXXXXXX --name "Full Name"
 
 It creates a user with role `admin` (or does nothing if that admin already exists), refuses a phone that belongs to another role, writes the audit event `user.admin_created`, and prints the user id. In compose: `docker compose run --rm --no-deps api python -m app.cli create-admin ...`.
 
+## Seeding the catalogue
+
+```bash
+python -m app.cli seed-catalogue --file data/catalogue_seed.sample.csv
+```
+
+An idempotent upsert of catalogue items on `(make, model)` from a CSV with the columns `category,make,model,mount,band,aliases` (aliases separated by `|`; band `A`, `B` or `C`; category a known slug; values are case-sensitive; lines starting with `#` are skipped). The whole file is validated first and written in one transaction: the first bad row is refused with its line number and nothing is written. A category change on an item that assets already use is refused too. It prints `inserted=N updated=N unchanged=N` and writes the audit events `catalogue_item.seeded` and `catalogue_item.seed_updated`. `data/catalogue_seed.sample.csv` is sample data with placeholder bands; the real catalogue comes from the owner.
+
 ## Providers (fakes only in M2)
 
 The OTP sender, the KYC provider and the payment provider each have one implementation in M2, an in-memory **fake**. No SMS, KYC or Paystack SDK is a dependency.

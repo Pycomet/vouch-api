@@ -277,7 +277,7 @@ One rentable unit: one serial number, quantity 1. Several units of a model are s
 - FKs: `assets_vendor_id_fkey (vendor_id) → users(id)`, `assets_review_actor_id_fkey (review_actor_id) → users(id)`, `fk_assets_city_id (city_id) → cities(id)`, `fk_assets_category_id (category_id) → categories(id)`, `fk_assets_catalogue_item_id (catalogue_item_id) → catalogue_items(id)`, and `fk_assets_item_category (catalogue_item_id, category_id) → catalogue_items(id, category_id)` (0006), so an asset's category is always its item's.
 - CHECKs: `ck_assets_daily_rate_positive` (`daily_rate > 0`), `ck_assets_deposit_amount_nonnegative` (`deposit_amount >= 0`), `ck_assets_weekend_rate_positive` and `ck_assets_weekly_rate_positive` (NULL or `> 0`), `ck_assets_condition_grade_valid`, `ck_assets_minimum_trust_tier_valid` (`minimum_trust_tier BETWEEN 0 AND 3`; widened from 0–2 by 0003), `ck_assets_paused_by_values` (`paused_by IN ('vendor', 'admin')`) and `ck_assets_paused_by_matches_status` (`(listing_status = 'paused') = (paused_by IS NOT NULL)`) (0006).
 - Indexes: `ix_assets_vendor_id (vendor_id)`, and the partial index `ix_assets_public (city_id, category_id, daily_rate, created_at, id) WHERE listing_status = 'active' AND is_available = true AND deleted_at IS NULL`. It replaced 0002's `ix_assets_public_lagos`. The partial unique index `uq_assets_vendor_item_serial (vendor_id, catalogue_item_id, lower(serial_number)) WHERE deleted_at IS NULL AND serial_number IS NOT NULL` (0006) allows one live listing per vendor, item and serial, ignoring letter case.
-- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor, and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, `paused_by = 'admin'`, audit `asset.paused`); if the vendor had paused it, the pause becomes an admin one (audit `asset.pause_taken_over`), so the vendor cannot resume lost gear.
+- Public visibility (the inventory service, used by `/assets` and `/catalogue/search`): `listing_status = 'active'`, available, not deleted, an active and not-deleted vendor whose vendor profile is `active` (a pending, suspended or missing profile hides all their listings, M3a §4.7), and a city in the launched set. An asset in a city that is not launched is a 404. A city filter outside the launched set is 400 `city_not_launched`. Marking a booking lost pauses its asset (`listing_status = 'paused'`, `paused_by = 'admin'`, audit `asset.paused`); if the vendor had paused it, the pause becomes an admin one (audit `asset.pause_taken_over`), so the vendor cannot resume lost gear.
 
 ### `availability_windows`
 
@@ -433,7 +433,7 @@ Append-only history (0003, spec §2.6).
 | `id` | BIGINT | NOT NULL | BIGSERIAL |
 | `actor_id` | UUID | NULL | NULL only for `system` (timers and webhooks) |
 | `actor_role` | TEXT | NOT NULL | `renter`, `vendor`, `admin` or `system` |
-| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record` or `kyc_profile` |
+| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record`, `kyc_profile`, `catalogue_item` or `availability_window` |
 | `entity_id` | UUID | NOT NULL | |
 | `action` | TEXT | NOT NULL | e.g. `booking.confirmed` (below) |
 | `before`, `after` | JSONB | NULL | The changed columns, plus handler extras (amounts, payment ids, the refund breakdown) |
@@ -445,17 +445,29 @@ Append-only history (0003, spec §2.6).
 - CHECKs: `ck_audit_events_actor_role_valid`, and `ck_audit_events_actor_required` (`actor_role = 'system' OR actor_id IS NOT NULL`).
 - Index `ix_audit_events_entity (entity, entity_id)` for audit-trail lookups (A12).
 - Triggers: `trg_audit_no_update`, `trg_audit_no_truncate` (append-only, including TRUNCATE).
+- Catalogue seed loader (`python -m app.cli seed-catalogue`): one row per inserted or updated item, `entity = 'catalogue_item'`, `actor_role = 'system'`, action `catalogue_item.seeded` (insert, `before` NULL) or `catalogue_item.seed_updated` (`before` and `after` hold the changed columns only). Unchanged items write nothing.
 - Actions written in M2:
   - `booking.<new status>` for every transition (`booking.requested`, `booking.accepted`, `booking.deposit_paid`, `booking.confirmed`, …);
   - `booking.vendor_approved` and `booking.at_risk` (no status change);
   - `deposit.released`, `deposit.deducted` and `deposit.forfeited`, beside the booking's own row;
   - `vendor.reliability_penalty` (entity `user`) on a vendor cancellation or a no-show;
-  - `user.restricted` and `asset.paused`; `asset.pause_taken_over` (M3a) when a lost booking turns a vendor pause into an admin one;
+  - `user.restricted` and `asset.paused` (on a lost booking, `before {listing_status}`, `after {listing_status, paused_by: "admin", booking_id}`);
   - `handover.updated` and `handover.signed`;
   - `kyc.verified` and `kyc.failed`;
   - `payment.refunded_late`, `payment.refunded_mismatch`, `payment.refunded_unapplied`, `payment.refunded_duplicate` and `payout.paid`.
 
   Every booking transition writes at least one row. An illegal transition, or a failed guard, writes none.
+- Actions written in M3a (every vendor write records the vendor as actor and the request id):
+  - `user.admin_created` (entity `user`, actor `system`) by `create-admin`: `before` NULL, `after {role, is_active}`;
+  - `asset.pause_taken_over` when a lost booking turns a vendor pause into an admin one: `before {listing_status, paused_by}`, `after {listing_status, paused_by: "admin", booking_id}`;
+  - `asset.created`: `before` NULL, `after {listing_status, catalogue_item_id, category_id, city, serial_number, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, fulfilment, minimum_trust_tier}`;
+  - `asset.updated`: `before` and `after` hold the changed fields only (including a re-derived `category_id` or a raised `minimum_trust_tier`); an edit that changes nothing writes no row;
+  - `asset.submitted`, `asset.paused` (by the vendor) and `asset.resumed`: `before` and `after` are `{listing_status, paused_by}`;
+  - `asset.deleted`: `before` and `after` are `{deleted_at, listing_status}`;
+  - `availability.blocked` (entity `availability_window`, the block's id): `before` NULL, `after {asset_id, starts_on, ends_on}`;
+  - `availability.unblocked`: `before {asset_id, starts_on, ends_on}`, `after` NULL.
+
+  A refused vendor write writes no row.
 
 ### `webhook_events`
 
@@ -515,7 +527,7 @@ The transition table is the `_TRANSITIONS` registry in `app/services/booking.py`
 |---|---|---|---|---|---|
 | — | `request` | renter | `requested` | Asset publicly visible (else 404); dates valid, not past, at most `VOUCH_MAX_RENTAL_DAYS`, starting within `VOUCH_BOOKING_HORIZON_DAYS`, fulfilment offered (else 400); renter active and not restricted (`renter_restricted`); effective tier meets `minimum_trust_tier`, where a tier-3 asset may be requested at effective tier 2 (`tier_insufficient`); no blocked window (`dates_blocked`); no live overlap (`dates_unavailable`, from the exclusion constraint); not the renter's own asset (`self_booking`) | `hold_expires_at = now + 4h`; `price_snapshot` frozen; audit `booking.requested`; vendor notified |
 | `requested` | `approve_vendor` | vendor | `requested` | Not yet approved (else `invalid_transition`); before `hold_expires_at` (`hold_expired`); asset is tier 3 (`approval_not_required`) | `vendor_approved_at = now`; audit `booking.vendor_approved` |
-| `requested` | `accept` | vendor | `accepted` | Before `hold_expires_at` (`hold_expired`); renter guards run again (`renter_restricted`, `tier_insufficient`); tier 3 needs `vendor_approved_at` (`vendor_approval_required`); a payment provider is configured (503 `payment_unavailable`) | The provider opens a virtual account for D + C + R + F, and a `booking` payment row is recorded `pending` (a provider failure is 502 `payment_provider_error` and changes nothing); `deposit_due_at = now + 12h`; the renter is notified with the payment instructions |
+| `requested` | `accept` | vendor | `accepted` | The vendor's profile is `active` (`vendor_not_active`; handovers and returns stay open to a suspended vendor); before `hold_expires_at` (`hold_expired`); renter guards run again (`renter_restricted`, `tier_insufficient`); tier 3 needs `vendor_approved_at` (`vendor_approval_required`); a payment provider is configured (503 `payment_unavailable`) | The provider opens a virtual account for D + C + R + F, and a `booking` payment row is recorded `pending` (a provider failure is 502 `payment_provider_error` and changes nothing); `deposit_due_at = now + 12h`; the renter is notified with the payment instructions |
 | `requested` | `decline` | vendor | `declined` | — | Audit with the optional reason; renter notified |
 | `requested` | `cancel` | renter | `cancelled_by_renter` | — | Free withdrawal (A13): no money moves; `cancelled_at`; vendor notified `booking.withdrawn` |
 | `requested` | `expire_hold` | system (timer) | `expired` | `now > hold_expires_at` | Dates freed; renter notified |

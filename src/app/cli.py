@@ -17,6 +17,18 @@
       API's ``FullName`` limit): nothing is read or written. Exit 2.
 
 Only the user id reaches stdout; errors go to stderr and never echo the phone.
+
+``seed-catalogue --file path.csv`` (M3a §4.2)
+    Idempotent upsert of catalogue items on ``(make, model)`` from a CSV with the
+    columns ``category,make,model,mount,band,aliases`` (see
+    :mod:`app.services.catalogue_seed`). The whole file is validated and written in
+    one transaction.
+
+    * Success: prints ``inserted=N updated=N unchanged=N``. Exit 0.
+    * A bad row or header (unknown category, bad band, missing make or model,
+      duplicate ``(make, model)``): nothing is written, the first bad line is named
+      on stderr. Exit 1.
+    * The file cannot be read: Exit 2.
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import asyncio
 import sys
 import uuid
 from collections.abc import Sequence
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -37,6 +50,7 @@ from app.db.models.user import RenterRole
 from app.db.session import create_database_engine, create_database_sessionmaker
 from app.services.audit import Actor, record_audit
 from app.services.auth import normalize_phone
+from app.services.catalogue_seed import SeedError, apply_seed, category_ids, parse_seed
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -89,7 +103,39 @@ def _parser() -> argparse.ArgumentParser:
     admin = commands.add_parser("create-admin", help="create the admin for a phone number")
     admin.add_argument("--phone", required=True, help="+234XXXXXXXXXX or 0XXXXXXXXXX")
     admin.add_argument("--name", required=True, help="the admin's full name")
+    seed = commands.add_parser("seed-catalogue", help="upsert catalogue items from a CSV file")
+    seed.add_argument("--file", required=True, help="CSV: category,make,model,mount,band,aliases")
     return parser
+
+
+async def _seed_catalogue_command(file_raw: str) -> int:
+    try:
+        text = await asyncio.to_thread(Path(file_raw).read_text, encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"error: cannot read --file ({exc.__class__.__name__})", file=sys.stderr)
+        return EXIT_USAGE
+
+    engine = create_database_engine(get_settings())
+    try:
+        async with create_database_sessionmaker(engine)() as session:
+            try:
+                known = frozenset(await category_ids(session))
+                rows = parse_seed(text, known)
+                counts = await apply_seed(session, rows)
+                await session.commit()
+            except SeedError as exc:
+                await session.rollback()
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_REFUSED
+            except IntegrityError:
+                # A database rule the checks missed (or a concurrent change); no SQL is echoed.
+                await session.rollback()
+                print("error: the database refused the file; nothing was written", file=sys.stderr)
+                return EXIT_REFUSED
+    finally:
+        await engine.dispose()
+    print(f"inserted={counts.inserted} updated={counts.updated} unchanged={counts.unchanged}")
+    return EXIT_OK
 
 
 async def _create_admin_command(phone_raw: str, name_raw: str) -> int:
@@ -130,7 +176,8 @@ async def _create_admin_command(phone_raw: str, name_raw: str) -> int:
 async def run(argv: Sequence[str] | None = None) -> int:
     """Parse ``argv`` and run the command; returns the exit status."""
     args = _parser().parse_args(argv)
-    # ``create-admin`` is the only command; the subparser makes it required.
+    if args.command == "seed-catalogue":
+        return await _seed_catalogue_command(args.file)
     return await _create_admin_command(args.phone, args.name)
 
 
