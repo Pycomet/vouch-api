@@ -3,10 +3,13 @@
 Block creation and ``request_booking`` both lock the asset row first, then check
 blocks, then live bookings, then insert. The tests are deterministic: one session
 does its write and keeps its transaction open (so it holds the asset lock), the
-other starts as a task, and the test proves it is waiting on a lock
-(``pg_stat_activity.wait_event_type = 'Lock'``, polled with a deadline) before the
-first commits. Every wait has a timeout, so a deadlock or a missing lock fails the
-test instead of hanging it.
+other starts as a task, and the test proves it is waiting on the **asset row
+lock** before the first commits: its backend is in a ``Lock`` wait, the statement
+it is waiting in is the ``SELECT … FROM assets … FOR UPDATE``, and it holds the
+heavyweight tuple lock on ``assets`` that Postgres takes for a row-lock waiter
+(polled with a deadline). A wait on the bookings exclusion constraint or on a
+foreign-key check would not pass that check. Every wait has a timeout, so a
+deadlock or a missing lock fails the test instead of hanging it.
 
 The test engine sets neither ``lock_timeout`` nor ``statement_timeout``, and the
 application engine (``app.db.session``) does not either, so nothing cuts a wait
@@ -16,6 +19,7 @@ short: the waiting session really waits until the holder commits.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
 from dataclasses import dataclass
@@ -112,22 +116,40 @@ async def _pid(session: AsyncSession) -> int:
     return await session.scalar(text("SELECT pg_backend_pid()"))
 
 
-async def _waits_on_lock(pid: int) -> bool:
-    """True once backend ``pid`` is waiting on a lock; False after the deadline."""
+_ASSET_ROW_LOCK_WAIT = """
+SELECT a.wait_event_type = 'Lock'
+   AND a.query ILIKE 'SELECT%FROM assets%FOR UPDATE%'
+   AND EXISTS (
+       SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+       WHERE l.pid = a.pid AND l.locktype = 'tuple' AND c.relname = 'assets'
+   )
+   AND EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND NOT l.granted)
+FROM pg_stat_activity a
+WHERE a.pid = $1
+"""
+
+
+async def _waits_on_asset_lock(pid: int) -> bool:
+    """True once backend ``pid`` is blocked on the asset row lock; False after the deadline."""
     monitor = await asyncpg.connect(asyncpg_url())
     try:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + LOCK_WAIT_DEADLINE
         while loop.time() < deadline:
-            waiting = await monitor.fetchval(
-                "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1", pid
-            )
-            if waiting:
+            if await monitor.fetchval(_ASSET_ROW_LOCK_WAIT, pid):
                 return True
             await asyncio.sleep(0.02)
         return False
     finally:
         await monitor.close()
+
+
+async def _settle(task: asyncio.Task) -> None:
+    """Cancel a task a failed test left running, and wait for it before sessions close."""
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def _counts(factory: Factory, asset_id: uuid.UUID) -> tuple[int, int]:
@@ -151,14 +173,13 @@ async def test_block_first_then_request_waits_and_is_dates_blocked(session_facto
         second_pid = await _pid(second)
         task = asyncio.create_task(_request(second, parties.renter_id, parties.asset_id))
         try:
-            assert await _waits_on_lock(second_pid), "the request did not wait for the block"
+            assert await _waits_on_asset_lock(second_pid), "the request did not wait for the block"
             assert not task.done()
             await first.commit()
             with pytest.raises(BookingGuardFailed) as caught:
                 await asyncio.wait_for(task, TASK_TIMEOUT)
         finally:
-            if not task.done():
-                task.cancel()
+            await _settle(task)
         assert caught.value.code == "dates_blocked"
 
     assert await _counts(session_factory, parties.asset_id) == (1, 0)
@@ -171,14 +192,13 @@ async def test_request_first_then_block_waits_and_is_dates_unavailable(session_f
         second_pid = await _pid(second)
         task = asyncio.create_task(_block(second, parties.vendor_id, parties.asset_id))
         try:
-            assert await _waits_on_lock(second_pid), "the block did not wait for the request"
+            assert await _waits_on_asset_lock(second_pid), "the block did not wait for the request"
             assert not task.done()
             await first.commit()
             with pytest.raises(DatesUnavailableError):
                 await asyncio.wait_for(task, TASK_TIMEOUT)
         finally:
-            if not task.done():
-                task.cancel()
+            await _settle(task)
 
     assert await _counts(session_factory, parties.asset_id) == (0, 1)
 
@@ -190,14 +210,13 @@ async def test_two_requests_for_the_same_unit_resolve_to_one(session_factory) ->
         second_pid = await _pid(second)
         task = asyncio.create_task(_request(second, parties.other_renter_id, parties.asset_id))
         try:
-            assert await _waits_on_lock(second_pid), "the second request did not wait"
+            assert await _waits_on_asset_lock(second_pid), "the second request did not wait"
             assert not task.done()
             await first.commit()
             with pytest.raises(BookingGuardFailed) as caught:
                 await asyncio.wait_for(task, TASK_TIMEOUT)
         finally:
-            if not task.done():
-                task.cancel()
+            await _settle(task)
         assert caught.value.code == "dates_unavailable"
 
     assert await _counts(session_factory, parties.asset_id) == (0, 1)
@@ -216,13 +235,13 @@ async def test_a_request_waiting_on_a_delete_is_404_after_it(session_factory) ->
         second_pid = await _pid(second)
         task = asyncio.create_task(_request(second, parties.renter_id, parties.asset_id))
         try:
-            assert await _waits_on_lock(second_pid), "the request did not wait for the delete"
+            assert await _waits_on_asset_lock(second_pid), "the request did not wait for the delete"
+            assert not task.done()
             await first.commit()
             with pytest.raises(ResourceNotFoundError):
                 await asyncio.wait_for(task, TASK_TIMEOUT)
         finally:
-            if not task.done():
-                task.cancel()
+            await _settle(task)
 
     assert await _counts(session_factory, parties.asset_id) == (0, 0)
 
