@@ -17,6 +17,7 @@ Reference docs:
 
 - [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md): endpoints, roles, error codes, the money line. The OpenAPI document at `/docs` is the authoritative schema.
 - [`docs/SCHEMA.md`](docs/SCHEMA.md) and [`docs/erd.svg`](docs/erd.svg): every table, constraint and trigger, the transition table, and the ledger recipes.
+- [`docs/DEPLOY.md`](docs/DEPLOY.md): the container image, Docker Compose, environment variables, migrations, backups, the restore drill and the deploy freeze.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/OPERATIONS-NOTES.md`](docs/OPERATIONS-NOTES.md): the module layout, the known gaps, and what real adapters need first.
 - [`docs/specs/M2.md`](docs/specs/M2.md) and [`docs/specs/M2-amendments.md`](docs/specs/M2-amendments.md): the milestone spec and its amendments.
 
@@ -43,7 +44,7 @@ Every setting is an environment variable with the `VOUCH_` prefix. They can also
 
 | Key | Purpose |
 |---|---|
-| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging` or `production` |
+| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging`, `production` or `phase0` (the fake providers with production's safety rules; see `docs/DEPLOY.md`) |
 | `VOUCH_DATABASE_URL` | `postgresql+asyncpg://…` |
 | `VOUCH_LAUNCHED_CITIES` | Comma-separated city slugs open for inventory (default `abuja`) |
 | `VOUCH_JWT_SECRET` | Token signing key. Outside development and test, `change-me` or anything under 32 bytes is refused. |
@@ -80,11 +81,31 @@ python -m app.jobs.timers --once   # one run, then exit (non-zero if the run fai
 
 Each run logs one `timer_run …` line with its counts. Running it twice in a row is safe: the second run does nothing.
 
+## Running with Docker Compose
+
+One image runs the API, the migrations and the timer job (`Dockerfile`, `compose.yml`):
+
+```bash
+cp .env.example .env        # set POSTGRES_PASSWORD and the secrets
+docker compose up -d --build
+```
+
+`migrate` (`alembic upgrade head`) runs once and must succeed before `api` and `timers` start; the API never migrates on start. See [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+## Creating the first admin
+
+```bash
+python -m app.cli create-admin --phone +234XXXXXXXXXX --name "Full Name"
+```
+
+It creates a user with role `admin` (or does nothing if that admin already exists), refuses a phone that belongs to another role, writes the audit event `user.admin_created`, and prints the user id. In compose: `docker compose run --rm --no-deps api python -m app.cli create-admin ...`.
+
 ## Providers (fakes only in M2)
 
 The OTP sender, the KYC provider and the payment provider each have one implementation in M2, an in-memory **fake**. No SMS, KYC or Paystack SDK is a dependency.
 
 - In `development` and `test`, the fakes are used by default.
+- In `phase0` (amendment A20, the Phase 0 deployment) the fakes are allowed and are the default, with production's secret, debug and API-docs rules.
 - In `staging` and `production`, `fake` is refused at start-up and no real adapter exists yet. Leave these settings unset there, and the API answers **503** for OTP requests (`otp_unavailable`), KYC (`kyc_unavailable`) and accepting a booking (`payment_unavailable`) until real adapters land. See `docs/OPERATIONS-NOTES.md` for what they need first.
 
 ## Tests and quality checks
@@ -96,7 +117,7 @@ VOUCH_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/vo
   pytest --cov=app --cov-report=term-missing
 ```
 
-Without `VOUCH_TEST_DATABASE_URL`, the tests that need a live PostgreSQL (migrations, constraints, triggers, the booking flows) are skipped. The live tests migrate the database they are given and leave it at `head`, so point them at a throwaway database such as `vouch_test` (`createdb vouch_test`, or `-e POSTGRES_DB=vouch_test` on the container above). Coverage must stay at 90% or more. CI runs the same three commands against a Postgres 16 service.
+Without `VOUCH_TEST_DATABASE_URL`, the tests that need a live PostgreSQL (migrations, constraints, triggers, the booking flows) are skipped. The live tests migrate the database they are given and leave it at `head`, so point them at a throwaway database such as `vouch_test` (`createdb vouch_test`, or `-e POSTGRES_DB=vouch_test` on the container above). Coverage must stay at 90% or more. CI runs the same three commands against a Postgres 16 service, plus `alembic upgrade head` and `alembic check` (the models must match the migrations), and a separate job builds the container image (no push).
 
 After a schema change, regenerate the ERD (`tests/test_docs_schema.py` fails until you do):
 
@@ -111,4 +132,4 @@ The product describes money as a **deposit hold** and an optional **damage contr
 
 ## Backups
 
-Production PostgreSQL must use encrypted automated backups, point-in-time recovery and a regular restore drill. These must be in place and checked before the API handles real bookings or payment records.
+Production PostgreSQL must use encrypted automated backups, point-in-time recovery and a regular restore drill. These must be in place and checked before the API handles real bookings or payment records. `scripts/backup.sh` (nightly `pg_dump`), `scripts/restore_check.sh` (the restore drill) and `scripts/ledger_check.sql` are described in [`docs/DEPLOY.md`](docs/DEPLOY.md).

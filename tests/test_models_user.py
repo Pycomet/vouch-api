@@ -107,8 +107,9 @@ def test_timestamp_mixin_has_one_canonical_definition() -> None:
 
 def test_user_has_handover_signer_relationships() -> None:
     relationships = User.__mapper__.relationships
-    assert relationships["handovers_signed_as_vendor"].back_populates == "vendor_signer"
     assert relationships["handovers_signed_as_renter"].back_populates == "renter_signer"
+    # The vendor-signer relationship needed the model-only FK removed in M3a (A19).
+    assert "handovers_signed_as_vendor" not in relationships
 
 
 def test_kyc_profile_status_tier_and_timestamp_are_consistent() -> None:

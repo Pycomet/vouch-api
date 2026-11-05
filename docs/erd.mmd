@@ -227,7 +227,6 @@ erDiagram
     users |o--o{ assets : "review_actor_id"
     users |o--o{ audit_events : "actor_id"
     users |o--o{ handover_records : "renter_signer_id"
-    users |o--o{ handover_records : "vendor_signer_id"
     users ||--o{ assets : "vendor_id"
     users ||--o{ bookings : "renter_id"
     users ||--o{ bookings : "vendor_id"

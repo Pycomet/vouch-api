@@ -86,9 +86,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=runtime_settings.app_name,
         version=runtime_settings.app_version,
         debug=runtime_settings.debug,
-        docs_url=None if runtime_settings.is_production else "/docs",
-        redoc_url=None if runtime_settings.is_production else "/redoc",
-        openapi_url=None if runtime_settings.is_production else "/openapi.json",
+        docs_url="/docs" if runtime_settings.serves_api_docs else None,
+        redoc_url="/redoc" if runtime_settings.serves_api_docs else None,
+        openapi_url="/openapi.json" if runtime_settings.serves_api_docs else None,
         lifespan=lifespan,
     )
     application.state.settings = runtime_settings

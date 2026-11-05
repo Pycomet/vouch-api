@@ -24,10 +24,19 @@ class Environment(StrEnum):
     TEST = "test"
     STAGING = "staging"
     PRODUCTION = "production"
+    # Phase 0 (M3a A20): hand-brokered rentals on the fake providers, with the
+    # production safety rules on (strong secrets, no debug, no interactive docs).
+    PHASE0 = "phase0"
 
 
-# Environments where the JWT secret rules are not enforced.
+# Environments where the secret rules are not enforced.
 _UNGUARDED_ENVIRONMENTS = frozenset({Environment.DEVELOPMENT, Environment.TEST})
+# Environments where the fake providers are allowed, and used when the setting is unset.
+_FAKE_PROVIDER_ENVIRONMENTS = frozenset(
+    {Environment.DEVELOPMENT, Environment.TEST, Environment.PHASE0}
+)
+# Environments that refuse debug mode and do not serve /docs, /redoc or /openapi.json.
+_LOCKED_DOWN_ENVIRONMENTS = frozenset({Environment.PRODUCTION, Environment.PHASE0})
 
 
 def _check_secret(field: str, value: SecretStr, env: str) -> None:
@@ -80,18 +89,19 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
     jwt_ttl_minutes: int = Field(default=60 * 24 * 7, ge=1)
     # Where phone OTP codes go. Only the in-memory fake exists in M2 (R26), and it
-    # is refused outside development and test; unset there means "no sender" (the
-    # OTP request route answers 503). Unset in development and test means the fake.
+    # is refused in staging and production; unset there means "no sender" (the
+    # OTP request route answers 503). Unset in development, test and phase0 (A20)
+    # means the fake.
     otp_sender: Literal["fake"] | None = None
     # Which KYC provider verifies renters (R27); same rules as ``otp_sender``.
     kyc_provider: Literal["fake"] | None = None
     # Which payment provider opens virtual accounts and sends webhooks (R21, R28);
-    # same rules as ``otp_sender``. Unset outside development and test means no
+    # same rules as ``otp_sender``. Unset in staging and production means no
     # provider: accepting a booking then answers 503 ``payment_unavailable``.
     payment_provider: Literal["fake"] | None = None
     # HMAC-SHA256 key the fake provider signs webhook bodies with (R24). Outside
-    # development and test it is checked like ``jwt_secret``, but only when
-    # ``payment_provider`` is "fake" (the only provider that uses it).
+    # development and test it is checked like ``jwt_secret``, but only when the
+    # fake payment provider is in use (the only provider that uses it).
     fake_payment_webhook_secret: SecretStr = SecretStr(JWT_SECRET_PLACEHOLDER)
 
     @field_validator("launched_cities", mode="before")
@@ -134,13 +144,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def enforce_production_safety(self) -> Settings:
-        if self.environment == Environment.PRODUCTION and self.debug:
-            raise ValueError("debug must be disabled in production")
+        env = self.environment.value
+        if self.environment in _LOCKED_DOWN_ENVIRONMENTS and self.debug:
+            raise ValueError(f"debug must be disabled in {env}")
         # The signing key is checked everywhere except local development and tests,
-        # so a staging deployment cannot run on the placeholder or a weak key either.
+        # so a staging or phase0 deployment cannot run on the placeholder or a weak key.
         if self.environment not in _UNGUARDED_ENVIRONMENTS:
-            env = self.environment.value
             _check_secret("jwt_secret", self.jwt_secret, env)
+        if self.environment == Environment.PHASE0:
+            # The fakes are allowed (and the default) here, so the fake provider's
+            # webhook key is checked whenever the fake payment provider is in use.
+            if self.effective_payment_provider == "fake":
+                _check_secret("fake_payment_webhook_secret", self.fake_payment_webhook_secret, env)
+        elif self.environment not in _UNGUARDED_ENVIRONMENTS:
             if self.otp_sender == "fake":
                 raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
             if self.kyc_provider == "fake":
@@ -154,28 +170,29 @@ class Settings(BaseSettings):
 
     @property
     def effective_otp_sender(self) -> str | None:
-        """The OTP sender to build: the setting, or the fake in development and test."""
+        """The OTP sender to build: the setting, or the fake in development, test and phase0."""
         if self.otp_sender is not None:
             return self.otp_sender
-        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+        return "fake" if self.environment in _FAKE_PROVIDER_ENVIRONMENTS else None
 
     @property
     def effective_kyc_provider(self) -> str | None:
-        """The KYC provider to build: the setting, or the fake in development and test."""
+        """The KYC provider to build: the setting, or the fake in development, test and phase0."""
         if self.kyc_provider is not None:
             return self.kyc_provider
-        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+        return "fake" if self.environment in _FAKE_PROVIDER_ENVIRONMENTS else None
 
     @property
     def effective_payment_provider(self) -> str | None:
-        """The payment provider to build: the setting, or the fake in development and test."""
+        """The payment provider to build: the setting, or the fake (development, test, phase0)."""
         if self.payment_provider is not None:
             return self.payment_provider
-        return "fake" if self.environment in _UNGUARDED_ENVIRONMENTS else None
+        return "fake" if self.environment in _FAKE_PROVIDER_ENVIRONMENTS else None
 
     @property
-    def is_production(self) -> bool:
-        return self.environment == Environment.PRODUCTION
+    def serves_api_docs(self) -> bool:
+        """Whether /docs, /redoc and /openapi.json are served (not in production or phase0)."""
+        return self.environment not in _LOCKED_DOWN_ENVIRONMENTS
 
     @property
     def business_zone(self) -> ZoneInfo:
