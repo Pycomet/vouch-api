@@ -13,12 +13,13 @@ left alone, so a catalogue item an admin deactivated stays deactivated.
 from __future__ import annotations
 
 import csv
+import io
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import CatalogueItem
+from app.db.models import Asset, CatalogueItem
 from app.db.models.catalogue import ValueBand
 from app.db.models.reference import Category
 from app.services.audit import Actor, record_audit
@@ -64,14 +65,21 @@ def parse_seed(text: str, known_categories: set[str] | frozenset[str]) -> list[S
     rows: list[SeedRow] = []
     seen: dict[tuple[str, str], int] = {}
     header_seen = False
-    for number, raw in enumerate(text.splitlines(), start=1):
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
+    reader = csv.reader(io.StringIO(text))
+    previous_end = 0
+    while True:
+        # A record may span lines (a quoted field); it starts after the previous one ended.
+        number = previous_end + 1
         try:
-            cells = next(csv.reader([raw]))
+            cells = next(reader)
+        except StopIteration:
+            break
         except csv.Error as exc:
             raise SeedError(number, f"unreadable row ({exc})") from exc
+        previous_end = reader.line_num
         cells = [cell.strip() for cell in cells]
+        if not cells or not any(cells) or cells[0].startswith("#"):
+            continue
         if not header_seen:
             if cells != COLUMNS:
                 raise SeedError(number, f"the header must be {','.join(COLUMNS)}")
@@ -81,13 +89,17 @@ def parse_seed(text: str, known_categories: set[str] | frozenset[str]) -> list[S
             raise SeedError(number, f"expected {len(COLUMNS)} columns, found {len(cells)}")
         category, make, model, mount, band, aliases = cells
         if category not in known_categories:
-            raise SeedError(number, f"unknown category {category!r}")
+            raise SeedError(
+                number,
+                f"unknown category {category!r} (case-sensitive; one of "
+                f"{', '.join(sorted(known_categories))})",
+            )
         if not make:
             raise SeedError(number, "make is required")
         if not model:
             raise SeedError(number, "model is required")
         if band not in {b.value for b in ValueBand}:
-            raise SeedError(number, f"band must be A, B or C, not {band!r}")
+            raise SeedError(number, f"band must be one of A, B, C (case-sensitive), not {band!r}")
         if (make, model) in seen:
             raise SeedError(
                 number, f"duplicate make and model (first seen on line {seen[(make, model)]})"
@@ -103,12 +115,27 @@ def parse_seed(text: str, known_categories: set[str] | frozenset[str]) -> list[S
 async def apply_seed(session: AsyncSession, rows: list[SeedRow]) -> SeedCounts:
     """Upsert ``rows`` in the caller's transaction (flushes; the caller commits).
 
-    Raises :class:`SeedError` for an unknown category before any write.
+    Raises :class:`SeedError` before any write for an unknown category, or for a
+    category change on an item that assets use (spec 5.4; the composite foreign key
+    ``fk_assets_item_category`` would refuse it too, soft-deleted assets included).
     """
     categories = await category_ids(session)
     for row in rows:
         if row.category not in categories:
             raise SeedError(row.line, f"unknown category {row.category!r}")
+        existing = (
+            await session.scalars(
+                select(CatalogueItem).where(
+                    CatalogueItem.make == row.make, CatalogueItem.model == row.model
+                )
+            )
+        ).first()
+        if existing is not None and existing.category_id != categories[row.category]:
+            used = await session.scalar(
+                select(exists().where(Asset.catalogue_item_id == existing.id))
+            )
+            if used:
+                raise SeedError(row.line, "category cannot change: assets use this item")
 
     inserted = updated = unchanged = 0
     for row in rows:

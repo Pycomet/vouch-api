@@ -433,7 +433,7 @@ Append-only history (0003, spec §2.6).
 | `id` | BIGINT | NOT NULL | BIGSERIAL |
 | `actor_id` | UUID | NULL | NULL only for `system` (timers and webhooks) |
 | `actor_role` | TEXT | NOT NULL | `renter`, `vendor`, `admin` or `system` |
-| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record` or `kyc_profile` |
+| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record`, `kyc_profile` or `catalogue_item` |
 | `entity_id` | UUID | NOT NULL | |
 | `action` | TEXT | NOT NULL | e.g. `booking.confirmed` (below) |
 | `before`, `after` | JSONB | NULL | The changed columns, plus handler extras (amounts, payment ids, the refund breakdown) |
@@ -445,6 +445,7 @@ Append-only history (0003, spec §2.6).
 - CHECKs: `ck_audit_events_actor_role_valid`, and `ck_audit_events_actor_required` (`actor_role = 'system' OR actor_id IS NOT NULL`).
 - Index `ix_audit_events_entity (entity, entity_id)` for audit-trail lookups (A12).
 - Triggers: `trg_audit_no_update`, `trg_audit_no_truncate` (append-only, including TRUNCATE).
+- Catalogue seed loader (`python -m app.cli seed-catalogue`): one row per inserted or updated item, `entity = 'catalogue_item'`, `actor_role = 'system'`, action `catalogue_item.seeded` (insert, `before` NULL) or `catalogue_item.seed_updated` (`before` and `after` hold the changed columns only). Unchanged items write nothing.
 - Actions written in M2:
   - `booking.<new status>` for every transition (`booking.requested`, `booking.accepted`, `booking.deposit_paid`, `booking.confirmed`, …);
   - `booking.vendor_approved` and `booking.at_risk` (no status change);

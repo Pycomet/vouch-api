@@ -127,6 +127,11 @@ async def _seed_catalogue_command(file_raw: str) -> int:
                 await session.rollback()
                 print(f"error: {exc}", file=sys.stderr)
                 return EXIT_REFUSED
+            except IntegrityError:
+                # A database rule the checks missed (or a concurrent change); no SQL is echoed.
+                await session.rollback()
+                print("error: the database refused the file; nothing was written", file=sys.stderr)
+                return EXIT_REFUSED
     finally:
         await engine.dispose()
     print(f"inserted={counts.inserted} updated={counts.updated} unchanged={counts.unchanged}")

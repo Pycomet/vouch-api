@@ -108,6 +108,17 @@ docker compose run --rm --no-deps api python -m app.cli create-admin --phone +23
 
 Keep admin accounts to one or two people; there is no admin MFA in M3a.
 
+### Seeding the catalogue
+
+```bash
+docker compose run --rm --no-deps -v "$PWD/data:/data:ro" api python -m app.cli seed-catalogue --file /data/catalogue_seed.csv
+```
+
+- Columns `category,make,model,mount,band,aliases`; aliases separated by `|`; band `A`, `B` or `C`; values are case-sensitive; lines starting with `#` are skipped.
+- An idempotent upsert on `(make, model)`. The whole file is validated first and written in one transaction. The first bad row (unknown category, bad band, missing make or model, a duplicate, or a category change on an item that assets use) is refused with its line number (exit 1, nothing written). An unreadable file is exit 2.
+- It prints `inserted=N updated=N unchanged=N` and writes the audit events `catalogue_item.seeded` and `catalogue_item.seed_updated` (`actor_role = 'system'`).
+- `data/catalogue_seed.sample.csv` is sample data with placeholder bands, not the real catalogue.
+
 ## 6. Nightly backup
 
 `scripts/backup.sh` writes a `pg_dump --format=custom` archive to `BACKUP_DIR/vouch-<UTC timestamp>.dump`, checks that the archive reads back (`pg_restore --list`), and prints its path. It exits non-zero, leaving no file, on any failure. It does not upload anything: copying the file off the host, encrypting it at rest and pruning old files are the operator's job.
