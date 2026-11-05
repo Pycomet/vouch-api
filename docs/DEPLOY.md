@@ -30,7 +30,17 @@ docker compose up -d --build
 docker compose ps          # migrate "Exited (0)", api "Up (healthy)", timers "Up"
 ```
 
-The API is published on host port `API_HOST_PORT` (default 8000). PostgreSQL publishes no host port; reach it with `docker compose exec postgres psql -U vouch vouch`.
+The API is published on `127.0.0.1:API_HOST_PORT` (default 8000): the host's loopback only, so it is not reachable from other machines. PostgreSQL publishes no host port; reach it with `docker compose exec postgres psql -U vouch vouch`.
+
+**Exposing the API.** Put a reverse proxy on the same host (Caddy, nginx or similar) in front of `127.0.0.1:8000`. Let it terminate TLS, and have it be the only thing listening on the public ports. For example, with Caddy:
+
+```
+api.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+The API ignores `X-Forwarded-For` (§1), so until M3a §7.2 lands it sees the proxy as the client. Do not change the compose binding to `0.0.0.0` to skip the proxy.
 
 Then create the first admin (§5).
 
@@ -42,8 +52,8 @@ Required, or to review before any shared deployment:
 
 | Variable | Notes |
 |---|---|
-| `POSTGRES_PASSWORD` | Compose only. The `postgres` service's password; `compose.yml` refuses to start without it. Not read by the application. |
-| `API_HOST_PORT` | Compose only. Host port for the API (default 8000). |
+| `POSTGRES_PASSWORD` | Compose only. The `postgres` service's password; `compose.yml` refuses to start without it. Not read by the application. **It must be URL-safe** (letters, digits, `-`, `_`, `.`, `~` only), because `compose.yml` puts it into `VOUCH_DATABASE_URL` without encoding it, and the backup scripts read it back from URLs. `python -c "import secrets; print(secrets.token_urlsafe(32))"` makes one. |
+| `API_HOST_PORT` | Compose only. Loopback port the API is published on (default 8000). |
 | `VOUCH_ENVIRONMENT` | `development`, `test`, `staging`, `production` or `phase0`. A Phase 0 deployment uses `phase0`. See the start-up rules below. |
 | `VOUCH_DATABASE_URL` | `postgresql+asyncpg://user:password@host:5432/db`. Set by `compose.yml`; set it yourself anywhere else. |
 | `VOUCH_JWT_SECRET` | Token signing key: a random value of 32 bytes or more (for example `python -c "import secrets; print(secrets.token_urlsafe(48))"`). It also keys the OTP code hashes. |
@@ -104,18 +114,26 @@ Keep admin accounts to one or two people; there is no admin MFA in M3a.
 
 | Variable | Meaning |
 |---|---|
-| `BACKUP_DATABASE_URL` | libpq URL of the database. Falls back to `VOUCH_DATABASE_URL`; the `postgresql+asyncpg://` form is accepted. |
+| `BACKUP_DATABASE_URL` | libpq URL of the database, best without the password. Falls back to `VOUCH_DATABASE_URL`; the `postgresql+asyncpg://` form is accepted. Optional when `PGDATABASE` (and the other `PG*` variables) are set. |
+| `PGPASSWORD` or `PGPASSFILE` | The password, the libpq way. Recommended over a password in the URL. |
 | `BACKUP_DIR` | Target directory (default `./backups`). |
 
-It needs `pg_dump` and `pg_restore` from PostgreSQL 16 or newer. On a compose host, the `postgres:16` image has them, so run the script from that image on the compose network:
+**Keep the password out of process listings.** Anything on a command line (`docker run -e NAME=value`, `pg_dump --dbname=URL`) can be read by any user on the host with `ps`. So pass the password as `PGPASSWORD` from the environment, or use a `PGPASSFILE` (mode 0600). If a URL does carry a password, the scripts move it into `PGPASSWORD` before running `pg_dump`, `pg_restore` or `psql`, so it never reaches their argv; the URL you pass to the script itself is still visible, though.
+
+It needs `pg_dump` and `pg_restore` from PostgreSQL 16 or newer. On a compose host, the `postgres:16` image has them, so run the script from that image on the compose network. First load `.env` into the shell (this exports every variable in it), then pass the password by name only (`-e PGPASSWORD` copies it from the shell without putting the value on the command line):
 
 ```bash
+set -a; . ./.env; set +a
+export PGPASSWORD="$POSTGRES_PASSWORD"
 docker compose run --rm --no-deps \
   -v "$PWD/scripts:/scripts:ro" -v /var/backups/vouch:/backups \
-  -e BACKUP_DATABASE_URL="postgresql://vouch:${POSTGRES_PASSWORD}@postgres:5432/vouch" \
+  -e PGPASSWORD \
+  -e BACKUP_DATABASE_URL=postgresql://vouch@postgres:5432/vouch \
   -e BACKUP_DIR=/backups \
   --entrypoint /scripts/backup.sh postgres
 ```
+
+From cron, put these lines in a small wrapper script (mode 0700) rather than in the crontab itself.
 
 Schedule it nightly (cron or a systemd timer) at a quiet hour, for example 02:00 Africa/Lagos, and alert on a non-zero exit. A managed PostgreSQL service should also have its own encrypted automated backups and point-in-time recovery turned on; the logical dump is the copy you control and can restore anywhere.
 
@@ -124,13 +142,16 @@ Schedule it nightly (cron or a systemd timer) at a quiet hour, for example 02:00
 `scripts/restore_check.sh <dump>` proves that a backup can be restored and that its ledger is sound. It creates a scratch database `vouch_restore_check_<UTC timestamp>` on `RESTORE_SERVER_URL`'s server, restores the dump into it, prints the migration revision and some row counts, and runs `scripts/ledger_check.sql`. It exits 0 only if the restore succeeds and the check returns no rows. It drops the scratch database on exit (set `KEEP_RESTORE_DB=1` to keep it for inspection).
 
 ```bash
+set -a; . ./.env; set +a
+export PGPASSWORD="$POSTGRES_PASSWORD"
 docker compose run --rm --no-deps \
   -v "$PWD/scripts:/scripts:ro" -v /var/backups/vouch:/backups \
-  -e RESTORE_SERVER_URL="postgresql://vouch:${POSTGRES_PASSWORD}@postgres:5432/postgres" \
+  -e PGPASSWORD \
+  -e RESTORE_SERVER_URL=postgresql://vouch@postgres:5432/postgres \
   --entrypoint /scripts/restore_check.sh postgres /backups/vouch-20261104T010000Z.dump
 ```
 
-`RESTORE_SERVER_URL` names a maintenance database (such as `postgres`) and a role that may `CREATE DATABASE`. Prefer a separate scratch server to the production one.
+`RESTORE_SERVER_URL` names a maintenance database (such as `postgres`) and a role that may `CREATE DATABASE`. As for the backup, give the password as `PGPASSWORD` or `PGPASSFILE` rather than in the URL. Prefer a separate scratch server to the production one.
 
 Run the drill at least monthly, on the latest nightly file, and before the API handles real bookings or payment records. Record the date, the dump file and the result.
 

@@ -47,9 +47,10 @@ services:
   api:
     <<: *app
     # The image's default command: uvicorn on port 8000, with the image HEALTHCHECK
-    # on GET /api/v1/health/ready.
+    # on GET /api/v1/health/ready. Published on the host's loopback only: put a
+    # reverse proxy on the same host in front of it (docs/DEPLOY.md §2).
     ports:
-      - "${API_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
