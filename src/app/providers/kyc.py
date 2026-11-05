@@ -4,7 +4,7 @@ A provider receives the renter's id type and number, the selfie and the address
 document, and answers with a :class:`VerificationResult`. It must never log or
 keep those inputs. ``Settings.kyc_provider`` picks one through
 :func:`build_kyc_provider`; only ``"fake"`` exists until a real vendor is chosen,
-and it is refused outside development and test, where the builder returns ``None``.
+and it is refused in staging and production, where the builder returns ``None``.
 """
 
 from __future__ import annotations

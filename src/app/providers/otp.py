@@ -5,7 +5,7 @@ masked phone: it NEVER logs the code. :class:`FakeOtpSender` also remembers each
 ``(phone, code)`` in memory (the last :data:`FAKE_SENT_LIMIT`) so tests can read
 the code back. ``Settings.otp_sender`` picks one through :func:`build_otp_sender`;
 only ``"fake"`` exists until a real SMS adapter is chosen, and it is refused
-outside development and test, where :func:`build_otp_sender` returns ``None``.
+in staging and production, where :func:`build_otp_sender` returns ``None``.
 """
 
 from __future__ import annotations

@@ -24,7 +24,8 @@ The API does not trust `X-Forwarded-For` or other proxy headers (`--no-proxy-hea
 
 ```bash
 cp .env.example .env
-# edit .env: POSTGRES_PASSWORD, VOUCH_JWT_SECRET, VOUCH_ENVIRONMENT, VOUCH_CORS_ORIGINS ...
+# edit .env: VOUCH_ENVIRONMENT=phase0, VOUCH_DEBUG=false, POSTGRES_PASSWORD,
+# VOUCH_JWT_SECRET, VOUCH_FAKE_PAYMENT_WEBHOOK_SECRET, VOUCH_CORS_ORIGINS ...
 docker compose up -d --build
 docker compose ps          # migrate "Exited (0)", api "Up (healthy)", timers "Up"
 ```
@@ -43,7 +44,7 @@ Required, or to review before any shared deployment:
 |---|---|
 | `POSTGRES_PASSWORD` | Compose only. The `postgres` service's password; `compose.yml` refuses to start without it. Not read by the application. |
 | `API_HOST_PORT` | Compose only. Host port for the API (default 8000). |
-| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging` or `production`. See the start-up rules below. |
+| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging`, `production` or `phase0`. A Phase 0 deployment uses `phase0`. See the start-up rules below. |
 | `VOUCH_DATABASE_URL` | `postgresql+asyncpg://user:password@host:5432/db`. Set by `compose.yml`; set it yourself anywhere else. |
 | `VOUCH_JWT_SECRET` | Token signing key: a random value of 32 bytes or more (for example `python -c "import secrets; print(secrets.token_urlsafe(48))"`). It also keys the OTP code hashes. |
 | `VOUCH_JWT_TTL_MINUTES` | Access-token lifetime (default 7 days). |
@@ -58,11 +59,11 @@ The remaining settings (`VOUCH_APP_NAME`, `VOUCH_APP_VERSION`, `VOUCH_API_V1_PRE
 
 **Start-up rules already enforced** (`app/core/config.py`). A process with an invalid configuration exits at start-up instead of running:
 
-- In `staging` and `production`, `VOUCH_JWT_SECRET` must not be the `change-me` placeholder and must be at least 32 bytes.
+- In `staging`, `production` and `phase0`, `VOUCH_JWT_SECRET` must not be the `change-me` placeholder and must be at least 32 bytes.
 - In `staging` and `production`, `fake` is refused for `VOUCH_OTP_SENDER`, `VOUCH_KYC_PROVIDER` and `VOUCH_PAYMENT_PROVIDER`. Leave them unset there: OTP requests, KYC and accepting a booking then answer 503 until real adapters exist (M3b).
-- In `production`, `VOUCH_DEBUG=true` is refused, and the OpenAPI pages (`/docs`, `/redoc`, `/openapi.json`) are not served.
+- In `production` and `phase0`, `VOUCH_DEBUG=true` is refused, and the OpenAPI pages (`/docs`, `/redoc`, `/openapi.json`) are not served.
 
-So a deployment that must run on the fake providers (Phase 0) runs with `VOUCH_ENVIRONMENT=development`, where none of these checks apply. Set a strong `VOUCH_JWT_SECRET` and `VOUCH_FAKE_PAYMENT_WEBHOOK_SECRET` and `VOUCH_DEBUG=false` there anyway: nothing at start-up will stop you forgetting.
+**Phase 0 runs as `VOUCH_ENVIRONMENT=phase0`** (amendment A20). It is the one shared environment where the fake OTP sender, KYC provider and payment provider are allowed; unset, each of the three settings means the fake. Everything else is held to production's rules: a strong `VOUCH_JWT_SECRET`, a strong `VOUCH_FAKE_PAYMENT_WEBHOOK_SECRET` (checked whenever the fake payment provider is in use), `VOUCH_DEBUG=false`, and no interactive API docs. `development` and `test` are for a local checkout and CI only; never deploy them. `production` still refuses the fakes.
 
 ## 4. Migrations
 

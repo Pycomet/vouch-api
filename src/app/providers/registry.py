@@ -2,7 +2,7 @@
 
 ``Settings.payment_provider`` names one; :func:`build_payment_provider` builds it
 once per app (``app.state.payment_provider``). Only ``"fake"`` exists in M2, and
-it is refused outside development and test, where the builder returns ``None``
+it is refused in staging and production, where the builder returns ``None``
 and the routes that need a provider answer 503 ``payment_unavailable``.
 :func:`payment_provider_named` resolves the ``{provider}`` of a webhook URL
 against the configured provider (404 for any other name).

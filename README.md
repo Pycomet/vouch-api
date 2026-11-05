@@ -44,7 +44,7 @@ Every setting is an environment variable with the `VOUCH_` prefix. They can also
 
 | Key | Purpose |
 |---|---|
-| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging` or `production` |
+| `VOUCH_ENVIRONMENT` | `development`, `test`, `staging`, `production` or `phase0` (the fake providers with production's safety rules; see `docs/DEPLOY.md`) |
 | `VOUCH_DATABASE_URL` | `postgresql+asyncpg://…` |
 | `VOUCH_LAUNCHED_CITIES` | Comma-separated city slugs open for inventory (default `abuja`) |
 | `VOUCH_JWT_SECRET` | Token signing key. Outside development and test, `change-me` or anything under 32 bytes is refused. |
@@ -105,6 +105,7 @@ It creates a user with role `admin` (or does nothing if that admin already exist
 The OTP sender, the KYC provider and the payment provider each have one implementation in M2, an in-memory **fake**. No SMS, KYC or Paystack SDK is a dependency.
 
 - In `development` and `test`, the fakes are used by default.
+- In `phase0` (amendment A20, the Phase 0 deployment) the fakes are allowed and are the default, with production's secret, debug and API-docs rules.
 - In `staging` and `production`, `fake` is refused at start-up and no real adapter exists yet. Leave these settings unset there, and the API answers **503** for OTP requests (`otp_unavailable`), KYC (`kyc_unavailable`) and accepting a booking (`payment_unavailable`) until real adapters land. See `docs/OPERATIONS-NOTES.md` for what they need first.
 
 ## Tests and quality checks
