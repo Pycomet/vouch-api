@@ -63,6 +63,30 @@ class ValidationErrorResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class BodyFieldError(Exception):
+    """One request-body field is wrong in a way the schema cannot see.
+
+    For example an unknown ``catalogue_item_id`` or a trust tier below the
+    item's band default. Framework-free, so services can raise it; the app
+    answers 422 in exactly FastAPI's ``{"detail": [...]}`` validation shape, so
+    every 422 looks the same. Not a :class:`VouchAPIError`: it never uses the
+    error envelope.
+    """
+
+    def __init__(self, field: str, type: str, msg: str, input: object = None) -> None:
+        super().__init__(msg)
+        self.field = field
+        self.type = type
+        self.msg = msg
+        self.input = input
+
+    def errors(self) -> list[dict[str, object]]:
+        """The validation issues, as FastAPI's ``RequestValidationError.errors()``."""
+        return [
+            {"type": self.type, "loc": ("body", self.field), "msg": self.msg, "input": self.input}
+        ]
+
+
 class VouchAPIError(Exception):
     """Base for all application-level exceptions that map to HTTP responses."""
 

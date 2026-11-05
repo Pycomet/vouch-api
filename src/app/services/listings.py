@@ -36,8 +36,8 @@ reads do not. Another vendor's listing, and a soft-deleted one, are 404, exactly
 like an unknown id. Every write records one audit row (actor and request id).
 
 Body problems the schema cannot see (an unknown catalogue item, a trust tier
-below the band default) are answered with FastAPI's own 422 body, so every 422
-has the same shape.
+below the band default) raise :class:`~app.schemas.errors.BodyFieldError`, which
+the app answers with FastAPI's own 422 body, so every 422 has the same shape.
 
 Services flush and never commit: the caller owns the transaction.
 """
@@ -52,7 +52,6 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from fastapi.exceptions import RequestValidationError
 from sqlalchemy import Select, and_, exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +63,7 @@ from app.db.models.booking import LIVE_BOOKING_STATUSES, BookingStatus
 from app.db.models.catalogue import BAND_DEFAULT_TIER, ValueBand
 from app.schemas.errors import (
     LISTING_TRANSITION_MESSAGE,
+    BodyFieldError,
     CatalogueItemInactiveError,
     CityNotLaunchedError,
     DuplicateSerialError,
@@ -246,11 +246,9 @@ async def load_for_update(
 # ---------------------------------------------------------------------------
 
 
-def _body_error(field: str, error_type: str, message: str, value: Any) -> RequestValidationError:
-    """A FastAPI-shaped 422 for one body field."""
-    return RequestValidationError(
-        [{"type": error_type, "loc": ("body", field), "msg": message, "input": value}]
-    )
+def _body_error(field: str, error_type: str, message: str, value: Any) -> BodyFieldError:
+    """A 422 for one body field (the app renders it in FastAPI's validation shape)."""
+    return BodyFieldError(field, error_type, message, value)
 
 
 async def _catalogue_item(session: AsyncSession, item_id: uuid.UUID) -> CatalogueItem:

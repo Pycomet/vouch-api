@@ -338,7 +338,16 @@ async def test_create_unknown_item_is_422(client, db_session) -> None:
     response = await client.post(API, json=_body(uuid.uuid4()), headers=headers)
 
     assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "catalogue_item_id"]
+    # The same shape as a schema 422: type, loc and msg, never the input.
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "unknown_catalogue_item",
+                "loc": ["body", "catalogue_item_id"],
+                "msg": "No such catalogue item.",
+            }
+        ]
+    }
 
 
 async def test_create_inactive_item_is_409(client, db_session) -> None:
