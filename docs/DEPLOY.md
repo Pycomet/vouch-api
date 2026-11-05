@@ -137,7 +137,10 @@ Run the drill at least monthly, on the latest nightly file, and before the API h
 `scripts/ledger_check.sql` can also run against the live database at any time (`psql "$URL" -f scripts/ledger_check.sql`). It returns no rows when healthy, and one row per problem:
 
 - `unbalanced_txn_group`: a `txn_group` whose debits differ from its credits;
-- `booking_balance_mismatch`: a booking whose booking-scoped `renter_deposit_liability` or `protection_pool` balance differs from what the `docs/SCHEMA.md` §8 recipes leave in its current status (the deposit hold D while paid and live, 0 after; the damage contribution C once paid, unless a cancellation refunded it). The comment at the top of the file has the full table and what it does not check.
+- `booking_balance_mismatch`: a booking whose booking-scoped `renter_deposit_liability` or `protection_pool` balance differs from what the `docs/SCHEMA.md` §8 recipes leave in its current status (the deposit hold D while paid and live, 0 after; the damage contribution C once paid, unless a cancellation refunded it). The comment at the top of the file has the full table and what it does not check;
+- `booking_snapshot_missing_deposit`: a booking whose `price_snapshot` has no deposit, so its balances cannot be judged.
+
+Bookings backfilled by migration 0003 (`price_snapshot.basis = "legacy"`) have no ledger postings and are skipped.
 
 Any row is an incident: stop deploys, keep the evidence, and reconcile before posting a reversing entry through a reviewed script (never an API, never an UPDATE).
 

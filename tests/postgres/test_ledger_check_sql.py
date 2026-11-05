@@ -169,3 +169,27 @@ async def test_skips_legacy_bookings(db_session: AsyncSession) -> None:
     )
 
     assert await _problems(db_session) == []
+
+
+@pytest.mark.parametrize("status", [BookingStatus.requested, BookingStatus.confirmed])
+async def test_reports_a_snapshot_without_a_deposit(
+    db_session: AsyncSession, status: BookingStatus
+) -> None:
+    renter = await create_user(db_session, kyc_verified=True)
+    asset = await create_asset(db_session)
+    booking = await create_booking(
+        db_session,
+        asset=asset,
+        renter=renter,
+        status=status,
+        price_snapshot={"rate_basis": "daily", "rental_total": "1.00", "currency": "NGN"},
+    )
+
+    # One row naming the missing key, not a second balance-mismatch row as well.
+    assert await _problems(db_session) == [
+        (
+            "booking_snapshot_missing_deposit",
+            str(booking.id),
+            f"status {status.value}: price_snapshot has no deposit",
+        )
+    ]

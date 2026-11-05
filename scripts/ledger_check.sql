@@ -24,8 +24,16 @@
 --     they net to zero and do not change these figures. vendor_payable,
 --     platform_revenue and platform_cash are not checked: payouts and the
 --     cancellation-fee split make their expected balances depend on more than
---     the status. Bookings backfilled by migration 0003 (price_snapshot basis
---     "legacy") have no postings and are skipped.
+--     the status.
+--
+-- (c) booking_snapshot_missing_deposit: a booking whose price_snapshot has no
+--     "deposit" (missing or JSON null). Every recipe reads D from the snapshot,
+--     so the booking's balances cannot be judged; it is reported once, here,
+--     instead of in (b). A missing "damage_contribution" is read as 0.00.
+--
+-- Legacy bookings are skipped by (b) and (c): migration 0003 backfilled old rows
+-- with price_snapshot {"basis": "legacy", ...} and posted no ledger entries for
+-- them, so the §8 recipes say nothing about their balances.
 WITH group_totals AS (
     SELECT
         txn_group,
@@ -49,9 +57,10 @@ booking_expected AS (
     SELECT
         b.id,
         b.status::text AS status,
+        (b.price_snapshot ->> 'deposit') IS NOT NULL AS has_deposit,
         CASE
             WHEN b.status::text IN ('deposit_paid', 'confirmed', 'in_progress', 'returned', 'disputed')
-                THEN (b.price_snapshot ->> 'deposit')::numeric(12, 2)
+                THEN coalesce((b.price_snapshot ->> 'deposit')::numeric(12, 2), 0)
             ELSE 0
         END AS deposit_liability,
         CASE
@@ -63,6 +72,7 @@ booking_expected AS (
             ELSE 0
         END AS protection_pool
     FROM bookings AS b
+    -- Legacy rows (the 0003 backfill) have no postings: see the header.
     WHERE coalesce(b.price_snapshot ->> 'basis', '') <> 'legacy'
 )
 SELECT
@@ -85,6 +95,14 @@ SELECT
     ) AS detail
 FROM booking_expected AS e
 LEFT JOIN booking_balances AS a ON a.booking_id = e.id
-WHERE coalesce(a.deposit_liability, 0) <> e.deposit_liability
-   OR coalesce(a.protection_pool, 0) <> e.protection_pool
+WHERE e.has_deposit
+  AND (coalesce(a.deposit_liability, 0) <> e.deposit_liability
+       OR coalesce(a.protection_pool, 0) <> e.protection_pool)
+UNION ALL
+SELECT
+    'booking_snapshot_missing_deposit' AS problem,
+    e.id::text AS ref,
+    format('status %s: price_snapshot has no deposit', e.status) AS detail
+FROM booking_expected AS e
+WHERE NOT e.has_deposit
 ORDER BY problem, ref;
