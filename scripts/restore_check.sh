@@ -2,7 +2,7 @@
 # Restore drill (M3a §2.3): restore a dump into a throwaway database and run the
 # ledger check against it. See docs/DEPLOY.md.
 #
-#   RESTORE_SERVER_URL=postgresql://user:pass@host:5432/postgres \
+#   PGPASSWORD=... RESTORE_SERVER_URL=postgresql://user@host:5432/postgres \
 #     scripts/restore_check.sh backups/vouch-20261104T020000Z.dump
 #
 # Creates the database vouch_restore_check_<UTC timestamp> on that server, restores
@@ -16,23 +16,37 @@
 # Environment:
 #   RESTORE_SERVER_URL  libpq URL of a maintenance database on the scratch server
 #                       (a role that may CREATE DATABASE); postgresql+asyncpg:// is
-#                       accepted and converted
+#                       accepted and converted. A password in the URL is moved
+#                       into PGPASSWORD before any command runs, so it never shows
+#                       in a process listing; or leave it out and set PGPASSWORD
+#                       or PGPASSFILE yourself
 #   KEEP_RESTORE_DB     1 to keep the scratch database for inspection
 #
 # Needs psql and pg_restore at least as new as the server (PostgreSQL 16).
 set -euo pipefail
+
+# Sets `clean_url` to $1 in libpq form without its password, exporting the password
+# (if any) as PGPASSWORD. The password must be URL-safe (no percent-encoding).
+split_password() {
+  clean_url="${1/postgresql+asyncpg:\/\//postgresql://}"
+  local pattern='^(postgres(ql)?://)([^:@/]+):([^@/]*)@(.*)$'
+  if [[ "$clean_url" =~ $pattern ]]; then
+    export PGPASSWORD="${BASH_REMATCH[4]}"
+    clean_url="${BASH_REMATCH[1]}${BASH_REMATCH[3]}@${BASH_REMATCH[5]}"
+  fi
+}
 
 if [[ $# -ne 1 || ! -f "$1" ]]; then
   echo "usage: restore_check.sh <dump file>" >&2
   exit 2
 fi
 dump="$1"
-server="${RESTORE_SERVER_URL:-}"
-if [[ -z "$server" ]]; then
+if [[ -z "${RESTORE_SERVER_URL:-}" ]]; then
   echo "restore_check: set RESTORE_SERVER_URL" >&2
   exit 2
 fi
-server="${server/postgresql+asyncpg:\/\//postgresql://}"
+split_password "$RESTORE_SERVER_URL"
+server="$clean_url"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 scratch="vouch_restore_check_$(date -u +%Y%m%dT%H%M%SZ)"
 

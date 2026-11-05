@@ -89,6 +89,78 @@ def test_backup_fails_without_leaving_a_file(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def _recording_shim(bin_dir: Path, tool: str, log: Path) -> dict[str, str]:
+    """A fake ``tool`` first on PATH that logs its argv and PGPASSWORD, then fails."""
+    bin_dir.mkdir()
+    shim = bin_dir / tool
+    shim.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{log}"\n'
+        f'printf "PGPASSWORD=%s\\n" "${{PGPASSWORD:-}}" >> "{log}"\nexit 1\n'
+    )
+    shim.chmod(0o755)
+    return {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+def test_backup_keeps_the_password_out_of_argv(tmp_path: Path) -> None:
+    log = tmp_path / "argv.log"
+    env = _recording_shim(tmp_path / "bin", "pg_dump", log)
+    result = subprocess.run(
+        ["bash", str(BACKUP)],
+        env={
+            **env,
+            "BACKUP_DATABASE_URL": "postgresql+asyncpg://vouch:s3cret-Pass@db:5432/vouch",
+            "BACKUP_DIR": str(tmp_path / "out"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    logged = log.read_text()
+    assert "--dbname=postgresql://vouch@db:5432/vouch" in logged
+    assert logged.count("s3cret-Pass") == 1
+    assert "PGPASSWORD=s3cret-Pass" in logged
+
+
+def test_restore_check_keeps_the_password_out_of_argv(tmp_path: Path) -> None:
+    log = tmp_path / "argv.log"
+    env = _recording_shim(tmp_path / "bin", "psql", log)
+    dump = tmp_path / "x.dump"
+    dump.write_bytes(b"")
+    result = subprocess.run(
+        ["bash", str(RESTORE_CHECK), str(dump)],
+        env={**env, "RESTORE_SERVER_URL": "postgresql://vouch:s3cret-Pass@db:5432/postgres"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    logged = log.read_text()
+    assert "postgresql://vouch@db:5432/postgres" in logged
+    assert logged.count("s3cret-Pass") == 1
+    assert "PGPASSWORD=s3cret-Pass" in logged
+
+
+def test_backup_with_libpq_environment_only(migrated_db: str, tmp_path: Path) -> None:
+    """No URL: the standard PG* variables (and PGPASSWORD) name the database."""
+    url = os.environ["VOUCH_TEST_DATABASE_URL"]
+    match = re.match(r".*://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)$", url)
+    user, password, host, port, database = match.groups()
+    result = _run(
+        BACKUP,
+        env={
+            "PGHOST": host,
+            "PGPORT": port,
+            "PGUSER": user,
+            "PGPASSWORD": password,
+            "PGDATABASE": database,
+            "BACKUP_DIR": str(tmp_path),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).stat().st_size > 0
+
+
 def test_backup_needs_a_database_url(tmp_path: Path) -> None:
     result = _run(BACKUP, env={"BACKUP_DIR": str(tmp_path)})
     assert result.returncode == 2
