@@ -1022,6 +1022,7 @@ async def test_illegal_listing_events_are_invalid_transitions(
         status,
         None if paused_by is None else paused_by.value,
     )
+    assert await _audits(db_session, asset_id) == []
 
 
 async def test_pause_and_resume(client, db_session) -> None:

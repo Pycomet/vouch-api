@@ -19,12 +19,13 @@ from decimal import Decimal
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_clock, get_notifier
 from app.core.clock import FrozenClock
 from app.core.config import get_settings
-from app.db.models import Booking, VendorProfile, VendorStatus
+from app.db.models import AuditEvent, Booking, VendorProfile, VendorStatus
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.payment import PaymentType
@@ -189,6 +190,10 @@ async def test_suspended_vendor_cannot_accept(client, db_session) -> None:
     assert error["code"] == "vendor_not_active"
     booking = await db_session.get(Booking, booking_id, populate_existing=True)
     assert booking.status == BookingStatus.requested
+    audits = await db_session.scalars(
+        select(AuditEvent.action).where(AuditEvent.entity_id == booking_id)
+    )
+    assert audits.all() == []
 
 
 async def test_pending_vendor_cannot_accept(client, db_session) -> None:
@@ -198,12 +203,18 @@ async def test_pending_vendor_cannot_accept(client, db_session) -> None:
         db_session, asset=asset, renter=renter, price_snapshot=money_snapshot()
     )
 
+    booking_id = booking.id
+
     response = await client.post(
-        f"{API}/bookings/{booking.id}/accept", headers=_auth(asset.vendor_id, ActorRole.vendor)
+        f"{API}/bookings/{booking_id}/accept", headers=_auth(asset.vendor_id, ActorRole.vendor)
     )
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "vendor_not_active"
+    audits = await db_session.scalars(
+        select(AuditEvent.action).where(AuditEvent.entity_id == booking_id)
+    )
+    assert audits.all() == []
 
 
 async def _system(session, booking_id, event, clock, notifier, payload=None) -> None:
