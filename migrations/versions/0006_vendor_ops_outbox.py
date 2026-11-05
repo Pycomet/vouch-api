@@ -56,7 +56,14 @@ It first refuses (raises, nothing changes) while:
 * a ``notification_outbox`` row is still ``pending``: dropping the table would
   silently lose a message that was never sent. Sent and dead rows do not block;
 * a vendor profile is ``suspended``: 0005 has nowhere to record the suspension,
-  so dropping it would silently let the vendor trade again.
+  so dropping it would silently let the vendor trade again;
+* a vendor profile is ``pending``: under 0005 every user with role ``vendor`` may
+  trade, so dropping the profile would let an unverified vendor trade. The
+  backfill only creates ``active`` profiles; ``pending`` ones appear once Steps 3
+  and 4 create vendors through the service.
+
+Only ``active`` profiles (verified) pass: their vendors trade under 0005 rules
+exactly as they did before 0006.
 
 Then every object above is dropped. Lossy, by design:
 
@@ -115,6 +122,10 @@ def _refuse_lossy_downgrade() -> None:
         "IF EXISTS (SELECT 1 FROM vendor_profiles WHERE status = 'suspended') THEN "
         "RAISE EXCEPTION 'a suspended vendor exists and 0005 cannot record the suspension; "
         "lift or otherwise resolve it before downgrading 0006_vendor_ops_outbox'; "
+        "END IF; "
+        "IF EXISTS (SELECT 1 FROM vendor_profiles WHERE status = 'pending') THEN "
+        "RAISE EXCEPTION 'a pending (unverified) vendor exists and 0005 would let it trade; "
+        "verify or remove it before downgrading 0006_vendor_ops_outbox'; "
         "END IF; END $$"
     )
 

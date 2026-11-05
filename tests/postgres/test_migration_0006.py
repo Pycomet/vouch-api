@@ -44,6 +44,16 @@ def _value(query: str, *args):
     return rows[0][0] if rows else None
 
 
+def _raised(failure: pytest.ExceptionInfo) -> str:
+    """The database's own error message, without the SQL that SQLAlchemy echoes after it.
+
+    The echoed DO block holds every guard's text, so matching on the whole string
+    would pass whichever guard fired.
+    """
+    message = str(failure.value).split("\n[SQL:", 1)[0]
+    return message.split(") ", 1)[1] if message.startswith("(") else message
+
+
 def _revision() -> str:
     return _value("SELECT version_num FROM alembic_version")
 
@@ -271,10 +281,12 @@ def test_upgrade_fails_loudly_on_duplicate_serials_and_deletes_nothing(
     _duplicate_serial(db_at_0005)
     assets_before = _value("SELECT count(*) FROM assets")
 
-    with pytest.raises(Exception, match="uq_assets_vendor_item_serial") as failure:
+    with pytest.raises(Exception) as failure:
         command.upgrade(alembic_cfg, REVISION_0006)
-    message = str(failure.value)
+    message = _raised(failure)
+    assert message.startswith("cannot create uq_assets_vendor_item_serial: 1 group(s)")
     assert "share a vendor, catalogue item and serial number" in message
+    assert "serial 'sn-seed-1'" in message
     assert str(db_at_0005.active_asset_id) in message
     assert "no rows were deleted" in message
 
@@ -306,8 +318,9 @@ def test_downgrade_refused_while_an_outbox_row_is_pending(
     migrated_db: str, alembic_cfg: Config
 ) -> None:
     _fetch_sync("INSERT INTO notification_outbox (template) VALUES ('ops.webhook_failed')")
-    with pytest.raises(Exception, match="pending notification_outbox"):
+    with pytest.raises(Exception) as failure:
         command.downgrade(alembic_cfg, "-1")
+    assert _raised(failure).startswith("pending notification_outbox rows exist")
     assert _revision() == REVISION_0006
 
     # Sent and dead rows are history; they do not block.
@@ -328,13 +341,36 @@ def test_downgrade_refused_while_a_vendor_is_suspended(
         "suspended_reason) VALUES ($1, 'suspended', 'individual', now(), 'Fraud report')",
         vendor_id,
     )
-    with pytest.raises(Exception, match="suspended vendor"):
+    with pytest.raises(Exception) as failure:
         command.downgrade(alembic_cfg, "-1")
+    assert _raised(failure).startswith("a suspended vendor exists")
     assert _revision() == REVISION_0006
 
+    # Lifted, the vendor is active (verified) again: nothing blocks.
     _fetch_sync(
-        "UPDATE vendor_profiles SET status = 'pending', suspended_at = NULL, "
-        "suspended_reason = NULL"
+        "UPDATE vendor_profiles SET status = 'active', verified_at = now(), "
+        "suspended_at = NULL, suspended_reason = NULL"
     )
+    command.downgrade(alembic_cfg, "-1")
+    assert _revision() == REVISION_0005
+
+
+def test_downgrade_refused_while_a_vendor_is_pending(migrated_db: str, alembic_cfg: Config) -> None:
+    # Under 0005 any vendor user can trade, so an unverified vendor would be let in.
+    vendor_id = _value(
+        "INSERT INTO users (phone, full_name, role, is_active) "
+        "VALUES ('+2348000000602', 'Pending Vendor', 'vendor', true) RETURNING id"
+    )
+    _fetch_sync(
+        "INSERT INTO vendor_profiles (user_id, status, business_type) "
+        "VALUES ($1, 'pending', 'rental_house')",
+        vendor_id,
+    )
+    with pytest.raises(Exception) as failure:
+        command.downgrade(alembic_cfg, "-1")
+    assert _raised(failure).startswith("a pending (unverified) vendor exists")
+    assert _revision() == REVISION_0006
+
+    _fetch_sync("UPDATE vendor_profiles SET status = 'active', verified_at = now()")
     command.downgrade(alembic_cfg, "-1")
     assert _revision() == REVISION_0005
