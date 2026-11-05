@@ -100,6 +100,7 @@ from app.services.payments import (
 )
 from app.services.pricing import money, price_snapshot
 from app.services.trust import required_tier_met, tier_effective
+from app.services.vendors import ensure_vendor_active
 
 HOLD_PERIOD = timedelta(hours=4)
 DEPOSIT_PERIOD = timedelta(hours=12)
@@ -365,6 +366,9 @@ async def _accept(ctx: _Context) -> _Outcome:
     provider (503) changes nothing (R21).
     """
     booking = ctx.booking
+    # A vendor who is not active (pending or suspended) takes no new work (M3a 4.7);
+    # handovers and returns on live bookings stay open to them.
+    await ensure_vendor_active(ctx.session, booking.vendor_id)
     if not ctx.now < booking.hold_expires_at:
         raise BookingGuardFailed(
             "hold_expired", {"hold_expires_at": _plain(booking.hold_expires_at)}

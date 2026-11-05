@@ -49,7 +49,7 @@ async def _seed() -> InventorySeed:
     try:
 
         async def user(phone: str, role: str, active: bool = True) -> uuid.UUID:
-            return await conn.fetchval(
+            user_id = await conn.fetchval(
                 "INSERT INTO users (phone, full_name, role, is_active) "
                 "VALUES ($1, $2, $3, $4) RETURNING id",
                 phone,
@@ -57,6 +57,14 @@ async def _seed() -> InventorySeed:
                 role,
                 active,
             )
+            if role == "vendor":
+                # An active vendor profile (M3a 4.7): without one, nothing is public.
+                await conn.execute(
+                    "INSERT INTO vendor_profiles (user_id, status, business_type, verified_at) "
+                    "VALUES ($1, 'active', 'individual', now())",
+                    user_id,
+                )
+            return user_id
 
         async def item(category: str, make: str, model: str, aliases: list[str]) -> uuid.UUID:
             return await conn.fetchval(

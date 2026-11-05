@@ -263,8 +263,84 @@ class InvalidTransition(VouchAPIError):
     code = "invalid_transition"
     message = "This booking cannot make that transition."
 
-    def __init__(self, from_status: str | None, event: str) -> None:
-        super().__init__(details={"from": from_status, "event": event})
+    def __init__(self, from_status: str | None, event: str, message: str | None = None) -> None:
+        super().__init__(message, details={"from": from_status, "event": event})
+
+
+LISTING_TRANSITION_MESSAGE = "This listing cannot make that transition."
+
+
+class VendorNotActiveError(VouchAPIError):
+    """Raised when a vendor whose profile is not ``active`` tries a vendor write.
+
+    Creating or submitting a listing, pausing or resuming one, and accepting a
+    booking request all need an ``active`` profile (M3a 4.4, 4.7). Returns 409
+    ``vendor_not_active``. Reads, handovers and returns stay allowed.
+    """
+
+    status_code = 409
+    code = "vendor_not_active"
+    message = "Your vendor account is not active."
+
+
+class ListingLockedError(VouchAPIError):
+    """Raised when a vendor edits a listing, or a field, its status locks (M3a 4.5).
+
+    Returns 409 ``listing_locked`` with ``details: {status}`` and, for an identity
+    field outside ``draft``/``rejected``, ``details.fields``.
+    """
+
+    status_code = 409
+    code = "listing_locked"
+    message = "This listing cannot be edited in its current status."
+
+
+class ListingIncompleteError(VouchAPIError):
+    """Raised when a listing is submitted for review without everything it needs.
+
+    Returns 409 ``listing_incomplete`` with ``details: {missing: [...]}``.
+    """
+
+    status_code = 409
+    code = "listing_incomplete"
+    message = "This listing is missing details needed for review."
+
+    def __init__(self, missing: list[str]) -> None:
+        super().__init__(details={"missing": missing})
+
+
+class CatalogueItemInactiveError(VouchAPIError):
+    """Raised when a listing names a catalogue item that is no longer active.
+
+    Returns 409 ``catalogue_item_inactive``.
+    """
+
+    status_code = 409
+    code = "catalogue_item_inactive"
+    message = "This catalogue item is not available for new listings."
+
+
+class DuplicateSerialError(VouchAPIError):
+    """Raised when the vendor already lists this serial for this catalogue item.
+
+    Translates the unique index ``uq_assets_vendor_item_serial``. Returns 409
+    ``duplicate_serial``.
+    """
+
+    status_code = 409
+    code = "duplicate_serial"
+    message = "You already list a unit of this item with this serial number."
+
+
+class HasLiveBookingsError(VouchAPIError):
+    """Raised when a listing with a live or disputed booking is deleted.
+
+    Returns 409 ``has_live_bookings``.
+    """
+
+    status_code = 409
+    code = "has_live_bookings"
+    message = "This listing has bookings in progress and cannot be deleted."
 
 
 _GUARD_MESSAGES = {

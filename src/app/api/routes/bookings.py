@@ -41,6 +41,7 @@ from app.api.examples import (
     PAYMENT_UNAVAILABLE,
     RENTER_ACCEPTED_BOOKING_EXAMPLE,
     REQUESTED_BOOKING_EXAMPLE,
+    VENDOR_NOT_ACTIVE,
     Err,
     documented,
     guard,
@@ -142,6 +143,7 @@ _CREATE_ERRORS = documented(
     422,
 )
 _ACCEPT_ERRORS = _action(
+    VENDOR_NOT_ACTIVE,
     _HOLD_EXPIRED,
     guard("vendor_approval_required"),
     _TIER_INSUFFICIENT,
@@ -388,7 +390,8 @@ async def accept_booking(
 ) -> BookingOut:
     """Accept before the hold expires; payment is then due within 12 hours.
 
-    The renter's virtual account is opened with the payment provider first: 502
+    A vendor whose profile is not active gets 409 ``vendor_not_active``. The
+    renter's virtual account is opened with the payment provider first: 502
     ``payment_provider_error`` if it fails, 503 ``payment_unavailable`` if the app
     has no provider. Either way the booking stays ``requested``."""
     return await _apply(

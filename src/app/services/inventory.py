@@ -12,6 +12,8 @@ Visibility rules applied here
 4. The asset's city is launched: its ``cities.slug`` is in ``launched_cities``
    (from ``Settings.launched_cities``) and ``cities.is_active = TRUE``.
 5. Owning vendor: ``users.is_active = TRUE AND users.deleted_at IS NULL``
+6. The owning vendor's profile is ``active`` (M3a 4.7): a ``pending`` or
+   ``suspended`` profile, or none at all, hides every listing of that vendor.
 
 A ``city`` filter that is not in ``launched_cities`` raises
 :class:`~app.schemas.errors.CityNotLaunchedError` (400) before any query runs.
@@ -57,6 +59,7 @@ from app.db.models.booking import LIVE_BOOKING_STATUSES, Booking
 from app.db.models.catalogue import CATALOGUE_SEARCH_FUNCTION, CatalogueItem
 from app.db.models.reference import Category, City
 from app.db.models.user import User
+from app.db.models.vendor import VendorProfile, VendorStatus
 from app.schemas.errors import CityNotLaunchedError, InvalidRequestError, ResourceNotFoundError
 from app.schemas.pagination import MAX_PAGE_LIMIT, decode_cursor, encode_cursor
 
@@ -99,6 +102,8 @@ def _public_query(launched_cities: Sequence[str]) -> Select:
         .join(Category, Category.id == Asset.category_id)
         .join(CatalogueItem, CatalogueItem.id == Asset.catalogue_item_id)
         .join(User, User.id == Asset.vendor_id)
+        # Inner join: a vendor without a profile counts as not active.
+        .join(VendorProfile, VendorProfile.user_id == Asset.vendor_id)
         .where(
             Asset.listing_status == ListingStatus.active,
             Asset.is_available.is_(True),
@@ -107,6 +112,7 @@ def _public_query(launched_cities: Sequence[str]) -> Select:
             City.is_active.is_(True),
             User.is_active.is_(True),
             User.deleted_at.is_(None),
+            VendorProfile.status == VendorStatus.active,
         )
     )
 
@@ -286,8 +292,8 @@ async def get_public_asset(
 
     Raises :class:`app.schemas.errors.ResourceNotFoundError` when the asset is
     absent, soft-deleted, non-active, in a city that is not launched, or owned
-    by an inactive vendor, making all hidden states indistinguishable from a
-    genuine 404.
+    by an inactive vendor or one whose profile is not ``active``, making all
+    hidden states indistinguishable from a genuine 404.
     """
     stmt = _public_query(launched_cities).where(Asset.id == asset_id)
     result = await session.execute(stmt)

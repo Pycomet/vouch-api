@@ -24,6 +24,8 @@ from app.schemas.errors import (
     ErrorEnvelope,
     OtpRejectedError,
     ValidationErrorResponse,
+    VendorNotActiveError,
+    VouchAPIError,
 )
 
 REQUEST_ID = "4b9f7c1e-2d3a-4e5f-8a6b-7c8d9e0f1a2b"
@@ -50,6 +52,24 @@ def guard(code: str, details: dict[str, Any] | None = None, description: str = "
     """The 409 a booking guard ``code`` returns, with the API's own message."""
     error = BookingGuardFailed(code, details)
     return Err(409, code, error.detail_message, error.error_details, description or None)
+
+
+def raised(
+    error: type[VouchAPIError] | VouchAPIError,
+    details: dict[str, Any] | None = None,
+    description: str = "",
+    name: str | None = None,
+) -> Err:
+    """The error an exception class (or instance) returns, with its own message."""
+    instance = error if isinstance(error, VouchAPIError) else error(details=details)
+    return Err(
+        instance.status_code,
+        instance.code,
+        instance.detail_message,
+        details if details is not None else instance.error_details,
+        description or None,
+        name,
+    )
 
 
 _DEFAULT_ERRORS: dict[int, Err] = {
@@ -507,6 +527,12 @@ PAYLOAD_TOO_LARGE = Err(
     "The request body is too large.",
     description="The body is over the size cap.",
 )
+VENDOR_NOT_ACTIVE = raised(
+    VendorNotActiveError,
+    {"status": "suspended"},
+    "Your vendor profile is pending or suspended.",
+)
+
 PAYMENT_PROVIDER_FAILED = Err(
     502,
     "payment_provider_error",

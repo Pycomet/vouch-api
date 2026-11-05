@@ -44,7 +44,7 @@ The client never sets a role, tier, price, commission, payment status or payout 
 | GET | `/catalogue/search` | anyone | query: `q`, `city`, `from`, `to`, `limit`, `cursor` | 200 page of `PublicAsset` + `equivalents` | 400 `invalid_request` / `city_not_launched` / `invalid_cursor`, 422 |
 | POST | `/bookings` | renter | `{asset_id, starts_on, ends_on, fulfilment, damage_contribution}` | 201 `Booking` (`requested`) | 400, 401, 403, 404, 409 guards, 422 |
 | GET | `/bookings/{id}` | the booking's renter or vendor, or an admin | — | 200 `Booking` | 401, 403, 404, 422 |
-| POST | `/bookings/{id}/accept` | vendor | — | 200 `Booking` (`accepted`) | 401, 403, 404, 409, 422, 502 `payment_provider_error`, 503 `payment_unavailable` |
+| POST | `/bookings/{id}/accept` | vendor | — | 200 `Booking` (`accepted`) | 401, 403, 404, 409 (incl. `vendor_not_active`), 422, 502 `payment_provider_error`, 503 `payment_unavailable` |
 | POST | `/bookings/{id}/decline` | vendor | `{reason?}` | 200 `Booking` (`declined`) | 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/approve` | vendor | — | 200 `Booking` (`vendor_approved_at` set) | 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/cancel` | renter or vendor | `{reason?}` (vendor: required) | 200 `Booking` (`cancelled_by_renter` / `cancelled_by_vendor`) | 401, 403, 404, 409, 422 |
@@ -68,7 +68,7 @@ The client never sets a role, tier, price, commission, payment status or payout 
 
 ### 4.2 Inventory
 
-`PublicAsset` is `{id, name, display_name, make, model, description, category, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, city, is_available, minimum_trust_tier, created_at, updated_at}`. It never includes the serial number, vendor identity, condition notes or review data. Only active, available, non-deleted listings of active vendors in launched cities are visible.
+`PublicAsset` is `{id, name, display_name, make, model, description, category, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, currency, city, is_available, minimum_trust_tier, created_at, updated_at}`. It never includes the serial number, vendor identity, condition notes or review data. Only active, available, non-deleted listings of active vendors (an active user whose vendor profile is `active`) in launched cities are visible; a pending or suspended vendor's listings vanish from search and their detail is 404.
 
 - `/assets`: `starts_on` and `ends_on` must be given together, with `starts_on <= ends_on` (400 otherwise). With them, units that have a live booking or a blocked window overlapping the range are left out.
 - `/catalogue/search`: `q` is a full-text match on make, model and aliases. `from` and `to` work like the `/assets` dates. If nothing is free and `q` matched catalogue items, the search runs again over those items' categories without `q`, and the response says `"equivalents": true`.
@@ -167,8 +167,14 @@ A 422 is FastAPI's validation body, `{"detail": [{"type", "loc", "msg", "ctx"?}]
 | 401 | `unauthenticated` | Missing, bad or expired token; the token's user is missing, inactive, deleted or has another role; any failed OTP verify. Sent with `WWW-Authenticate: Bearer`. |
 | 401 | `invalid_signature` | The webhook's `X-Vouch-Signature` is missing or wrong |
 | 403 | `forbidden` | Authenticated, but this role may not use the route or action |
-| 404 | `resource_not_found` | Unknown or hidden: an asset that is not public, a booking the caller is not party to, an unknown webhook provider |
-| 409 | `invalid_transition` | The booking cannot take this event from its status, or this actor may not send it. `details: {from, event}` |
+| 404 | `resource_not_found` | Unknown or hidden: an asset that is not public (including every listing of a vendor whose profile is not `active`), a booking the caller is not party to, an unknown webhook provider |
+| 409 | `invalid_transition` | The booking (or listing) cannot take this event from its status, or this actor may not send it. `details: {from, event}` |
+| 409 | `vendor_not_active` | The vendor's profile is `pending` or `suspended` (or missing): no listing create, submit, pause or resume, and no accepting a request. Reads, handovers and returns still work. `details: {status}` |
+| 409 | `listing_locked` | The vendor's listing cannot take this edit: any edit while it is in `review`, or an identity field (`catalogue_item_id`, `serial_number`, `city`) outside `draft`/`rejected`. `details: {status, fields?}` |
+| 409 | `listing_incomplete` | A listing submitted for review lacks something it needs. `details: {missing: [...]}` (`serial_number`, `condition_grade`, `daily_rate`, `deposit_amount`, `fulfilment`, `delivery_fee`) |
+| 409 | `catalogue_item_inactive` | The listing names a catalogue item that is no longer active |
+| 409 | `duplicate_serial` | The vendor already lists a unit of this catalogue item with this serial number (any letter case) |
+| 409 | `has_live_bookings` | A listing with a live or disputed booking cannot be deleted |
 | 409 | `tier_insufficient` | The renter's effective trust tier is below the item's minimum. `details: {required, effective}` |
 | 409 | `vendor_approval_required` | A tier-3 item: the vendor must approve the renter before accepting |
 | 409 | `approval_not_required` | `/approve` on an item that does not need it |

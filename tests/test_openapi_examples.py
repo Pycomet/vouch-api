@@ -128,6 +128,7 @@ ACTION = f"{BOOKINGS}/{{booking_id}}"
         (
             f"{ACTION}/accept",
             {
+                "vendor_not_active",
                 "invalid_transition",
                 "hold_expired",
                 "vendor_approval_required",
