@@ -23,6 +23,8 @@ from app.schemas.errors import (
     LISTING_TRANSITION_MESSAGE,
     BookingGuardFailed,
     CatalogueItemInactiveError,
+    DatesBlockedError,
+    DatesUnavailableError,
     DuplicateSerialError,
     ErrorEnvelope,
     HasLiveBookingsError,
@@ -494,6 +496,27 @@ CATALOGUE_ITEM_INACTIVE = raised(
 )
 DUPLICATE_SERIAL = raised(DuplicateSerialError, description="You already list this serial.")
 HAS_LIVE_BOOKINGS = raised(HasLiveBookingsError, description="A booking still holds the unit.")
+
+
+# Availability blocks (M3a 4.6).
+BLOCK_EXAMPLE: dict[str, Any] = {
+    "id": "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a",
+    "asset_id": ASSET_ID,
+    "starts_on": "2026-12-24",
+    "ends_on": "2026-12-27",
+    "created_at": "2026-11-05T09:15:00Z",
+}
+BLOCK_LIST_EXAMPLE: dict[str, Any] = {"items": [BLOCK_EXAMPLE]}
+BLOCK_DATES_INVALID = Err(
+    400,
+    "invalid_request",
+    "The start date must not be in the past.",
+    description="The start is after the end, or before today (business zone).",
+)
+BLOCK_OVERLAPS_BLOCK = raised(DatesBlockedError, description="Another block overlaps these dates.")
+BLOCK_OVERLAPS_BOOKING = raised(
+    DatesUnavailableError, description="A live booking holds some of these dates."
+)
 
 
 def listing_transition(from_status: str, event: str, description: str) -> Err:

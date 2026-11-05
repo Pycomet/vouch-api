@@ -297,10 +297,10 @@ LISTING_TRANSITION_MESSAGE = "This listing cannot make that transition."
 class VendorNotActiveError(VouchAPIError):
     """Raised when a vendor whose profile is not ``active`` tries a vendor write.
 
-    Every listing write (create, edit, submit, pause, resume, delete; amendment
-    A23) and accepting a booking request need an ``active`` profile (M3a 4.4,
-    4.7). Returns 409
-    ``vendor_not_active``. Reads, handovers and returns stay allowed.
+    Every listing write (create, edit, submit, pause, resume, delete, adding or
+    removing a block; amendment A23) and accepting a booking request need an
+    ``active`` profile (M3a 4.4, 4.6, 4.7). Returns 409 ``vendor_not_active``.
+    Reads, handovers and returns stay allowed.
     """
 
     status_code = 409
@@ -366,6 +366,31 @@ class HasLiveBookingsError(VouchAPIError):
     status_code = 409
     code = "has_live_bookings"
     message = "This listing has bookings in progress and cannot be deleted."
+
+
+class DatesBlockedError(VouchAPIError):
+    """Raised when a vendor's new block overlaps another block on the listing (M3a 4.6).
+
+    Also the translation of the exclusion constraint
+    ``ex_availability_windows_no_blocked_overlap``. Returns 409 ``dates_blocked``,
+    the code a booking request on blocked dates gets too.
+    """
+
+    status_code = 409
+    code = "dates_blocked"
+    message = "These dates overlap another block on this listing."
+
+
+class DatesUnavailableError(VouchAPIError):
+    """Raised when a vendor's new block overlaps a live booking (M3a 4.6).
+
+    Returns 409 ``dates_unavailable``, the code a booking request gets when another
+    live booking holds the dates.
+    """
+
+    status_code = 409
+    code = "dates_unavailable"
+    message = "A live booking holds some of these dates."
 
 
 _GUARD_MESSAGES = {

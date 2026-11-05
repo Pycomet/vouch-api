@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.main import create_app
 from app.schemas.assets import CatalogueSearchPage, PublicAsset
 from app.schemas.auth import OtpSent, TokenOut
+from app.schemas.blocks import Block, BlockList
 from app.schemas.bookings import BookingOut, MoneyLine
 from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
@@ -225,6 +226,33 @@ def test_listing_routes_name_their_409s(schema, method, path, codes) -> None:
     assert {"401", "403", "422"} <= set(responses)
 
 
+BLOCKS = f"{LISTING}/blocks"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "codes"),
+    [
+        ("post", BLOCKS, {"vendor_not_active", "dates_blocked", "dates_unavailable"}),
+        ("delete", f"{BLOCKS}/{{block_id}}", {"vendor_not_active"}),
+    ],
+)
+def test_block_routes_name_their_409s(schema, method, path, codes) -> None:
+    responses = schema["paths"][path][method]["responses"]
+
+    assert codes <= _named(responses, "409")
+    assert {"401", "403", "404", "422"} <= set(responses)
+
+
+def test_block_routes_document_400_and_bodiless_delete(schema) -> None:
+    create = schema["paths"][BLOCKS]["post"]["responses"]
+    listing = schema["paths"][BLOCKS]["get"]["responses"]
+    remove = schema["paths"][f"{BLOCKS}/{{block_id}}"]["delete"]["responses"]
+
+    assert _named(create, "400") == {"invalid_request"}
+    assert "409" not in listing
+    assert "content" not in remove["204"]
+
+
 def test_listing_transition_example_names_the_listing(schema) -> None:
     media = schema["paths"][f"{LISTING}/resume"]["post"]["responses"]["409"]["content"]
     error = media["application/json"]["examples"]["invalid_transition"]["value"]["error"]
@@ -306,6 +334,8 @@ def test_late_payment_example_returns_everything_and_owes_nothing(schema) -> Non
         (OwnAsset, examples.OWN_ASSET_EXAMPLE),
         (OwnAsset, examples.PAUSED_ASSET_EXAMPLE),
         (Page[OwnAsset], examples.OWN_ASSET_PAGE_EXAMPLE),
+        (Block, examples.BLOCK_EXAMPLE),
+        (BlockList, examples.BLOCK_LIST_EXAMPLE),
     ],
 )
 def test_examples_match_their_models(model: type[BaseModel], payload: dict) -> None:
