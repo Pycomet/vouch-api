@@ -5,10 +5,12 @@ from app.db.models.catalogue import CatalogueItem
 from app.db.models.handover import HandoverRecord
 from app.db.models.ledger import Direction, LedgerAccount, LedgerEntry
 from app.db.models.otp import OtpChallenge
+from app.db.models.outbox import NotificationOutbox, OutboxStatus
 from app.db.models.payment import Payment
 from app.db.models.reference import Category, City
 from app.db.models.trust import VendorReference
 from app.db.models.user import KYCProfile, User
+from app.db.models.vendor import VendorBusinessType, VendorProfile, VendorStatus
 from app.db.models.webhook import WebhookEvent
 
 __all__ = [
@@ -26,8 +28,13 @@ __all__ = [
     "City",
     "HandoverRecord",
     "KYCProfile",
+    "NotificationOutbox",
     "OtpChallenge",
+    "OutboxStatus",
     "Payment",
     "User",
+    "VendorBusinessType",
+    "VendorProfile",
     "VendorReference",
+    "VendorStatus",
 ]

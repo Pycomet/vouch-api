@@ -35,7 +35,7 @@ from app.db.models import (
     User,
     VendorReference,
 )
-from app.db.models.asset import ListingStatus
+from app.db.models.asset import ListingStatus, PausedBy
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
 from app.db.models.payment import DepositStatus, PaymentStatus, PaymentType
@@ -106,12 +106,15 @@ async def create_asset(
     weekly_rate: Decimal | None = None,
     fulfilment: dict | None = None,
     listing_status: ListingStatus = ListingStatus.active,
+    paused_by: PausedBy | None = None,
     make: str = "TestMake",
     model: str | None = None,
     aliases: list[str] | None = None,
     name: str | None = None,
 ) -> Asset:
     """An active asset in a launched city, with its own catalogue item.
+
+    A ``paused`` asset needs ``paused_by`` (0006 CHECK); it defaults to ``admin``.
 
     Creates a verified vendor when ``vendor`` is not given (``asset.vendor_id``).
     ``make``, ``model`` and ``aliases`` name the catalogue item (the model gets a
@@ -144,6 +147,7 @@ async def create_asset(
         weekly_rate=weekly_rate,
         fulfilment=fulfilment or {"pickup": True, "delivery": False},
         listing_status=listing_status,
+        paused_by=paused_by or (PausedBy.admin if listing_status == ListingStatus.paused else None),
         minimum_trust_tier=minimum_trust_tier,
         condition_grade="good",
     )

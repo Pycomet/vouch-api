@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 REVISION_0004 = "0004_booking_payment"
+REVISION_0005 = "0005_otp_challenges"
 OTP_COLUMNS = {
     "id": ("uuid", "NO"),
     "phone": ("text", "NO"),
@@ -64,19 +65,21 @@ def _insert(attempts: int) -> None:
 
 
 def test_migration_0005_roundtrip(migrated_db: str, alembic_cfg: Config) -> None:
+    # Head is past 0005 since M3a's 0006 (which adds ip_hash): check 0005 itself.
+    command.downgrade(alembic_cfg, REVISION_0005)
     assert _columns("otp_challenges") == OTP_COLUMNS
     assert "ix_otp_challenges_phone_created_at" in _indexes("otp_challenges")
     users = _columns("users")
     assert users["phone_verified_at"] == ("timestamp with time zone", "YES")
     assert users["full_name"] == ("character varying", "YES")
 
-    command.downgrade(alembic_cfg, "-1")
+    command.downgrade(alembic_cfg, REVISION_0004)
     assert _columns("otp_challenges") == {}
     users = _columns("users")
     assert "phone_verified_at" not in users
     assert users["full_name"] == ("character varying", "NO")
 
-    command.upgrade(alembic_cfg, "head")
+    command.upgrade(alembic_cfg, REVISION_0005)
     assert _columns("otp_challenges") == OTP_COLUMNS
 
 

@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.clock import FrozenClock, start_of_business_day
 from app.core.config import get_settings
 from app.db.models import Asset, AuditEvent, Booking, LedgerAccount, LedgerEntry, User
-from app.db.models.asset import ListingStatus
+from app.db.models.asset import ListingStatus, PausedBy
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
@@ -1091,6 +1091,7 @@ async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> Non
     asset = await db_session.get(Asset, booking.asset_id)
     await db_session.refresh(asset)
     assert asset.listing_status == ListingStatus.paused
+    assert asset.paused_by == PausedBy.admin
 
     audits = await _audits(db_session, booking.id)
     assert [a.action for a in audits[-2:]] == ["deposit.forfeited", "booking.lost"]
@@ -1102,6 +1103,7 @@ async def test_mark_lost_forfeits_and_pauses(db_session, clock, notifier) -> Non
         "active",
         "paused",
     )
+    assert paused.after["paused_by"] == "admin"
     restricted = (await _audits(db_session, booking.renter_id))[-1]
     assert restricted.action == "user.restricted"
     assert restricted.after["restricted_reason"] == "lost_item"
@@ -1200,6 +1202,7 @@ async def test_mark_lost_on_paused_asset_writes_no_pause_row(db_session, clock, 
     booking = await _paid(db_session, BookingStatus.in_progress)
     asset = await db_session.get(Asset, booking.asset_id)
     asset.listing_status = ListingStatus.paused
+    asset.paused_by = PausedBy.vendor
     await db_session.flush()
     admin = await admin_actor(db_session)
 
@@ -1225,7 +1228,8 @@ async def test_mark_lost_reads_the_locked_asset_not_a_stale_copy(
     assert asset.listing_status == ListingStatus.active  # the session's copy
     # Paused behind the session's back (as another transaction would).
     await db_session.execute(
-        text("UPDATE assets SET listing_status = 'paused' WHERE id = :id"), {"id": asset.id}
+        text("UPDATE assets SET listing_status = 'paused', paused_by = 'admin' WHERE id = :id"),
+        {"id": asset.id},
     )
     admin = await admin_actor(db_session)
 

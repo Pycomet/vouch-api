@@ -60,7 +60,7 @@ from app.db.models import (
     Payment,
     User,
 )
-from app.db.models.asset import ListingStatus
+from app.db.models.asset import ListingStatus, PausedBy
 from app.db.models.audit import ActorRole
 from app.db.models.booking import BookingStatus
 from app.db.models.handover import HandoverDirection, HandoverStatus
@@ -1175,6 +1175,7 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
     if asset.listing_status != ListingStatus.paused:
         previous = asset.listing_status
         asset.listing_status = ListingStatus.paused
+        asset.paused_by = PausedBy.admin  # marking a booking lost is an admin act
         await record_audit(
             ctx.session,
             actor=ctx.actor,
@@ -1182,7 +1183,11 @@ async def _mark_lost(ctx: _Context) -> _Outcome:
             entity_id=asset.id,
             action="asset.paused",
             before={"listing_status": previous},
-            after={"listing_status": ListingStatus.paused, "booking_id": booking.id},
+            after={
+                "listing_status": ListingStatus.paused,
+                "paused_by": PausedBy.admin,
+                "booking_id": booking.id,
+            },
             reason=reason,
             request_id=ctx.request_id,
         )

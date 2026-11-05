@@ -22,6 +22,7 @@ erDiagram
         uuid review_actor_id FK "null"
         timestamptz reviewed_at "null"
         text review_reason "null"
+        text paused_by "null"
         timestamptz created_at
         timestamptz updated_at
         timestamptz deleted_at "null"
@@ -141,6 +142,18 @@ erDiagram
         text memo "null"
         timestamptz created_at
     }
+    notification_outbox {
+        bigint id PK
+        uuid user_id FK "null"
+        text template
+        jsonb data
+        outboxstatus status
+        smallint attempts
+        timestamptz next_attempt_at
+        text last_error "null"
+        timestamptz created_at
+        timestamptz sent_at "null"
+    }
     otp_challenges {
         uuid id PK
         text phone
@@ -148,6 +161,7 @@ erDiagram
         timestamptz expires_at
         smallint attempts
         timestamptz consumed_at "null"
+        text ip_hash "null"
         timestamptz created_at
     }
     payments {
@@ -193,6 +207,24 @@ erDiagram
         timestamptz updated_at
         timestamptz deleted_at "null"
     }
+    vendor_profiles {
+        uuid user_id PK, FK
+        vendorstatus status
+        vendorbusinesstype business_type
+        boolean is_sub_broker
+        text business_name "null"
+        text business_registration_ref "null"
+        text bank_name "null"
+        text account_name "null"
+        char_4 account_last4 "null"
+        text recipient_code UK "null"
+        uuid verified_by FK "null"
+        timestamptz verified_at "null"
+        timestamptz suspended_at "null"
+        text suspended_reason "null"
+        timestamptz created_at
+        timestamptz updated_at
+    }
     vendor_references {
         uuid id PK
         uuid renter_id FK
@@ -209,6 +241,10 @@ erDiagram
         timestamptz received_at
         timestamptz processed_at "null"
         text processing_error "null"
+        text resolution "null"
+        timestamptz resolved_at "null"
+        uuid resolved_by FK "null"
+        text resolution_note "null"
     }
     assets ||--o{ availability_windows : "asset_id"
     assets ||--o{ bookings : "asset_id"
@@ -220,6 +256,7 @@ erDiagram
     bookings ||--o{ vendor_references : "booking_id, renter_id"
     bookings ||--o{ vendor_references : "booking_id, vendor_id"
     catalogue_items ||--o{ assets : "catalogue_item_id"
+    catalogue_items ||--o{ assets : "catalogue_item_id, category_id"
     categories ||--o{ assets : "category_id"
     categories ||--o{ catalogue_items : "category_id"
     cities ||--o{ assets : "city_id"
@@ -227,9 +264,13 @@ erDiagram
     users |o--o{ assets : "review_actor_id"
     users |o--o{ audit_events : "actor_id"
     users |o--o{ handover_records : "renter_signer_id"
+    users |o--o{ notification_outbox : "user_id"
+    users |o--o{ vendor_profiles : "verified_by"
+    users |o--o{ webhook_events : "resolved_by"
     users ||--o{ assets : "vendor_id"
     users ||--o{ bookings : "renter_id"
     users ||--o{ bookings : "vendor_id"
+    users ||--o{ vendor_profiles : "user_id"
     users ||--o{ vendor_references : "renter_id"
     users ||--o{ vendor_references : "vendor_id"
     users ||--o| kyc_profiles : "user_id"
