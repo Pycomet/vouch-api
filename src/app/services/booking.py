@@ -3,12 +3,15 @@
 Two entry points:
 
 * :func:`request_booking` creates a ``requested`` booking (the table's ``request``
-  row). Its guards run in order: the asset is publicly visible (else 404), the
-  dates are valid and start no earlier than today on the business calendar, the
-  fulfilment is offered, the renter is not restricted, the renter's trust tier is
-  high enough, no blocked availability window overlaps, and finally the insert
-  itself, where the exclusion constraint ``ex_bookings_no_live_overlap`` is the
-  real guard against overlapping live bookings.
+  row). Its guards run in order: the asset is publicly visible (else 404), its
+  row is locked ``FOR UPDATE`` and its visibility checked again (M3a 4.6: the
+  same lock block creation takes first, so a block and a request never both
+  succeed), the dates are valid and start no earlier than today on the
+  business calendar, the fulfilment is offered, the renter is not restricted,
+  the renter's trust tier is high enough, no blocked availability window
+  overlaps, and finally the insert itself, where the exclusion constraint
+  ``ex_bookings_no_live_overlap`` is the real guard against overlapping live
+  bookings.
 * :func:`transition` applies an event to an existing booking. It locks the row
   (``SELECT ... FOR UPDATE``), looks up ``(status, event)`` in ``_TRANSITIONS``,
   checks the actor, runs the handler, writes one audit row and flushes.
@@ -1282,6 +1285,12 @@ async def request_booking(
     if renter.role != ActorRole.renter:
         raise InvalidTransition(None, REQUEST_EVENT)
 
+    await get_public_asset(session, asset_id, launched_cities=settings.launched_cities)
+    # Lock order (M3a 4.6, S3-R6): the asset row first, before the blocks check and
+    # the insert, exactly as block creation does; no booking is locked on this path.
+    # The lock may have waited for a vendor write (a block, a pause, a delete), so
+    # visibility is checked again against what that write committed.
+    await session.get(Asset, asset_id, with_for_update=True, populate_existing=True)
     asset = (
         await get_public_asset(session, asset_id, launched_cities=settings.launched_cities)
     ).asset
