@@ -18,6 +18,7 @@ from app.db.models import CatalogueItem
 from app.db.models.reference import Category
 from app.db.session import get_session
 from app.main import create_app
+from tests.helpers.cursors import CRAFTED_CURSORS
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("VOUCH_TEST_DATABASE_URL"),
@@ -167,4 +168,12 @@ async def test_bad_cursor_is_400(client) -> None:
     response = await client.get(API, params={"cursor": "not-a-cursor"})
 
     assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_cursor"
+
+
+@pytest.mark.parametrize("cursor", CRAFTED_CURSORS.values(), ids=CRAFTED_CURSORS.keys())
+async def test_well_formed_but_wrong_cursor_is_400(client, cursor) -> None:
+    response = await client.get(API, params={"cursor": cursor})
+
+    assert response.status_code == 400, response.text
     assert response.json()["error"]["code"] == "invalid_cursor"

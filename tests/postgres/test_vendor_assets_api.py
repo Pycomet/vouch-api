@@ -46,6 +46,7 @@ from app.services.audit import Actor
 from app.services.listings import create_listing, update_listing
 from app.services.notify import RecordingNotifier
 from tests.helpers.auth import bearer
+from tests.helpers.cursors import CRAFTED_CURSORS
 from tests.postgres.factories import (
     DEFAULT_NOW,
     FIRST_START,
@@ -1301,3 +1302,13 @@ async def test_a_refused_live_edit_leaves_the_transaction_usable(db_session) -> 
 
     asset = await _asset(db_session, asset_id)
     assert (asset.condition_grade, asset.description) == ("good", None)
+
+
+@pytest.mark.parametrize("cursor", CRAFTED_CURSORS.values(), ids=CRAFTED_CURSORS.keys())
+async def test_list_well_formed_but_wrong_cursor_is_400(client, db_session, cursor) -> None:
+    _, headers = await _vendor(db_session)
+
+    response = await client.get(API, params={"cursor": cursor}, headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert _error(response)["code"] == "invalid_cursor"

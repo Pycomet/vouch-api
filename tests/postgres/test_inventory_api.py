@@ -25,6 +25,7 @@ from app.core.config import Environment, Settings
 from app.main import create_app
 from app.schemas.errors import CityNotLaunchedError, ResourceNotFoundError
 from app.services.inventory import get_public_asset, search_public_assets
+from tests.helpers.cursors import CRAFTED_CURSORS
 from tests.postgres.conftest import DATABASE_URL, asyncpg_url
 
 pytestmark = pytest.mark.skipif(
@@ -405,3 +406,11 @@ async def test_service_rejects_unlaunched_city_and_hides_detail(seed: InventoryS
             assert row.city_slug == "lagos"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.parametrize("cursor", CRAFTED_CURSORS.values(), ids=CRAFTED_CURSORS.keys())
+def test_search_well_formed_but_wrong_cursor_is_400(client: TestClient, cursor) -> None:
+    response = client.get("/api/v1/assets", params={"cursor": cursor})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_cursor"

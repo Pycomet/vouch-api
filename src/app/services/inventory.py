@@ -238,9 +238,7 @@ async def search_public_assets(
 
     # Cursor: items after the encoded (created_at, id) position.
     if cursor is not None:
-        created_at_iso, id_str = decode_cursor(cursor)
-        cursor_dt = datetime.datetime.fromisoformat(created_at_iso)
-        cursor_id = uuid.UUID(id_str)
+        cursor_dt, cursor_id = decode_cursor(cursor)
         stmt = stmt.where(
             and_(
                 Asset.created_at >= cursor_dt,
@@ -348,9 +346,7 @@ async def list_catalogue_items(
     if q is not None and q.strip():
         stmt = stmt.where(_text_match(q))
     if cursor is not None:
-        created_at_iso, id_str = decode_cursor(cursor)
-        cursor_dt = datetime.datetime.fromisoformat(created_at_iso)
-        cursor_id = uuid.UUID(id_str)
+        cursor_dt, cursor_id = decode_cursor(cursor)
         stmt = stmt.where(
             CatalogueItem.created_at >= cursor_dt,
             ~and_(CatalogueItem.created_at == cursor_dt, CatalogueItem.id <= cursor_id),

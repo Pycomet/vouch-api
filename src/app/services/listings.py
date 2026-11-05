@@ -204,9 +204,7 @@ async def list_own_listings(
     if status is not None:
         stmt = stmt.where(Asset.listing_status == status)
     if cursor is not None:
-        created_at_iso, id_str = decode_cursor(cursor)
-        cursor_dt = datetime.datetime.fromisoformat(created_at_iso)
-        cursor_id = uuid.UUID(id_str)
+        cursor_dt, cursor_id = decode_cursor(cursor)
         stmt = stmt.where(
             Asset.created_at <= cursor_dt,
             ~and_(Asset.created_at == cursor_dt, Asset.id >= cursor_id),
