@@ -54,6 +54,8 @@ The client never sets a role, tier, price, commission, payment status or payout 
 | POST | `/bookings/{id}/claim` | vendor | `{amount, description, evidence_urls}` | 200 `Booking` (`disputed`) | 400, 401, 403, 404, 409, 422 |
 | POST | `/bookings/{id}/resolve` | admin | `{decision, reason, amount?}` | 200 `Booking` (`completed`) | 400, 401, 403, 404, 409, 422 |
 | GET | `/me/home` | renter | — | 200 `{active, past}` | 401, 403 |
+| GET | `/catalogue/items` | anyone | query: `q`, `category` (slug), `limit`, `cursor` | 200 page of `{id, category, make, model, mount, specs, replacement_value_band}` (active items only) | 400 `invalid_request` (unknown category) / `invalid_cursor`, 422 |
+| GET | `/vendor/profile` | vendor | — | 200 `{status, business_type, is_sub_broker, business_name, bank_name, account_name, account_last4, has_recipient_code}` (the recipient code itself is never returned) | 401, 403, 404 (no profile) |
 | GET | `/vendor/home` | vendor | — | 200 `{requests, today: {handovers, returns}, next_payout, utilisation_7d}` | 401, 403 |
 | POST | `/webhooks/{provider}` | the payment provider (no token; `X-Vouch-Signature`) | the provider's raw event | 200 `{status: "processed" \| "duplicate", processing_error}` | 401 `invalid_signature`, 404 (provider is not the configured one), 413, 422 |
 

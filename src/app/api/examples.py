@@ -373,6 +373,40 @@ VENDOR_HOME_EXAMPLE: dict[str, Any] = {
     "utilisation_7d": "0.43",
 }
 
+CATALOGUE_ITEMS_EXAMPLE: dict[str, Any] = {
+    "items": [
+        {
+            "id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e",
+            "category": "camera",
+            "make": "Sony",
+            "model": "FX3",
+            "mount": "E",
+            "specs": {},
+            "replacement_value_band": "C",
+        }
+    ],
+    "pagination": {"limit": 20, "next_cursor": None},
+}
+
+UNKNOWN_CATEGORY = Err(
+    400,
+    "invalid_request",
+    "Unknown category.",
+    {"category": "no-such-category"},
+    description="The category slug does not exist.",
+)
+
+VENDOR_PROFILE_EXAMPLE: dict[str, Any] = {
+    "status": "active",
+    "business_type": "rental_house",
+    "is_sub_broker": False,
+    "business_name": "Example Rentals Ltd",
+    "bank_name": "Example Bank",
+    "account_name": "EXAMPLE RENTALS LTD",
+    "account_last4": "4321",
+    "has_recipient_code": True,
+}
+
 LIVE_EXAMPLE: dict[str, Any] = {"status": "ok", "service": "Vouch API", "version": "0.1.0"}
 READY_EXAMPLE: dict[str, Any] = {**LIVE_EXAMPLE, "checks": {"database": "ok"}}
 NOT_READY_EXAMPLE: dict[str, Any] = {

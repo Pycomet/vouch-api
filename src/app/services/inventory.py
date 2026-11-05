@@ -57,7 +57,7 @@ from app.db.models.booking import LIVE_BOOKING_STATUSES, Booking
 from app.db.models.catalogue import CATALOGUE_SEARCH_FUNCTION, CatalogueItem
 from app.db.models.reference import Category, City
 from app.db.models.user import User
-from app.schemas.errors import CityNotLaunchedError, ResourceNotFoundError
+from app.schemas.errors import CityNotLaunchedError, InvalidRequestError, ResourceNotFoundError
 from app.schemas.pagination import MAX_PAGE_LIMIT, decode_cursor, encode_cursor
 
 
@@ -297,3 +297,64 @@ async def get_public_asset(
         raise ResourceNotFoundError()
 
     return _to_row(row)
+
+
+@dataclass(frozen=True)
+class CatalogueItemRow:
+    """One active catalogue item with its category slug."""
+
+    item: CatalogueItem
+    category_slug: str
+
+
+@dataclass
+class CatalogueItemPage:
+    items: list[CatalogueItemRow]
+    next_cursor: str | None
+
+
+async def list_catalogue_items(
+    session: AsyncSession,
+    *,
+    q: str | None = None,
+    category: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> CatalogueItemPage:
+    """A page of active catalogue items (M3a 4.1), ordered by ``(created_at, id)``.
+
+    ``q`` uses the same search vector as :func:`search_public_assets`. A ``category``
+    slug that does not exist raises 400 ``invalid_request``.
+    """
+    limit = min(limit, MAX_PAGE_LIMIT)
+    if category is not None:
+        known = await session.scalar(select(Category.id).where(Category.slug == category))
+        if known is None:
+            raise InvalidRequestError(message="Unknown category.", details={"category": category})
+
+    stmt = (
+        select(CatalogueItem, Category.slug)
+        .join(Category, Category.id == CatalogueItem.category_id)
+        .where(CatalogueItem.is_active.is_(True))
+    )
+    if category is not None:
+        stmt = stmt.where(Category.slug == category)
+    if q is not None and q.strip():
+        stmt = stmt.where(_text_match(q))
+    if cursor is not None:
+        created_at_iso, id_str = decode_cursor(cursor)
+        cursor_dt = datetime.datetime.fromisoformat(created_at_iso)
+        cursor_id = uuid.UUID(id_str)
+        stmt = stmt.where(
+            CatalogueItem.created_at >= cursor_dt,
+            ~and_(CatalogueItem.created_at == cursor_dt, CatalogueItem.id <= cursor_id),
+        )
+    stmt = stmt.order_by(CatalogueItem.created_at.asc(), CatalogueItem.id.asc()).limit(limit + 1)
+
+    rows = [CatalogueItemRow(item, slug) for item, slug in (await session.execute(stmt)).all()]
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1].item
+        next_cursor = encode_cursor(last.created_at.isoformat(), str(last.id))
+    return CatalogueItemPage(items=rows, next_cursor=next_cursor)

@@ -22,19 +22,60 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_launched_cities
 from app.api.examples import (
+    CATALOGUE_ITEMS_EXAMPLE,
     CITY_NOT_LAUNCHED,
     INVALID_CURSOR,
     INVALID_DATES,
     SEARCH_EXAMPLE,
+    UNKNOWN_CATEGORY,
     documented,
 )
 from app.db.session import get_session
 from app.schemas.assets import DEFAULT_LIMIT, MAX_LIMIT, CatalogueSearchPage, PublicAsset
+from app.schemas.catalogue import CatalogueItemOut
 from app.schemas.errors import InvalidRequestError
-from app.schemas.pagination import PageMeta, decode_cursor
-from app.services.inventory import matching_categories, search_public_assets
+from app.schemas.pagination import Page, PageMeta, decode_cursor
+from app.services.inventory import (
+    list_catalogue_items,
+    matching_categories,
+    search_public_assets,
+)
 
 router = APIRouter(prefix="/catalogue", tags=["inventory"])
+
+
+@router.get(
+    "/items",
+    response_model=Page[CatalogueItemOut],
+    summary="Look up catalogue items to list",
+    responses=documented(200, CATALOGUE_ITEMS_EXAMPLE, UNKNOWN_CATEGORY, INVALID_CURSOR, 422),
+)
+async def list_items(
+    q: str | None = Query(None, max_length=200, description="Free text: make, model or alias."),
+    category: str | None = Query(None, description="Category slug."),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Items per page (≤100)."),
+    cursor: str | None = Query(None, description="Opaque pagination cursor from a prior response."),
+    session: AsyncSession = Depends(get_session),
+) -> Page[CatalogueItemOut]:
+    """Active catalogue items, for a vendor choosing what to list. No token needed."""
+    if cursor is not None:
+        decode_cursor(cursor)  # CursorDecodeError (400) before any query
+    page = await list_catalogue_items(session, q=q, category=category, limit=limit, cursor=cursor)
+    return Page[CatalogueItemOut](
+        items=[
+            CatalogueItemOut(
+                id=row.item.id,
+                category=row.category_slug,
+                make=row.item.make,
+                model=row.item.model,
+                mount=row.item.mount,
+                specs=row.item.specs,
+                replacement_value_band=row.item.replacement_value_band,
+            )
+            for row in page.items
+        ],
+        pagination=PageMeta(limit=limit, next_cursor=page.next_cursor),
+    )
 
 
 @router.get(
