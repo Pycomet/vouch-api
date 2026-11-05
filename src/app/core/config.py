@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     # is refused outside development and test; unset there means "no sender" (the
     # OTP request route answers 503). Unset in development and test means the fake.
     otp_sender: Literal["fake"] | None = None
+    # A fixed six-digit code the fake sender's challenges use, so a local client
+    # (vouch-web) or an end-to-end test can sign in without reading process memory.
+    # Refused outside development and test; ignored unless the sender is the fake.
+    fake_otp_code: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     # Which KYC provider verifies renters (R27); same rules as ``otp_sender``.
     kyc_provider: Literal["fake"] | None = None
     # Which payment provider opens virtual accounts and sends webhooks (R21, R28);
@@ -143,6 +147,8 @@ class Settings(BaseSettings):
             _check_secret("jwt_secret", self.jwt_secret, env)
             if self.otp_sender == "fake":
                 raise ValueError(f"otp_sender 'fake' is not allowed in {env}")
+            if self.fake_otp_code is not None:
+                raise ValueError(f"fake_otp_code is not allowed in {env}")
             if self.kyc_provider == "fake":
                 raise ValueError(f"kyc_provider 'fake' is not allowed in {env}")
             if self.payment_provider == "fake":

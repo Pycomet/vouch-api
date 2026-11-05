@@ -1,6 +1,7 @@
 """Phone OTP login (spec 4, R25, R26).
 
-:func:`request_otp` makes a 6-digit code (``secrets.randbelow``), stores only its
+:func:`request_otp` makes a 6-digit code (``secrets.randbelow``, or
+``Settings.fake_otp_code`` with the fake sender in development and test), stores only its
 HMAC-SHA256 under the JWT secret with a 10-minute life, and hands the code to the
 :class:`~app.providers.otp.OtpSender`. The new challenge supersedes the phone's
 open ones (their ``consumed_at`` is set), so only the newest code ever works.
@@ -78,7 +79,11 @@ def hash_code(phone: str, code: str, settings: Settings) -> str:
     return hmac.new(key, f"{phone}:{code}".encode(), hashlib.sha256).hexdigest()
 
 
-def _new_code() -> str:
+def _new_code(settings: Settings) -> str:
+    # The fixed development code applies only to the fake sender (config refuses
+    # it outside development and test), so a real sender always gets a random code.
+    if settings.fake_otp_code is not None and settings.effective_otp_sender == "fake":
+        return settings.fake_otp_code
     return f"{secrets.randbelow(10**CODE_DIGITS):0{CODE_DIGITS}d}"
 
 
@@ -128,7 +133,7 @@ async def request_otp(
         raise RateLimitedError(retry_after=math.ceil((frees_at - now).total_seconds()))
 
     await _close_open_challenges(session, phone, now)
-    code = _new_code()
+    code = _new_code(settings)
     session.add(
         OtpChallenge(
             phone=phone,

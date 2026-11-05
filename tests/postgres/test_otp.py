@@ -555,3 +555,28 @@ async def test_token_role_comes_from_the_database(client, sender, db_session) ->
 
     claims = jwt.decode(token, options={"verify_signature": False})
     assert (claims["sub"], claims["role"]) == (str(admin_id), "admin")
+
+
+# ---------------------------------------------------------------------------
+# Fixed development code (VOUCH_FAKE_OTP_CODE)
+# ---------------------------------------------------------------------------
+
+
+async def test_fixed_fake_code_logs_in_without_reading_the_sender(db_session, clock) -> None:
+    app = create_app(SETTINGS.model_copy(update={"fake_otp_code": "000000"}))
+
+    async def session_override() -> AsyncIterator[AsyncSession]:
+        await db_session.commit()
+        try:
+            yield db_session
+        finally:
+            await db_session.rollback()
+
+    app.dependency_overrides[get_session] = session_override
+    app.dependency_overrides[get_clock] = lambda: clock
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        assert (await _request(http)).status_code == 202
+        response = await _verify(http, "000000")
+
+    assert response.status_code == 200, response.text
+    assert decode_token(response.json()["access_token"], SETTINGS).role == ActorRole.renter

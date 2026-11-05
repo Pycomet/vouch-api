@@ -49,6 +49,7 @@ Every setting is an environment variable with the `VOUCH_` prefix. They can also
 | `VOUCH_JWT_SECRET` | Token signing key. Outside development and test, `change-me` or anything under 32 bytes is refused. |
 | `VOUCH_OTP_SENDER`, `VOUCH_KYC_PROVIDER`, `VOUCH_PAYMENT_PROVIDER` | `fake`, or unset (see *Providers*) |
 | `VOUCH_FAKE_PAYMENT_WEBHOOK_SECRET` | HMAC key for the fake provider's webhook signatures |
+| `VOUCH_FAKE_OTP_CODE` | Optional fixed six-digit code for the fake OTP sender, so a local client or an end-to-end test can sign in (e.g. `000000`). Development and test only; refused at start-up elsewhere. Unset means random codes. |
 | `VOUCH_COMMISSION_RATE`, `VOUCH_DAMAGE_CONTRIBUTION_RATE`, `VOUCH_RENTER_CANCELLATION_FEE_RATE`, `VOUCH_CANCELLATION_FEE_VENDOR_SHARE` | Placeholder policy rates pending legal advice. Each booking freezes them at request time. |
 | `VOUCH_BUSINESS_TIMEZONE` | Business-day boundaries (default `Africa/Lagos`) |
 
