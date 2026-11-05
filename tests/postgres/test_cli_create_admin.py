@@ -209,3 +209,42 @@ async def test_concurrent_registration_is_refused(migrated_db: str, capsys, monk
     rows = await _users(migrated_db, PHONE)
     assert [(row["id"], row["role"]) for row in rows] == [(user_id, "renter")]
     assert "concurrently" in capsys.readouterr().err
+
+
+async def test_refuses_soft_deleted_admin(migrated_db: str, capsys) -> None:
+    """A soft-deleted admin is not reactivated (amendment A21)."""
+    connection = await asyncpg.connect(migrated_db)
+    try:
+        user_id = await connection.fetchval(
+            "INSERT INTO users (phone, full_name, role, is_active, deleted_at) "
+            "VALUES ($1, 'Old Admin', 'admin', true, now()) RETURNING id",
+            PHONE,
+        )
+    finally:
+        await connection.close()
+
+    assert await cli.run(["create-admin", "--phone", PHONE, "--name", "Ada Ops"]) == 1
+
+    connection = await asyncpg.connect(migrated_db)
+    try:
+        row = await connection.fetchrow(
+            "SELECT is_active, deleted_at FROM users WHERE id = $1", user_id
+        )
+    finally:
+        await connection.close()
+    assert row["is_active"] is True and row["deleted_at"] is not None
+    assert await _audits(migrated_db, user_id) == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "inactive or deleted" in captured.err
+
+
+async def test_refuses_a_name_over_200_characters(migrated_db: str, capsys) -> None:
+    assert await cli.run(["create-admin", "--phone", PHONE, "--name", "A" * 201]) == 2
+    assert await _users(migrated_db, PHONE) == []
+    assert "200" in capsys.readouterr().err
+
+
+async def test_accepts_a_200_character_name(migrated_db: str) -> None:
+    assert await cli.run(["create-admin", "--phone", PHONE, "--name", " " + "A" * 200 + " "]) == 0
+    assert (await _users(migrated_db, PHONE))[0]["full_name"] == "A" * 200

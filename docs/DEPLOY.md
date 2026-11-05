@@ -94,7 +94,7 @@ docker compose run --rm --no-deps api python -m app.cli create-admin --phone +23
 - It prints only the new user's id. The admin then logs in with the normal phone OTP flow.
 - It writes the audit event `user.admin_created` (`actor_role = 'system'`).
 - Re-running it for an existing active admin changes nothing and prints the same id (exit 0).
-- It refuses (exit 1, nothing changed) a phone that belongs to a renter or a vendor, or to an inactive or deleted admin: a role is never changed silently. A malformed phone or a blank name is exit 2.
+- It refuses (exit 1, nothing changed) a phone that belongs to a renter or a vendor, or to an inactive or soft-deleted admin (amendment A21): a role is never changed silently and an account is never reactivated. A malformed phone, or a name that is blank or longer than 200 characters, is exit 2.
 
 Keep admin accounts to one or two people; there is no admin MFA in M3a.
 

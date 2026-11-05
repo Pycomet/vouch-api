@@ -11,8 +11,10 @@
     * The phone already belongs to an active admin: nothing changes, the existing
       id is printed. Exit 0 (the command is safe to re-run).
     * The phone belongs to a user with another role, or to an inactive or deleted
-      admin: nothing changes (a role is never changed silently). Exit 1.
-    * A bad phone or a blank name: nothing is read or written. Exit 2.
+      admin: nothing changes (a role is never changed silently, and an admin is
+      never reactivated; amendment A21). Exit 1.
+    * A bad phone, or a name that is blank or longer than 200 characters (the
+      API's ``FullName`` limit): nothing is read or written. Exit 2.
 
 Only the user id reaches stdout; errors go to stderr and never echo the phone.
 """
@@ -39,6 +41,8 @@ from app.services.auth import normalize_phone
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
+# The same limit as the API's ``FullName`` (app.schemas.auth).
+MAX_NAME_LENGTH = 200
 
 
 class CommandRefused(Exception):
@@ -97,6 +101,9 @@ async def _create_admin_command(phone_raw: str, name_raw: str) -> int:
     full_name = name_raw.strip()
     if not full_name:
         print("error: --name must not be blank", file=sys.stderr)
+        return EXIT_USAGE
+    if len(full_name) > MAX_NAME_LENGTH:
+        print(f"error: --name must be at most {MAX_NAME_LENGTH} characters", file=sys.stderr)
         return EXIT_USAGE
 
     engine = create_database_engine(get_settings())
