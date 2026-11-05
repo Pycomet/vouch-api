@@ -433,7 +433,7 @@ Append-only history (0003, spec §2.6).
 | `id` | BIGINT | NOT NULL | BIGSERIAL |
 | `actor_id` | UUID | NULL | NULL only for `system` (timers and webhooks) |
 | `actor_role` | TEXT | NOT NULL | `renter`, `vendor`, `admin` or `system` |
-| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record`, `kyc_profile` or `catalogue_item` |
+| `entity` | TEXT | NOT NULL | `booking`, `user`, `asset`, `payment`, `handover_record`, `kyc_profile`, `catalogue_item` or `availability_window` |
 | `entity_id` | UUID | NOT NULL | |
 | `action` | TEXT | NOT NULL | e.g. `booking.confirmed` (below) |
 | `before`, `after` | JSONB | NULL | The changed columns, plus handler extras (amounts, payment ids, the refund breakdown) |
@@ -451,12 +451,23 @@ Append-only history (0003, spec §2.6).
   - `booking.vendor_approved` and `booking.at_risk` (no status change);
   - `deposit.released`, `deposit.deducted` and `deposit.forfeited`, beside the booking's own row;
   - `vendor.reliability_penalty` (entity `user`) on a vendor cancellation or a no-show;
-  - `user.restricted` and `asset.paused`; `asset.pause_taken_over` (M3a) when a lost booking turns a vendor pause into an admin one;
+  - `user.restricted` and `asset.paused` (on a lost booking, `before {listing_status}`, `after {listing_status, paused_by: "admin", booking_id}`);
   - `handover.updated` and `handover.signed`;
   - `kyc.verified` and `kyc.failed`;
   - `payment.refunded_late`, `payment.refunded_mismatch`, `payment.refunded_unapplied`, `payment.refunded_duplicate` and `payout.paid`.
 
   Every booking transition writes at least one row. An illegal transition, or a failed guard, writes none.
+- Actions written in M3a (every vendor write records the vendor as actor and the request id):
+  - `user.admin_created` (entity `user`, actor `system`) by `create-admin`: `before` NULL, `after {role, is_active}`;
+  - `asset.pause_taken_over` when a lost booking turns a vendor pause into an admin one: `before {listing_status, paused_by}`, `after {listing_status, paused_by: "admin", booking_id}`;
+  - `asset.created`: `before` NULL, `after {listing_status, catalogue_item_id, category_id, city, serial_number, condition_grade, daily_rate, weekend_rate, weekly_rate, deposit_amount, fulfilment, minimum_trust_tier}`;
+  - `asset.updated`: `before` and `after` hold the changed fields only (including a re-derived `category_id` or a raised `minimum_trust_tier`); an edit that changes nothing writes no row;
+  - `asset.submitted`, `asset.paused` (by the vendor) and `asset.resumed`: `before` and `after` are `{listing_status, paused_by}`;
+  - `asset.deleted`: `before` and `after` are `{deleted_at, listing_status}`;
+  - `availability.blocked` (entity `availability_window`, the block's id): `before` NULL, `after {asset_id, starts_on, ends_on}`;
+  - `availability.unblocked`: `before {asset_id, starts_on, ends_on}`, `after` NULL.
+
+  A refused vendor write writes no row.
 
 ### `webhook_events`
 
