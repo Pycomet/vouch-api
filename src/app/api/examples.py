@@ -20,8 +20,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.schemas.errors import (
+    LISTING_TRANSITION_MESSAGE,
     BookingGuardFailed,
+    CatalogueItemInactiveError,
+    DuplicateSerialError,
     ErrorEnvelope,
+    HasLiveBookingsError,
+    InvalidTransition,
+    ListingIncompleteError,
+    ListingLockedError,
     OtpRejectedError,
     ValidationErrorResponse,
     VendorNotActiveError,
@@ -426,6 +433,76 @@ VENDOR_PROFILE_EXAMPLE: dict[str, Any] = {
     "account_last4": "4321",
     "has_recipient_code": True,
 }
+
+# The vendor's own listings (M3a 4.4).
+OWN_ASSET_EXAMPLE: dict[str, Any] = {
+    "id": ASSET_ID,
+    "catalogue_item_id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e",
+    "make": "Sony",
+    "model": "FX3",
+    "category": "camera",
+    "city": "city-slug",
+    "serial_number": "SN-0001",
+    "condition_grade": "excellent",
+    "condition_notes": "Light wear on the grip.",
+    "description": "Full-frame cinema body with two batteries.",
+    "daily_rate": "50000.00",
+    "weekend_rate": "90000.00",
+    "weekly_rate": None,
+    "deposit_amount": "150000.00",
+    "currency": "NGN",
+    "included_accessories": ["2 batteries", "128 GB card"],
+    "fulfilment": {"pickup": True, "delivery": True, "delivery_fee": "5000.00"},
+    "listing_status": "draft",
+    "minimum_trust_tier": 3,
+    "paused_by": None,
+    "review_reason": None,
+    "reviewed_at": None,
+    "is_available": True,
+    "created_at": "2026-11-05T09:15:00Z",
+    "updated_at": "2026-11-05T09:15:00Z",
+}
+OWN_ASSET_PAGE_EXAMPLE: dict[str, Any] = {
+    "items": [OWN_ASSET_EXAMPLE],
+    "pagination": {"limit": 20, "next_cursor": None},
+}
+REVIEW_ASSET_EXAMPLE: dict[str, Any] = {**OWN_ASSET_EXAMPLE, "listing_status": "review"}
+PAUSED_ASSET_EXAMPLE: dict[str, Any] = {
+    **OWN_ASSET_EXAMPLE,
+    "listing_status": "paused",
+    "paused_by": "vendor",
+}
+ACTIVE_ASSET_EXAMPLE: dict[str, Any] = {**OWN_ASSET_EXAMPLE, "listing_status": "active"}
+
+LISTING_LOCKED = raised(
+    ListingLockedError, {"status": "review"}, "Locked while in review.", name="listing_locked"
+)
+IDENTITY_LOCKED = raised(
+    ListingLockedError,
+    {"status": "active", "fields": ["serial_number"]},
+    "An identity field outside draft or rejected.",
+    name="identity_locked",
+)
+LISTING_INCOMPLETE = raised(
+    ListingIncompleteError(["serial_number", "delivery_fee"]),
+    description="Something the review needs is missing.",
+)
+CATALOGUE_ITEM_INACTIVE = raised(
+    CatalogueItemInactiveError,
+    {"catalogue_item_id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e"},
+    "The catalogue item is no longer active.",
+)
+DUPLICATE_SERIAL = raised(DuplicateSerialError, description="You already list this serial.")
+HAS_LIVE_BOOKINGS = raised(HasLiveBookingsError, description="A booking still holds the unit.")
+
+
+def listing_transition(from_status: str, event: str, description: str) -> Err:
+    """The 409 ``invalid_transition`` an illegal listing event returns."""
+    return raised(
+        InvalidTransition(from_status, event, message=LISTING_TRANSITION_MESSAGE),
+        description=description,
+    )
+
 
 LIVE_EXAMPLE: dict[str, Any] = {"status": "ok", "service": "Vouch API", "version": "0.1.0"}
 READY_EXAMPLE: dict[str, Any] = {**LIVE_EXAMPLE, "checks": {"database": "ok"}}

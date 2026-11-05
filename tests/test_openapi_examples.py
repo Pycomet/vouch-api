@@ -24,6 +24,7 @@ from app.schemas.bookings import BookingOut, MoneyLine
 from app.schemas.errors import ErrorEnvelope, ValidationErrorResponse
 from app.schemas.health import ReadinessStatus, ServiceStatus
 from app.schemas.home import RenterHome, VendorHome
+from app.schemas.listings import OwnAsset
 from app.schemas.pagination import Page
 from app.schemas.webhooks import WebhookAck
 
@@ -69,7 +70,11 @@ def test_every_operation_has_examples(schema) -> None:
     for name, operation in operations:
         responses = operation["responses"]
         successes = [code for code in responses if code.startswith("2")]
-        if not any(_has_example(responses[code].get("content")) for code in successes):
+        # A 204 has no body to illustrate (DELETE /vendor/assets/{id}).
+        no_body = successes == ["204"] and "content" not in responses["204"]
+        if not no_body and not any(
+            _has_example(responses[code].get("content")) for code in successes
+        ):
             missing.append(f"{name}: no 2xx example")
         for code, response in responses.items():
             if code[0] in "45" and not _has_example(response.get("content")):
@@ -184,6 +189,50 @@ def test_get_booking_documents_no_409(schema) -> None:
     assert "409" not in schema["paths"][ACTION]["get"]["responses"]
 
 
+LISTINGS = f"{PREFIX}/vendor/assets"
+LISTING = f"{LISTINGS}/{{asset_id}}"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "codes"),
+    [
+        ("post", LISTINGS, {"vendor_not_active", "catalogue_item_inactive", "duplicate_serial"}),
+        (
+            "patch",
+            LISTING,
+            {"vendor_not_active", "listing_locked", "catalogue_item_inactive", "duplicate_serial"},
+        ),
+        (
+            "post",
+            f"{LISTING}/submit",
+            {"vendor_not_active", "invalid_transition", "listing_incomplete"},
+        ),
+        ("post", f"{LISTING}/pause", {"vendor_not_active", "invalid_transition"}),
+        ("post", f"{LISTING}/resume", {"vendor_not_active", "invalid_transition"}),
+        ("delete", LISTING, {"vendor_not_active", "has_live_bookings"}),
+    ],
+)
+def test_listing_routes_name_their_409s(schema, method, path, codes) -> None:
+    responses = schema["paths"][path][method]["responses"]
+
+    assert codes <= _named(responses, "409")
+    assert {"401", "403", "422"} <= set(responses)
+
+
+def test_listing_transition_example_names_the_listing(schema) -> None:
+    media = schema["paths"][f"{LISTING}/resume"]["post"]["responses"]["409"]["content"]
+    error = media["application/json"]["examples"]["invalid_transition"]["value"]["error"]
+
+    assert error["message"] == "This listing cannot make that transition."
+    assert error["details"] == {"from": "paused", "event": "resume"}
+
+
+def test_delete_listing_is_a_bodiless_204(schema) -> None:
+    responses = schema["paths"][LISTING]["delete"]["responses"]
+
+    assert "content" not in responses["204"]
+
+
 def test_cancelled_example_adds_up() -> None:
     line = examples.CANCELLED_MONEY_LINE
     paid = sum(Decimal(line[part]["amount"]) for part in ("deposit", "contribution", "rental"))
@@ -248,6 +297,9 @@ def test_late_payment_example_returns_everything_and_owes_nothing(schema) -> Non
         (OtpSent, examples.OTP_SENT_EXAMPLE),
         (TokenOut, examples.TOKEN_EXAMPLE),
         (ValidationErrorResponse, examples._VALIDATION_EXAMPLE),
+        (OwnAsset, examples.OWN_ASSET_EXAMPLE),
+        (OwnAsset, examples.PAUSED_ASSET_EXAMPLE),
+        (Page[OwnAsset], examples.OWN_ASSET_PAGE_EXAMPLE),
     ],
 )
 def test_examples_match_their_models(model: type[BaseModel], payload: dict) -> None:
