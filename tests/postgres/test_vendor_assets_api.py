@@ -367,11 +367,24 @@ async def test_create_inactive_item_is_409(client, db_session) -> None:
 
 
 @pytest.mark.parametrize("city", ["no-such-city", "lagos" if CITY != "lagos" else "abuja"])
-async def test_create_city_must_be_launched(client, db_session, city) -> None:
+async def test_create_city_must_be_launched(db_session, city) -> None:
+    """Only ``CITY`` is launched here, whatever ``VOUCH_LAUNCHED_CITIES`` says, so the
+    other reference city (it has a ``cities`` row) is refused like an unknown slug."""
+    app = create_app(SETTINGS.model_copy(update={"launched_cities": [CITY]}))
+
+    async def session_override() -> AsyncIterator[AsyncSession]:
+        await db_session.commit()
+        try:
+            yield db_session
+        finally:
+            await db_session.rollback()
+
+    app.dependency_overrides[get_session] = session_override
     _, headers = await _vendor(db_session)
     item = await _item(db_session)
 
-    response = await client.post(API, json=_body(item.id, city=city), headers=headers)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        response = await http.post(API, json=_body(item.id, city=city), headers=headers)
 
     assert response.status_code == 400
     assert _error(response)["code"] == "city_not_launched"
@@ -1075,9 +1088,13 @@ async def test_pause_and_resume(client, db_session) -> None:
     asset_id = await _listing(db_session, vendor_id, ListingStatus.active)
     assert (await client.get(f"/api/v1/assets/{asset_id}")).status_code == 200
 
-    paused = await client.post(f"{API}/{asset_id}/pause", headers=headers)
+    paused = await client.post(
+        f"{API}/{asset_id}/pause", headers={**headers, "X-Request-ID": "req_pause"}
+    )
     hidden = await client.get(f"/api/v1/assets/{asset_id}")
-    resumed = await client.post(f"{API}/{asset_id}/resume", headers=headers)
+    resumed = await client.post(
+        f"{API}/{asset_id}/resume", headers={**headers, "X-Request-ID": "req_resume"}
+    )
 
     assert (paused.json()["listing_status"], paused.json()["paused_by"]) == ("paused", "vendor")
     assert hidden.status_code == 404
@@ -1095,6 +1112,10 @@ async def test_pause_and_resume(client, db_session) -> None:
             {"listing_status": "paused", "paused_by": "vendor"},
             {"listing_status": "active", "paused_by": None},
         ),
+    ]
+    assert [(a.actor_id, a.actor_role, a.request_id) for a in audits] == [
+        (vendor_id, "vendor", "req_pause"),
+        (vendor_id, "vendor", "req_resume"),
     ]
 
 
@@ -1312,3 +1333,12 @@ async def test_list_well_formed_but_wrong_cursor_is_400(client, db_session, curs
 
     assert response.status_code == 400, response.text
     assert _error(response)["code"] == "invalid_cursor"
+
+
+@pytest.mark.parametrize("limit", ["0", "101"])
+async def test_list_limit_out_of_range_is_422(client, db_session, limit) -> None:
+    _, headers = await _vendor(db_session)
+
+    response = await client.get(API, params={"limit": limit}, headers=headers)
+
+    assert response.status_code == 422

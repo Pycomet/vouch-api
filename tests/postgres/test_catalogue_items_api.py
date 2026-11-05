@@ -177,3 +177,18 @@ async def test_well_formed_but_wrong_cursor_is_400(client, cursor) -> None:
 
     assert response.status_code == 400, response.text
     assert response.json()["error"]["code"] == "invalid_cursor"
+
+
+@pytest.mark.parametrize("limit", ["0", "101"])
+async def test_limit_out_of_range_is_422(client, limit) -> None:
+    response = await client.get(API, params={"limit": limit})
+
+    assert response.status_code == 422
+
+
+async def test_q_over_200_characters_is_422(client) -> None:
+    ok = await client.get(API, params={"q": "a" * 200})
+    too_long = await client.get(API, params={"q": "a" * 201})
+
+    assert ok.status_code == 200
+    assert too_long.status_code == 422
